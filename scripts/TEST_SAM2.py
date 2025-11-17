@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/flanthier/Documents/src/vision_processing/venv_py310/bin/python3
 """
 Fixed Single Food Piece Detector
 MODIFIED: Uses SAM 2 instead of SAM 1

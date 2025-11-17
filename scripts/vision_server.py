@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/flanthier/Documents/src/vision_processing/venv_py310/bin/python3
 import rospy
 from vision_processing.srv import ProcessImage, ProcessImageResponse
 from sensor_msgs.msg import Image
@@ -20,8 +20,9 @@ class VisionServer:
         
         # Load models ONCE at startup
         rospy.loginfo("🚀 Loading models at startup...")
-        model_path = os.path.join(script_dir, "sam_vit_l.pth")
-        self.detector = SingleFoodDetector(model_type="vit_l", model_name=model_path)
+        sam2_checkpoint = os.path.expanduser(f"~/segment-anything-2/checkpoints/sam2.1_hiera_base_plus.pt")
+        sam2_config = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+        self.detector = SingleFoodDetector(sam2_checkpoint, sam2_config, output_dir=script_dir)
         rospy.loginfo("✅ Models ready!")
         
         rospy.loginfo(f"Debug images will be saved to: {script_dir}")
@@ -34,17 +35,30 @@ class VisionServer:
     
     def handle_request(self, req):
         response = ProcessImageResponse()
+        original_dir = os.getcwd()
         
         try:
-            # Convert ROS Image to OpenCV format
-            cv_image = self.bridge.imgmsg_to_cv2(req.input_image, "bgr8")
+            # Extract raw image data from ROS message
+            height = req.input_image.height
+            width = req.input_image.width
+            encoding = req.input_image.encoding
+            
+            # Convert raw bytes to numpy array (no cv_bridge needed)
+            if encoding == "bgr8":
+                cv_image = np.frombuffer(req.input_image.data, dtype=np.uint8).reshape(height, width, 3)
+            elif encoding == "rgb8":
+                cv_image = np.frombuffer(req.input_image.data, dtype=np.uint8).reshape(height, width, 3)
+                cv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
+            else:
+                rospy.logerr(f"Unsupported encoding: {encoding}")
+                response.success = False
+                return response
             
             # Save temporarily in scripts directory
             temp_path = os.path.join(script_dir, "ros_image.jpg")
             cv2.imwrite(temp_path, cv_image)
             
             # Change working directory to scripts folder
-            original_dir = os.getcwd()
             os.chdir(script_dir)
             
             # Run detection (images will be saved in script_dir)
@@ -68,12 +82,17 @@ class VisionServer:
                 overlay[mask > 0] = [0, 255, 0]
                 blended = cv2.addWeighted(cv_image, 0.7, overlay, 0.3, 0)
                 
-                response.output_image = self.bridge.cv2_to_imgmsg(blended, "bgr8")
+                # Convert output image back to ROS message manually
+                response.output_image.height = blended.shape[0]
+                response.output_image.width = blended.shape[1]
+                response.output_image.encoding = "bgr8"
+                response.output_image.step = blended.shape[1] * 3
+                response.output_image.data = blended.tobytes()
                 
                 rospy.loginfo(f"✅ Detected: {result['selected_food']}, "
-                             f"Pieces: {result['total_pieces']}, "
-                             f"Centroid: {result['centroid']}, "
-                             f"Time: {result['computation_time']:.3f}s")
+                            f"Pieces: {result['total_pieces']}, "
+                            f"Centroid: {result['centroid']}, "
+                            f"Time: {result['computation_time']:.3f}s")
             else:
                 response.success = False
                 rospy.logwarn("❌ No detections found")
@@ -81,7 +100,7 @@ class VisionServer:
         except Exception as e:
             response.success = False
             rospy.logerr(f"❌ Detection failed: {str(e)}")
-            os.chdir(original_dir)  # Make sure to change back
+            os.chdir(original_dir)
         
         return response
     

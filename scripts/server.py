@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+#!/home/flanthier/Documents/src/vision_processing/venv_py310/bin/python3
 from flask import Flask, request, jsonify
 import torch
 from PIL import Image
 import io
 import base64
-from TEST_single import SingleFoodDetector
+from TEST_SAM2 import SingleFoodDetector
 
 app = Flask(__name__)
 
