@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Vision Server Node -->
+  <node name="vision_server" 
+        pkg="vision_processing" 
+        type="vision_server.py" 
+        output="screen"
+        required="true">
+    <!-- The service will be advertised as /process_image -->
+  </node>
+</launch>

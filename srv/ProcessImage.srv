@@ -1,0 +1,9 @@
+sensor_msgs/Image input_image
+---
+bool success
+string selected_food
+int32 total_pieces
+float64[] centroid
+float64 computation_time
+int32 selected_piece_area
+sensor_msgs/Image output_image
