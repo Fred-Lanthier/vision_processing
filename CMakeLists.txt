@@ -30,7 +30,7 @@ catkin_package(
     cv_bridge
     message_runtime
 )
-set(PYTHON_EXECUTABLE "/home/flanthier/Documents/src/vision_processing/venv_py310/bin/python3")
+set(PYTHON_EXECUTABLE "/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3")
 
 catkin_install_python(PROGRAMS
   scripts/vision_server.py
