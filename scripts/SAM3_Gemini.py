@@ -250,7 +250,7 @@ class FoodSegmenterNative:
 
 # --- TEST (Si lancé directement) ---
 if __name__ == "__main__":
-    API_KEY = ""
+    API_KEY = os.getenv("GOOGLE_API_KEY")
     IMAGE = "images/Brocoli.jpeg"
     
     if "AIza" in API_KEY:

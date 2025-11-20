@@ -18,7 +18,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # ==========================================
 # Remplacez par votre vraie clé ici !
-GOOGLE_API_KEY = ""
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # ==========================================
 # CHARGEMENT UNIQUE DU MODÈLE
