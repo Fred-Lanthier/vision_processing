@@ -18,7 +18,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # ==========================================
 # Remplacez par votre vraie clé ici !
-GOOGLE_API_KEY = "AIzaSyBiI8ij7bP_P0CUHkxv8W_cjMOCNa24-7I"
+GOOGLE_API_KEY = ""
 
 # ==========================================
 # CHARGEMENT UNIQUE DU MODÈLE
