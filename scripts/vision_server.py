@@ -18,7 +18,7 @@ from SAM3_Gemini import FoodSegmenterNative
 
 # --- VOTRE CLÉ API GEMINI ---
 # Idéalement, mettez ça dans un fichier de config ou variable d'env, mais pour l'instant :
-GOOGLE_API_KEY = "AIzaSyBiI8ij7bP_P0CUHkxv8W_cjMOCNa24-7I" 
+GOOGLE_API_KEY = "" 
 
 class VisionServer:
     def __init__(self):

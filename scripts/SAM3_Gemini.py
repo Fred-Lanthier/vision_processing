@@ -250,7 +250,7 @@ class FoodSegmenterNative:
 
 # --- TEST (Si lancé directement) ---
 if __name__ == "__main__":
-    API_KEY = "AIzaSyBiI8ij7bP_P0CUHkxv8W_cjMOCNa24-7I"
+    API_KEY = ""
     IMAGE = "images/Brocoli.jpeg"
     
     if "AIza" in API_KEY:
