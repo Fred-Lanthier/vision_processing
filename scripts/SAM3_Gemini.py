@@ -204,6 +204,6 @@ class FoodSegmenterNative:
 if __name__ == "__main__":
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     segmenter = FoodSegmenterNative(GOOGLE_API_KEY)
-    test_image_path = "test_images/meal1.jpg"  # Remplacez par votre image de test
+    test_image_path = "images/Filou.jpeg"  # Remplacez par votre image de test
     result = segmenter.process_image(test_image_path)
     print(result)

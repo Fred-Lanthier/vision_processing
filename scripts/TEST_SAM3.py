@@ -140,7 +140,7 @@ class FoodSegmenterNative:
 
 if __name__ == "__main__":
     IMAGE_PATH = "images/Brocoli.jpeg" 
-    LISTE_ALIMENTS = ["rice", "cucumber", "carrot", "tofu", "orange"]
+    LISTE_ALIMENTS = ["rice", "broccoli", "carrot", "chicken"]
     
     segmenter = FoodSegmenterNative()
     segmenter.process_food_list(IMAGE_PATH, LISTE_ALIMENTS)
