@@ -12,7 +12,7 @@ from google import genai
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
-class FoodSegmenterNative:
+class FoodSegmenterIndividual:
     def __init__(self, google_api_key):
         # 1. Configuration Hardware
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -79,6 +79,7 @@ class FoodSegmenterNative:
             return result_data
 
         # 2. Init SAM 3
+        print("🚀 [SAM3] Initialisation sur cuda...")
         inference_state = self.processor.set_image(image_pil_rgb)
         
         # Variables pour suivre le "Gagnant"
@@ -139,7 +140,7 @@ class FoodSegmenterNative:
         cx, cy = 0.0, 0.0
         winner_overlay_cv = None
         winner_rainbow_cv = None
-
+        print("🤖 [GEMINI] Analyse de l'image...")
         if winner_mask is not None:
             try:
                 # --- A. Calcul du Centroïde ---
@@ -203,7 +204,6 @@ class FoodSegmenterNative:
 
 if __name__ == "__main__":
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-    segmenter = FoodSegmenterNative(GOOGLE_API_KEY)
+    segmenter = FoodSegmenterIndividual(GOOGLE_API_KEY)
     test_image_path = "images/Filou.jpeg"  # Remplacez par votre image de test
     result = segmenter.process_image(test_image_path)
-    print(result)

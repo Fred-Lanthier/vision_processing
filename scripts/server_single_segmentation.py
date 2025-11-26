@@ -12,7 +12,7 @@ try:
 except ImportError: pass
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from SAM3_Gemini import FoodSegmenterNative
+from Single_Segmentation_Gemini_SAM3 import FoodSegmenterIndividual
 
 app = Flask(__name__)
 
@@ -24,7 +24,7 @@ if not GOOGLE_API_KEY or "AIza" not in GOOGLE_API_KEY:
 
 # Chargement Modèle
 print("🚀 [SERVER] Loading SAM 3 + Gemini models...")
-segmenter = FoodSegmenterNative(google_api_key=GOOGLE_API_KEY)
+segmenter = FoodSegmenterIndividual(google_api_key=GOOGLE_API_KEY)
 print("✅ [SERVER] Ready on port 5000!")
 
 def encode_image_to_base64(cv_image):
