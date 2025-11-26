@@ -1,0 +1,8 @@
+build_sam3_video_model args:
+(checkpoint_path: Optional[str] = None, load_from_HF=True, bpe_path: Optional[str] = None, has_presence_token: bool = True, geo_encoder_use_img_cross_attn: bool = True, strict_state_dict_loading: bool = True, apply_temporal_disambiguation: bool = True, device='cuda', compile=False) -> sam3.model.sam3_video_inference.Sam3VideoInferenceWithInstanceInteractivity
+
+build_sam3_video_predictor args:
+(*model_args, gpus_to_use=None, **model_kwargs)
+
+Sam3VideoPredictor methods:
+['add_prompt', 'close_session', 'handle_request', 'handle_stream_request', 'propagate_in_video', 'remove_object', 'reset_session', 'shutdown', 'start_session']

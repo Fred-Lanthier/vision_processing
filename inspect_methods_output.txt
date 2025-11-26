@@ -1,0 +1,8 @@
+start_session args:
+(self, resource_path, session_id=None)
+
+add_prompt args:
+(self, session_id: str, frame_idx: int, text: Optional[str] = None, points: Optional[List[List[float]]] = None, point_labels: Optional[List[int]] = None, bounding_boxes: Optional[List[List[float]]] = None, bounding_box_labels: Optional[List[int]] = None, obj_id: Optional[int] = None)
+
+propagate_in_video args:
+(self, session_id, propagation_direction, start_frame_idx, max_frame_num_to_track)
