@@ -124,6 +124,13 @@ class FoodSegmenterTotal:
                                         
                                         if masks_sub.size > 0 and np.any(masks_sub):
                                             print(f"         ✅ Trouvé avec '{sub_word}'!")
+                                            
+                                            # Gestion des dimensions pour le fallback (N, 1, H, W) -> (N, H, W)
+                                            if masks_sub.ndim == 4 and masks_sub.shape[1] == 1:
+                                                masks_sub = masks_sub.squeeze(1)
+                                            elif masks_sub.ndim == 4:
+                                                masks_sub = masks_sub[:, 0, :, :]
+                                                
                                             masks = masks_sub
                                             found_fallback = True
                                             break

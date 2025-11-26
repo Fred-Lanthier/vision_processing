@@ -241,7 +241,7 @@ def main():
     image_path = os.path.join(package_path, 'scripts', 'images')
     static_rgb = os.path.join(image_path, 'static_rgb_step_000010.png')
     static_depth = os.path.join(image_path, 'static_depth_step_000010.npy')
-    json_file = os.path.join(package_path, 'scripts', 'images', 'trajectory_6.json')
+    json_file = os.path.join(package_path, 'scripts', 'Robot_pcd_trajectory', 'trajectory_1.json')
 
     # Load and display static RGB image
     static_rgb_image = load_image(static_rgb)
