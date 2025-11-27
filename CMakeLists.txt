@@ -13,6 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
 add_service_files(
   FILES
   ProcessImage.srv
+  ProcessRobot.srv
 )
 
 ## Generate added messages and services
@@ -33,7 +34,8 @@ catkin_package(
 set(PYTHON_EXECUTABLE "/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3")
 
 catkin_install_python(PROGRAMS
-  scripts/vision_server.py
+  scripts/vision_server_food_segmentation.py
+  scripts/vision_server_robot_segmentation.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

@@ -1,0 +1,11 @@
+# ProcessRobot.srv
+
+# Entrées
+sensor_msgs/Image rgb_image
+sensor_msgs/Image depth_image  # <--- Indispensable pour le 3D
+---
+# Sorties
+bool success
+float64[] centroid             # [x, y] en pixels
+string pcd_path                # Chemin vers le fichier .npy généré
+sensor_msgs/Image debug_image  # Image avec le masque vert

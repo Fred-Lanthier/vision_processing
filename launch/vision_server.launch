@@ -1,8 +1,14 @@
 <?xml version="1.0"?>
 <launch>
-  <node name="vision_server" 
+  <node name="vision_server_food" 
         pkg="vision_processing" 
-        type="vision_server.py" 
+        type="vision_server_food_segmentation.py" 
+        output="screen"
+        required="true"/>
+        
+  <node name="vision_server_robot" 
+        pkg="vision_processing" 
+        type="vision_server_robot_segmentation.py" 
         output="screen"
         required="true"/>
 </launch>
