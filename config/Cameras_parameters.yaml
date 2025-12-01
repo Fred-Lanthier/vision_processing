@@ -1,0 +1,11 @@
+Static_camera:
+    fx: 616.1005249
+    fy: 615.82617188
+    cx: 318.38803101
+    cy: 249.23504639
+
+End_effector_camera:
+    fx: 500
+    fy: 500
+    cx: 320
+    cy: 240

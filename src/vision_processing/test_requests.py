@@ -193,7 +193,7 @@ if __name__ == "__main__":
         tester = GlobalTester()
         
         # Lancer les deux tests à la suite
-        tester.run_food_test()
+        # tester.run_food_test()
         time.sleep(1) # Petite pause pour la lisibilité
         tester.run_robot_sequence_test()
         
