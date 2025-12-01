@@ -15,8 +15,7 @@ sys.path.insert(0, script_dir)
 from vision_processing.srv import ProcessRobot, ProcessRobotResponse
 from sensor_msgs.msg import Image
 
-# --- IMPORT OUR NEW CLASS ---
-from Real_time_Robot_segmentation import SegmentRobotSAM2
+from vision_processing.src.vision_tracking.Real_time_Robot_segmentation import SegmentRobotSAM2
 
 class VisionServerRobot:
     def __init__(self):

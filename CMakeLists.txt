@@ -16,6 +16,9 @@ add_service_files(
   ProcessRobot.srv
 )
 
+## Python setup
+catkin_python_setup()
+
 ## Generate added messages and services
 generate_messages(
   DEPENDENCIES

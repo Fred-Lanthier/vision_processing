@@ -2,3 +2,5 @@ venv_py310/
 __pycache__/
 *.pyc
 venv_sam3/
+datas/
+resources/
