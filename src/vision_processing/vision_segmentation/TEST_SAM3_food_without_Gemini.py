@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import os
 import time
+import rospkg
 
 # Imports natifs SAM 3
 from sam3.model_builder import build_sam3_image_model
@@ -18,12 +19,12 @@ class FoodSegmenterNative:
         if hasattr(self.model, "to"):
             self.model.to(self.device)
             
-        self.processor = Sam3Processor(self.model)
+        self.processor = Sam3Processor(self.model, confidence_threshold=0.25)
         print("✅ Modèle chargé avec succès.")
 
     def process_food_list(self, image_path, food_list):
         # --- Config des chemins de sortie ---
-        output_dir = os.path.expanduser("~/Github/src/vision_processing/src/vision_segmentation/images")
+        output_dir = os.path.expanduser("~/Github/src/vision_processing/src/vision_processing/vision_segmentation/images")
         overlay_filename = os.path.join(output_dir, "resultat_overlay.png")
         rainbow_filename = os.path.join(output_dir, "resultat_rainbow_map.png")
 
@@ -55,6 +56,7 @@ class FoodSegmenterNative:
 
             try:
                 output = self.processor.set_text_prompt(state=inference_state, prompt=food_name)
+                print(output["scores"])
                 masks = output["masks"]
                 
                 if masks is not None:
@@ -139,8 +141,10 @@ class FoodSegmenterNative:
         target_image_rgb.paste(solid_color_layer, mask=mask_pil)
 
 if __name__ == "__main__":
-    IMAGE_PATH = "images/Brocoli.jpeg" 
-    LISTE_ALIMENTS = ["rice", "broccoli", "carrot", "chicken"]
+    rospkg = rospkg.RosPack()
+    pkg_path = rospkg.get_path("vision_processing")
+    IMAGE_PATH = os.path.join(pkg_path, "resources/images_food/Penne.jpeg") 
+    LISTE_ALIMENTS = ["sliced tomato", "single penne pasta"]
     
     segmenter = FoodSegmenterNative()
     segmenter.process_food_list(IMAGE_PATH, LISTE_ALIMENTS)

@@ -11,4 +11,10 @@
         type="vision_server_robot_segmentation.py" 
         output="screen"
         required="true"/>
+
+  <node name="vision_server_trajectory" 
+        pkg="vision_processing" 
+        type="trajectory_server.py" 
+        output="screen"
+        required="true"/>
 </launch>
