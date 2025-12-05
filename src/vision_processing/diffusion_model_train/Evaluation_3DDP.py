@@ -8,8 +8,8 @@ import json
 from scipy.spatial.transform import Rotation as R
 
 # Import du modèle et des outils
-from Train_3DDP import DP3AgentRobust, Normalizer
-from Data_Loader_3DDP import Robot3DDataset
+from Train_urdf import DP3AgentRobust, Normalizer
+from Data_Loader_urdf import Robot3DDataset
 
 # --- UTILITAIRES ROTATION ---
 def ortho6d_to_rotation_matrix(d6):
@@ -93,7 +93,7 @@ def evaluate_robust():
 
     # 5. Évaluation sur 10 exemples aléatoires
     indices = np.random.choice(len(val_dataset), 10, replace=False)
-
+    indices = np.linspace(1, len(val_dataset), len(val_dataset), dtype=int)
     for i, idx in enumerate(indices):
         print(f"\n--- Séquence {idx} ---")
         sample = val_dataset[idx]

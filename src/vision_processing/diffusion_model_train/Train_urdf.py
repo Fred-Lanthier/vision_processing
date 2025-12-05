@@ -13,7 +13,7 @@ import rospkg
 import json
 
 # Import Dataset existant (On va le wrapper pour la normalisation)
-from Data_Loader_3DDP import Robot3DDataset
+from Data_Loader_urdf import Robot3DDataset
 
 # ==============================================================================
 # 1. ARCHITECTURE ROBOMIMIC (Nettoyée et Intégrée)
@@ -302,7 +302,7 @@ class DP3AgentRobust(nn.Module):
 # ==============================================================================
 
 def main():
-    BATCH_SIZE = 32
+    BATCH_SIZE = 64
     NUM_EPOCHS = 1000 # On augmente un peu car le modèle est plus gros
     LEARNING_RATE = 1e-4
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -408,7 +408,7 @@ def main():
         
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_best_robust.ckpt"))
+            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_best_robust_urdf.ckpt"))
             print("💾 Saved Best Model (Robust)")
 
 if __name__ == "__main__":

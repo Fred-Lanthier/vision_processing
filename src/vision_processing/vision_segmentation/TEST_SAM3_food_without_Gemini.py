@@ -19,7 +19,7 @@ class FoodSegmenterNative:
         if hasattr(self.model, "to"):
             self.model.to(self.device)
             
-        self.processor = Sam3Processor(self.model, confidence_threshold=0.25)
+        self.processor = Sam3Processor(self.model, confidence_threshold=0.1)
         print("✅ Modèle chargé avec succès.")
 
     def process_food_list(self, image_path, food_list):
@@ -82,8 +82,9 @@ class FoodSegmenterNative:
                     # On doit quand même combiner les masques pour l'affichage visuel
                     if masks.ndim > 2:
                         # On aplatit pour l'image (N, H, W) -> (H, W)
-                        masks_reshaped = masks.reshape(-1, masks.shape[-2], masks.shape[-1])
-                        combined_mask = np.any(masks_reshaped > 0, axis=0)
+                        scores = output["scores"].cpu().numpy()
+                        max_score_idx = np.argmax(scores)
+                        combined_mask = masks[max_score_idx] > 0
                     else:
                         combined_mask = masks > 0
 
@@ -114,10 +115,10 @@ class FoodSegmenterNative:
         mask_uint8 = (mask * 255).astype(np.uint8)
         
         try:
-            mask_pil = Image.fromarray(mask_uint8, mode='L')
+            mask_pil = Image.fromarray(mask_uint8)
         except Exception:
             mask_uint8 = np.squeeze(mask_uint8)
-            mask_pil = Image.fromarray(mask_uint8, mode='L')
+            mask_pil = Image.fromarray(mask_uint8)
 
         if mask_pil.size != image.size:
             mask_pil = mask_pil.resize(image.size, resample=Image.NEAREST)
@@ -130,10 +131,10 @@ class FoodSegmenterNative:
         solid_color_layer = Image.new("RGB", target_image_rgb.size, color_rgb)
         mask_uint8 = (mask * 255).astype(np.uint8)
         try:
-            mask_pil = Image.fromarray(mask_uint8, mode='L') 
+            mask_pil = Image.fromarray(mask_uint8) 
         except Exception:
              mask_uint8 = np.squeeze(mask_uint8)
-             mask_pil = Image.fromarray(mask_uint8, mode='L')
+             mask_pil = Image.fromarray(mask_uint8)
 
         if mask_pil.size != target_image_rgb.size:
             mask_pil = mask_pil.resize(target_image_rgb.size, resample=Image.NEAREST)
@@ -143,8 +144,9 @@ class FoodSegmenterNative:
 if __name__ == "__main__":
     rospkg = rospkg.RosPack()
     pkg_path = rospkg.get_path("vision_processing")
-    IMAGE_PATH = os.path.join(pkg_path, "resources/images_food/Penne.jpeg") 
-    LISTE_ALIMENTS = ["sliced tomato", "single penne pasta"]
+    step = 11
+    IMAGE_PATH = os.path.join(pkg_path, f"datas/Trajectories_record/Trajectory_{step}/images_Trajectory_{step}/ee_rgb_step_0001.png") 
+    LISTE_ALIMENTS = ["dark object in trapezoidal shape with pink side"]
     
     segmenter = FoodSegmenterNative()
     segmenter.process_food_list(IMAGE_PATH, LISTE_ALIMENTS)
