@@ -1,0 +1,44 @@
+<launch>
+  <arg name="arm_id" default="panda"/>
+  <arg name="paused" default="false"/>
+  
+  <!-- ============================================ -->
+  <!-- GAZEBO AVEC LE ROBOT                         -->
+  <!-- ============================================ -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="gui" value="true"/>
+    <arg name="use_sim_time" value="true"/>
+  </include>
+
+  <!-- Charger le robot -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro arm_id:=$(arg arm_id)" />
+
+  <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+        args="-param robot_description -urdf -model panda -z 0.0"/>
+
+  <!-- Contrôleurs Gazebo -->
+  <rosparam file="$(find vision_processing)/config/simple_controllers.yaml" command="load"/>
+  
+  <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="false" output="screen"
+        args="joint_state_controller effort_joint_trajectory_controller franka_gripper"/>
+
+  <!-- ============================================ -->
+  <!-- MOVEIT                                       -->
+  <!-- ============================================ -->
+  
+  <!-- Planning context -->
+  <include file="$(find panda_moveit_config)/launch/planning_context.launch">
+    <arg name="load_robot_description" value="false"/>
+  </include>
+  
+  <!-- Move group -->
+  <include file="$(find panda_moveit_config)/launch/move_group.launch">
+    <arg name="allow_trajectory_execution" value="true"/>
+    <arg name="moveit_controller_manager" value="simple"/>
+    <arg name="info" value="true"/>
+    <arg name="load_robot_description" value="false"/>
+  </include>
+
+</launch>

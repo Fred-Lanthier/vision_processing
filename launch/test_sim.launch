@@ -1,0 +1,36 @@
+<launch>
+  <arg name="arm_id" default="panda"/>
+  <arg name="paused" default="true"/>
+  <arg name="use_sim_time" default="true"/>
+  <arg name="gui" default="true"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="use_sim_time" value="$(arg use_sim_time)"/>
+  </include>
+
+  <param name="robot_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro arm_id:=$(arg arm_id)" />
+
+  <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+        args="-param robot_description -urdf -model panda -z 0.0
+              -J panda_joint1 -0.000059
+              -J panda_joint2 -0.125928
+              -J panda_joint3 0.000117
+              -J panda_joint4 -2.193312
+              -J panda_joint5 -0.000251
+              -J panda_joint6 2.064780
+              -J panda_joint7 0.785511" />
+
+  <rosparam file="$(find vision_processing)/config/simple_controllers.yaml" command="load"/>
+  
+  <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="false" output="screen"
+        args="joint_state_controller panda_arm_controller"/>
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" output="screen"/>
+  
+  <node name="set_initial_pose" pkg="vision_processing" type="set_initial_pose.py" 
+      output="screen" launch-prefix="bash -c 'sleep 5; $0 $@'"/>
+
+</launch>
