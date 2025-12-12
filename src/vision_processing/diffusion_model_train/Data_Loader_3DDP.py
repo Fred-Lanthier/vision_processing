@@ -186,7 +186,7 @@ class Robot3DDataset(Dataset):
         """
         # 1. Shift Global (+/- 2cm)
         # On déplace tout le monde (Robot + Env) ensemble
-        shift = np.random.uniform(low=-0.02, high=0.02, size=(1, 3))
+        shift = np.random.uniform(low=-0.05, high=0.05, size=(1, 3))
         
         pcd = pcd + shift
         obs_poses[:, :3] += shift

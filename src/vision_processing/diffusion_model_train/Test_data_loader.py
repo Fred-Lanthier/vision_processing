@@ -106,7 +106,7 @@ def visualize_sequence(dataset, idx=None, save_dir=None):
         ax.set_xlim(mid_x - max_range, mid_x + max_range)
         ax.set_ylim(mid_y - max_range, mid_y + max_range)
         ax.set_zlim(mid_z - max_range, mid_z + max_range)
-        ax.view_init(elev=30, azim=45)
+        ax.view_init(elev=0, azim=45)
 
     # SAUVEGARDE SSH
     if save_dir is None:
@@ -130,7 +130,7 @@ if __name__ == "__main__":
     dataset = Robot3DDataset(root_dir=data_path, pred_horizon=16, obs_horizon=2)
     
     # Générer 3 exemples aléatoires pour vérifier
-    idxs = [1, 35, 69]
+    idxs = [1, 35, 170]
     for i in range(3):
         print(f"\n--- Exemple {i+1}/3 ---")
         visualize_sequence(dataset, idx=idxs[i])

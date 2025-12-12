@@ -175,6 +175,7 @@ class ConditionalUnet1D(nn.Module):
 # ==============================================================================
 
 class DP3Encoder(nn.Module):
+
     def __init__(self, input_dim=3, output_dim=64):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -188,6 +189,27 @@ class DP3Encoder(nn.Module):
         x = self.mlp(x)
         x = torch.max(x, dim=1)[0]
         return self.projection(x)
+    
+    def save_gradient(self, module, grad_input, grad_output):
+        """
+        for grad-cam
+        """
+        self.gradient = grad_output[0]
+
+    def save_feature(self, module, input, output):
+        """
+        for grad-cam
+        """
+        if isinstance(output, tuple):
+            self.feature = output[0].detach()
+        else:
+            self.feature = output.detach()
+    
+    def save_input(self, module, input, output):
+        """
+        for grad-cam
+        """
+        self.input_pointcloud = input[0].detach()
 
 class Normalizer:
     def __init__(self, stats=None):
@@ -410,6 +432,9 @@ def main():
             best_val_loss = avg_val
             torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_best_robust_urdf.ckpt"))
             print("💾 Saved Best Model (Robust)")
+        else:
+            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_last_robust_urdf.ckpt"))
+            print("💾 Saved Last Model (Robust)")
 
 if __name__ == "__main__":
     main()

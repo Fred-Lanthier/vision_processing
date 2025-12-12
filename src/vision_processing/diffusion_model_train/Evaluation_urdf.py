@@ -8,8 +8,8 @@ import json
 from scipy.spatial.transform import Rotation as R
 
 # Import du modèle et des outils
-from Train_3DDP import DP3AgentRobust, Normalizer
-from Data_Loader_3DDP import Robot3DDataset
+from Train_urdf import DP3AgentRobust, Normalizer
+from Data_Loader_urdf import Robot3DDataset
 
 # --- UTILITAIRES ROTATION ---
 def ortho6d_to_rotation_matrix(d6):

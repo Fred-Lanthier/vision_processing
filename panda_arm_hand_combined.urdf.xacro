@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="panda">
+  
+  <!-- Include utilities -->
+  <xacro:include filename="$(find franka_description)/robots/common/utils.xacro"/>
+  
+  <!-- Load joint limits -->
+  <xacro:property name="joint_limits" value="${xacro.load_yaml('$(find fl_read_pose)/config/joint_limits.yaml')}"/>
+  
+  <!-- Include arm definition -->
+  <xacro:include filename="$(find franka_description)/robots/common/franka_arm.xacro"/>
+  
+  <!-- Include hand definition -->
+  <xacro:include filename="$(find franka_description)/robots/common/franka_hand.xacro"/>
+  
+  <!-- Your custom transformation parameters -->
+  <xacro:arg name="hand_rotation_angle" default="-0.7853981634"/>  <!-- in radians, or specify in degrees below -->
+  <xacro:property name="hand_z_offset" value="0.0"/>
+  
+  <!-- Instantiate the arm (connected to world frame) -->
+  <xacro:franka_arm 
+    arm_id="panda" 
+    connected_to="world"
+    joint_limits="${joint_limits}"/>
+  
+  <!-- Add intermediate link with your custom transformation -->
+  <link name="panda_hand_transform"/>
+  
+  <joint name="panda_hand_transform_joint" type="fixed">
+    <parent link="panda_link8"/>
+    <child link="panda_hand_transform"/>
+    <!-- Your transformation: rotation around Z + translation in Z -->
+    <origin xyz="0 0 ${hand_z_offset}" rpy="0 0 $(arg hand_rotation_angle)"/>
+  </joint>
+  
+  <!-- Instantiate the hand (connected to the transformed link) -->
+  <xacro:franka_hand 
+    arm_id="panda" 
+    connected_to="panda_hand_transform"
+    safety_distance="0.03"
+    gazebo="false"/>
+  
+</robot>

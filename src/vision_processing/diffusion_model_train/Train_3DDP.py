@@ -189,6 +189,27 @@ class DP3Encoder(nn.Module):
         x = torch.max(x, dim=1)[0]
         return self.projection(x)
 
+    def save_gradient(self, module, grad_input, grad_output):
+        """
+        for grad-cam
+        """
+        self.gradient = grad_output[0]
+
+    def save_feature(self, module, input, output):
+        """
+        for grad-cam
+        """
+        if isinstance(output, tuple):
+            self.feature = output[0].detach()
+        else:
+            self.feature = output.detach()
+    
+    def save_input(self, module, input, output):
+        """
+        for grad-cam
+        """
+        self.input_pointcloud = input[0].detach()
+
 class Normalizer:
     def __init__(self, stats=None):
         self.stats = stats
@@ -302,7 +323,7 @@ class DP3AgentRobust(nn.Module):
 # ==============================================================================
 
 def main():
-    BATCH_SIZE = 32
+    BATCH_SIZE = 64
     NUM_EPOCHS = 1000 # On augmente un peu car le modèle est plus gros
     LEARNING_RATE = 1e-4
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -410,6 +431,8 @@ def main():
             best_val_loss = avg_val
             torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_best_robust.ckpt"))
             print("💾 Saved Best Model (Robust)")
-
+        else:
+            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_last_robust.ckpt"))
+            print("💾 Saved Last Model (Robust)")
 if __name__ == "__main__":
     main()

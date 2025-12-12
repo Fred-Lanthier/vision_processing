@@ -87,7 +87,7 @@ def load_png_datas_static():
     
     static_rgb = []
     for i, trajectory_path in enumerate(Trajectories_path):
-        new_static_rgb = glob.glob(os.path.join(trajectory_path, f'images_Trajectory_{i+2}', 'static_rgb_step_*.png'))
+        new_static_rgb = glob.glob(os.path.join(trajectory_path, f'images_Trajectory_{i+1}', 'static_rgb_step_*.png'))
         new_static_rgb = sorted(new_static_rgb, key=lambda x: int(os.path.splitext(x)[0].split('_')[-1]))
         for j, _ in enumerate(new_static_rgb):
             static_rgb.append(new_static_rgb[j])
@@ -102,7 +102,7 @@ def load_depth_datas_static():
     # Load all the files
     static_depth = []
     for i, trajectory_path in enumerate(Trajectories_path):
-        static_depth.append(glob.glob(os.path.join(trajectory_path, f'images_Trajectory_{i+2}', 'static_depth_step_*.npy')))
+        static_depth.append(glob.glob(os.path.join(trajectory_path, f'images_Trajectory_{i+1}', 'static_depth_step_*.npy')))
     
     return ee_depth, static_depth
 
@@ -311,7 +311,7 @@ def segment_robot_and_create_pcd():
 
     # --- BOUCLE SUR LES TRAJECTOIRES ---
     for i, trajectory_path in enumerate(TRAJECTORIES_PATH):
-        traj_idx = i + 2
+        traj_idx = i + 1
         print(f"\n📂 Traitement Trajectoire {traj_idx}...")
 
         # 1. Définition des dossiers
@@ -594,14 +594,56 @@ def merge_pcd_trajectory():
         if not os.path.exists(json_path): continue
         with open(json_path, 'r') as f: json_data = json.load(f)
 
-        # --- OPTION B PREPARATION : Trouver le Grasp ---
-        # On cherche le Z minimum de l'effecteur pour savoir quand la saisie a lieu
-        positions = [s['end_effector_position'] for s in json_data['states']]
-        zs = [p[2] for p in positions]
-        grasp_idx = np.argmin(zs)
+        # --- OPTION B PREPARATION : Trouver le Grasp (Smart Detection) ---
+        states = json_data['states']
+        positions = [s['end_effector_position'] for s in states]
         
-        # Matrice du robot au moment du grasp (World)
+        # Récupération directe car c'est déjà une liste de nombres dans le JSON
+        orientations = [s['end_effector_orientation'] for s in states] 
+        
+        zs = np.array([p[2] for p in positions])
+        
+        # Conversion directe de la liste de listes en matrice NumPy (N, 4)
+        qs = np.array(orientations)
+
+        # 1. Trouver le point le plus bas absolu (fin probable du scoop)
+        min_z_idx = np.argmin(zs)
+
+        # 2. Remonter le temps pour trouver le début de la rotation (début du scoop)
+        grasp_idx = min_z_idx
+        
+        # Seuil : Si l'angle entre deux pas change de plus de ~0.5 degré (0.01 rad),
+        # on considère que c'est un mouvement volontaire du poignet.
+        rotation_threshold = 0.01 
+
+        # On remonte du point le plus bas (min_z) vers le début
+        for i in range(min_z_idx, 0, -1):
+            # Produit scalaire entre le quaternion i et i-1
+            dot_product = np.dot(qs[i], qs[i-1])
+            
+            # Gestion du "Double Cover" (q et -q sont la même rotation) et bornes num
+            dot_product = np.abs(dot_product)
+            dot_product = np.clip(dot_product, -1.0, 1.0) 
+            
+            # Calcul de l'angle de rotation entre les deux pas
+            angle_change = 2 * np.arccos(dot_product)
+
+            # TANT QUE l'angle change beaucoup, on est dans le "scoop".
+            # DÈS QUE l'angle devient stable (petit), on est revenu à la descente verticale.
+            if angle_change < rotation_threshold:
+                grasp_idx = i
+                break
+        
+        # Sécurité : Si on remonte trop loin (ex: début du fichier), on garde le min_z
+        if grasp_idx < 5: 
+             grasp_idx = min_z_idx
+             print(f"   ⚠️ Pas de rotation détectée avant le min Z, utilisation de min_z ({min_z_idx})")
+        else:
+             print(f"   Success: Grasp détecté à l'idx {grasp_idx} (Début rotation), Min Z était à {min_z_idx}")
+
         grasp_state = json_data['states'][grasp_idx]
+        
+        # Note: Assurez-vous que votre fonction pose_to_matrix accepte une liste pour l'orientation
         T_world_grasp = pose_to_matrix(
             grasp_state['end_effector_position'], 
             grasp_state['end_effector_orientation']
@@ -831,67 +873,61 @@ def update_json_merged_pcd():
         except Exception as e:
             print(f"  ❌ Erreur écriture {json_path} : {e}")
 
-    print(f"\n🎉 Terminé ! {count_updated} fichiers JSON ont été mis à jour avec le champ 'Merged_point_cloud'.")
+    print(f"\n🎉 Terminé ! {count_updated} fichiers JSON ont été mis à jour avec le champ 'Merged_point_cloud' et 'Merged_urdf_point_cloud'.")
 
 def main():
 
-    print("="*80)
-    print("Step 0 : Vérifier quelles trajectoires ont déjà été traitées")
-    print("="*80)
-    
-
-
-    print("="*80)
-    print("Step 1 : Convertir les PNG static en JPG pour faire la segmentation et le tracking avec SAM 2")
-    print("="*80)
-    start_time = time.time()
-    png_datas = load_png_datas_static()
-    
-    for png_path in png_datas:
-        directory_path = os.path.dirname(png_path)
-        filename = os.path.basename(png_path)
-        name_no_ext = os.path.splitext(filename)[0]
+    # print("="*80)
+    # print("Step 1 : Convertir les PNG static en JPG pour faire la segmentation et le tracking avec SAM 2")
+    # print("="*80)
+    # start_time = time.time()
+    # png_datas = load_png_datas_static()
+    # print(png_datas)
+    # for png_path in png_datas:
+    #     directory_path = os.path.dirname(png_path)
+    #     filename = os.path.basename(png_path)
+    #     name_no_ext = os.path.splitext(filename)[0]
         
-        directory_path = directory_path.replace("Trajectories_record", "Trajectories_preprocess")
+    #     directory_path = directory_path.replace("Trajectories_record", "Trajectories_preprocess")
         
-        try:
-            # On extrait le numéro "11" depuis "static_rgb_step_11"
-            step_number = int(name_no_ext.split('_')[-1])
+    #     try:
+    #         # On extrait le numéro "11" depuis "static_rgb_step_11"
+    #         step_number = int(name_no_ext.split('_')[-1])
             
-            # On définit le nom CIBLE qu'on veut obtenir : "0011.jpg"
-            target_name = f"{step_number:04d}.jpg"
-            target_path = os.path.join(directory_path, target_name)
+    #         # On définit le nom CIBLE qu'on veut obtenir : "0011.jpg"
+    #         target_name = f"{step_number:04d}.jpg"
+    #         target_path = os.path.join(directory_path, target_name)
             
-            # LE TEST ULTIME : Si le résultat existe déjà, on passe !
-            if os.path.exists(target_path):
-                # print(f"Le fichier {target_name} existe déjà. Skip.")
-                continue
+    #         # LE TEST ULTIME : Si le résultat existe déjà, on passe !
+    #         if os.path.exists(target_path):
+    #             print(f"Le fichier {target_name} existe déjà. Skip.")
+    #             continue
 
-            # Sinon, on lance la conversion
-            print(f"Création de {target_name} à partir de {filename}...")
-            jpg_path = os.path.join(directory_path, target_name)
-            print(jpg_path)
-            png_to_jpg_static(png_path, jpg_path)
-        except Exception as e:
-            print(f"Erreur sur {png_path}: {e}")
-    end_time = time.time()
-    print(f"Temps total pour transformer les PNG static en JPG : {end_time - start_time}")
+    #         # Sinon, on lance la conversion
+    #         print(f"Création de {target_name} à partir de {filename}...")
+    #         jpg_path = os.path.join(directory_path, target_name)
+    #         print(jpg_path)
+    #         png_to_jpg_static(png_path, jpg_path)
+    #     except Exception as e:
+    #         print(f"Erreur sur {png_path}: {e}")
+    # end_time = time.time()
+    # print(f"Temps total pour transformer les PNG static en JPG : {end_time - start_time}")
     
     
-    print("="*80)
-    print("Step 2 : Ajouter les fichiers json dans les nouveaux dossiers")
-    print("="*80)
-    start_time = time.time()
-    mappings = get_json_paths_map()
-    for src, dest in mappings:
-        print(f"Source: {os.path.basename(src)} -> Dest: {dest}")
-        with open(src, 'r') as f:
-            data = json.load(f)
-        with open(dest, 'w') as f:
-            json.dump(data, f)
+    # print("="*80)
+    # print("Step 2 : Ajouter les fichiers json dans les nouveaux dossiers")
+    # print("="*80)
+    # start_time = time.time()
+    # mappings = get_json_paths_map()
+    # for src, dest in mappings:
+    #     print(f"Source: {os.path.basename(src)} -> Dest: {dest}")
+    #     with open(src, 'r') as f:
+    #         data = json.load(f)
+    #     with open(dest, 'w') as f:
+    #         json.dump(data, f)
         
-    end_time = time.time()
-    print(f"Temps total pour ajouter les fichiers json dans les nouveaux dossiers : {end_time - start_time}")
+    # end_time = time.time()
+    # print(f"Temps total pour ajouter les fichiers json dans les nouveaux dossiers : {end_time - start_time}")
     
     # print("="*80)
     # print("Step 3 : Segmenter les images avec SAM 2 et creer les nuages de points du robot segmenté et de la nourriture segmentée")

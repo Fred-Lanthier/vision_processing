@@ -186,7 +186,7 @@ class Robot3DDataset(Dataset):
         """
         # 1. Shift Global (+/- 2cm)
         # On déplace tout le monde (Robot + Env) ensemble
-        shift = np.random.uniform(low=-0.02, high=0.02, size=(1, 3))
+        shift = np.random.uniform(low=-0.05, high=0.05, size=(1, 3))
         
         pcd = pcd + shift
         obs_poses[:, :3] += shift
@@ -217,7 +217,7 @@ if __name__ == "__main__":
             sample = dataset[0]
             print("Sample keys:", sample.keys())
             print("PC shape:", sample['point_cloud'].shape)   # Attendu: (1024, 3)
-            print("Agent Obs shape:", sample['agent_pos'].shape) # Attendu: (2, 6)
-            print("Action shape:", sample['action'].shape)       # Attendu: (16, 6)
+            print("Agent Obs shape:", sample['agent_pos'].shape) # Attendu: (2, 9)
+            print("Action shape:", sample['action'].shape)       # Attendu: (16, 9)
     except Exception as e:
         print(f"Error during test: {e}")

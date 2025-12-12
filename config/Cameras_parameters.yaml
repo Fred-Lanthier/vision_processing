@@ -5,7 +5,7 @@ Static_camera:
     cy: 249.23504639
 
 End_effector_camera:
-    fx: 500
-    fy: 500
-    cx: 320
-    cy: 240
+    fx: 607.18261719
+    fy: 606.91986084
+    cx: 320.85250854
+    cy: 243.40284729
