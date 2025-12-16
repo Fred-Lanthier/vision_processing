@@ -2,12 +2,19 @@ cmake_minimum_required(VERSION 3.0.2)
 project(vision_processing)
 
 find_package(catkin REQUIRED COMPONENTS
+  roscpp
   rospy
   std_msgs
   sensor_msgs
   cv_bridge
+  geometry_msgs
+  moveit_core
+  moveit_ros_planning
+  moveit_ros_planning_interface
   message_generation
 )
+
+find_package(OpenCV REQUIRED)
 
 ## Add service files
 add_service_files(
@@ -32,8 +39,19 @@ catkin_package(
     std_msgs 
     sensor_msgs 
     cv_bridge
+    geometry_msgs
+    moveit_core
+    moveit_ros_planning
+    moveit_ros_planning_interface
     message_runtime
 )
+
+include_directories(
+  ${catkin_INCLUDE_DIRS}
+)
+
+add_executable(franka_state_camera_reader src/vision_processing/gazebo_simulation/franka_state_camera_reader.cpp)
+target_link_libraries(franka_state_camera_reader ${catkin_LIBRARIES})
 set(PYTHON_EXECUTABLE "/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3")
 
 catkin_install_python(PROGRAMS
