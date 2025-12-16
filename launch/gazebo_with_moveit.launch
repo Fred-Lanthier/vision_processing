@@ -22,7 +22,7 @@
   <rosparam file="$(find vision_processing)/config/simple_controllers.yaml" command="load"/>
   
   <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="false" output="screen"
-        args="joint_state_controller effort_joint_trajectory_controller franka_gripper"/>
+        args="joint_state_controller effort_joint_trajectory_controller"/>
 
   <!-- ============================================ -->
   <!-- MOVEIT                                       -->

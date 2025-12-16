@@ -877,82 +877,82 @@ def update_json_merged_pcd():
 
 def main():
 
-    # print("="*80)
-    # print("Step 1 : Convertir les PNG static en JPG pour faire la segmentation et le tracking avec SAM 2")
-    # print("="*80)
-    # start_time = time.time()
-    # png_datas = load_png_datas_static()
-    # print(png_datas)
-    # for png_path in png_datas:
-    #     directory_path = os.path.dirname(png_path)
-    #     filename = os.path.basename(png_path)
-    #     name_no_ext = os.path.splitext(filename)[0]
+    print("="*80)
+    print("Step 1 : Convertir les PNG static en JPG pour faire la segmentation et le tracking avec SAM 2")
+    print("="*80)
+    start_time = time.time()
+    png_datas = load_png_datas_static()
+    print(png_datas)
+    for png_path in png_datas:
+        directory_path = os.path.dirname(png_path)
+        filename = os.path.basename(png_path)
+        name_no_ext = os.path.splitext(filename)[0]
         
-    #     directory_path = directory_path.replace("Trajectories_record", "Trajectories_preprocess")
+        directory_path = directory_path.replace("Trajectories_record", "Trajectories_preprocess")
         
-    #     try:
-    #         # On extrait le numéro "11" depuis "static_rgb_step_11"
-    #         step_number = int(name_no_ext.split('_')[-1])
+        try:
+            # On extrait le numéro "11" depuis "static_rgb_step_11"
+            step_number = int(name_no_ext.split('_')[-1])
             
-    #         # On définit le nom CIBLE qu'on veut obtenir : "0011.jpg"
-    #         target_name = f"{step_number:04d}.jpg"
-    #         target_path = os.path.join(directory_path, target_name)
+            # On définit le nom CIBLE qu'on veut obtenir : "0011.jpg"
+            target_name = f"{step_number:04d}.jpg"
+            target_path = os.path.join(directory_path, target_name)
             
-    #         # LE TEST ULTIME : Si le résultat existe déjà, on passe !
-    #         if os.path.exists(target_path):
-    #             print(f"Le fichier {target_name} existe déjà. Skip.")
-    #             continue
+            # LE TEST ULTIME : Si le résultat existe déjà, on passe !
+            if os.path.exists(target_path):
+                print(f"Le fichier {target_name} existe déjà. Skip.")
+                continue
 
-    #         # Sinon, on lance la conversion
-    #         print(f"Création de {target_name} à partir de {filename}...")
-    #         jpg_path = os.path.join(directory_path, target_name)
-    #         print(jpg_path)
-    #         png_to_jpg_static(png_path, jpg_path)
-    #     except Exception as e:
-    #         print(f"Erreur sur {png_path}: {e}")
-    # end_time = time.time()
-    # print(f"Temps total pour transformer les PNG static en JPG : {end_time - start_time}")
+            # Sinon, on lance la conversion
+            print(f"Création de {target_name} à partir de {filename}...")
+            jpg_path = os.path.join(directory_path, target_name)
+            print(jpg_path)
+            png_to_jpg_static(png_path, jpg_path)
+        except Exception as e:
+            print(f"Erreur sur {png_path}: {e}")
+    end_time = time.time()
+    print(f"Temps total pour transformer les PNG static en JPG : {end_time - start_time}")
     
     
-    # print("="*80)
-    # print("Step 2 : Ajouter les fichiers json dans les nouveaux dossiers")
-    # print("="*80)
-    # start_time = time.time()
-    # mappings = get_json_paths_map()
-    # for src, dest in mappings:
-    #     print(f"Source: {os.path.basename(src)} -> Dest: {dest}")
-    #     with open(src, 'r') as f:
-    #         data = json.load(f)
-    #     with open(dest, 'w') as f:
-    #         json.dump(data, f)
+    print("="*80)
+    print("Step 2 : Ajouter les fichiers json dans les nouveaux dossiers")
+    print("="*80)
+    start_time = time.time()
+    mappings = get_json_paths_map()
+    for src, dest in mappings:
+        print(f"Source: {os.path.basename(src)} -> Dest: {dest}")
+        with open(src, 'r') as f:
+            data = json.load(f)
+        with open(dest, 'w') as f:
+            json.dump(data, f)
         
-    # end_time = time.time()
-    # print(f"Temps total pour ajouter les fichiers json dans les nouveaux dossiers : {end_time - start_time}")
+    end_time = time.time()
+    print(f"Temps total pour ajouter les fichiers json dans les nouveaux dossiers : {end_time - start_time}")
     
-    # print("="*80)
-    # print("Step 3 : Segmenter les images avec SAM 2 et creer les nuages de points du robot segmenté et de la nourriture segmentée")
-    # print("="*80)
-    # start_time = time.time()
+    print("="*80)
+    print("Step 3 : Segmenter les images avec SAM 2 et creer les nuages de points du robot segmenté et de la nourriture segmentée")
+    print("="*80)
+    start_time = time.time()
     
-    # try:
-    #     # Lancement de la fonction principale
-    #     segment_robot_and_create_pcd()
+    try:
+        # Lancement de la fonction principale
+        segment_robot_and_create_pcd()
         
-    # except KeyboardInterrupt:
-    #     print("\n🛑 Interruption par l'utilisateur.")
+    except KeyboardInterrupt:
+        print("\n🛑 Interruption par l'utilisateur.")
         
-    # end_time = time.time()
-    # print(f"Temps total pour segmenter les nuages de points : {end_time - start_time}")
+    end_time = time.time()
+    print(f"Temps total pour segmenter les nuages de points : {end_time - start_time}")
     
 
-    # print("="*80)
-    # print("Step 4 : Segmenter la nourriture dans l'assiette et créer le nuage de point correspondant.")
-    # print("="*80)
-    # force_gpu_clear()
-    # start_time = time.time()
-    # segment_food_init_step()
-    # end_time = time.time()
-    # print(f"Temps total pour segmenter la nourriture dans l'assiette et créer le nuage de point correspondant : {end_time - start_time}")
+    print("="*80)
+    print("Step 4 : Segmenter la nourriture dans l'assiette et créer le nuage de point correspondant.")
+    print("="*80)
+    force_gpu_clear()
+    start_time = time.time()
+    segment_food_init_step()
+    end_time = time.time()
+    print(f"Temps total pour segmenter la nourriture dans l'assiette et créer le nuage de point correspondant : {end_time - start_time}")
     
     print("="*80)
     print("Step 5 : Créer les nuages de points merge du robot segmenter et de la nourriture segmentée.")

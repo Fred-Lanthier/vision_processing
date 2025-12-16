@@ -2,8 +2,7 @@ joint_state_controller:
   type: joint_state_controller/JointStateController
   publish_rate: 30
 
-# 👇 RENOMMÉ pour matcher ce que MoveIt cherche
-effort_joint_trajectory_controller:  # Avant: panda_arm_controller
+effort_joint_trajectory_controller:
   type: position_controllers/JointTrajectoryController
   joints:
     - panda_joint1
@@ -13,13 +12,16 @@ effort_joint_trajectory_controller:  # Avant: panda_arm_controller
     - panda_joint5
     - panda_joint6
     - panda_joint7
-
-# Gripper - on garde franka_gripper
-franka_gripper:
-  type: position_controllers/JointTrajectoryController
-  joints:
-    - panda_finger_joint1
-    - panda_finger_joint2
+  constraints:
+    goal_time: 1.0  # Augmenté de 0.5 à 1.0
+    # Tolérances beaucoup plus permissives
+    panda_joint1: {trajectory: 0.1, goal: 0.05}  # Avant: 0.05, 0.01
+    panda_joint2: {trajectory: 0.1, goal: 0.05}
+    panda_joint3: {trajectory: 0.1, goal: 0.05}
+    panda_joint4: {trajectory: 0.1, goal: 0.05}
+    panda_joint5: {trajectory: 0.1, goal: 0.05}
+    panda_joint6: {trajectory: 0.1, goal: 0.05}
+    panda_joint7: {trajectory: 0.1, goal: 0.05}
 
 gazebo_ros_control:
   pid_gains:

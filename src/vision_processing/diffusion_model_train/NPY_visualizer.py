@@ -32,7 +32,7 @@ def quick_3d_view(depth_image_path, filter_percentile=0):
     ax.set_xlim([-0.1, 0.6])
     ax.set_ylim([-0.4, 0.4])
     ax.set_zlim([0, 0.8])
-    ax.view_init(elev=0, azim=90) # Set view angle (elevation, azimuth)
+    ax.view_init(elev=30, azim=45) # Set view angle (elevation, azimuth)
 
     ax.set_title(f'3D View (filtered {filter_percentile}% outliers from each end)')
     plt.colorbar(scatter, label='Z (m)')
@@ -45,7 +45,7 @@ def main():
 
     # --- Build both file paths dynamically ---
     base_path = os.path.join(package_path, 'datas')
-    depth_image_path = f"{base_path}/Trajectories_preprocess/Trajectory_17/Merged_urdf_Trajectory_17/Merged_urdf_0059.npy"
+    depth_image_path = f"{base_path}/Trajectories_preprocess/Trajectory_17/Merged_pcd_Trajectory_17/Merged_0059.npy"
     # json_path = f"{base_path}/Trajectories_preprocess/Trajectory_9/trajectory_9.json"
     
     quick_3d_view(depth_image_path)

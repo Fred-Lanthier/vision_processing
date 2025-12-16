@@ -99,5 +99,70 @@
       <robotSimType>gazebo_ros_control/DefaultRobotHWSim</robotSimType>
     </plugin>
   </gazebo>
-
+	
+<!-- ============================================ -->
+  <!-- MATÉRIAUX GAZEBO (pour les couleurs)         -->
+  <!-- ============================================ -->
+  
+  <!-- Couleur blanche pour tous les liens du bras -->
+  <gazebo reference="$(arg arm_id)_link0">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_link1">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_link2">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_link3">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_link4">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_link5">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_link6">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_link7">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_link8">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <!-- Gripper en gris foncé -->
+  <gazebo reference="$(arg arm_id)_hand">
+    <material>Gazebo/DarkGrey</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_leftfinger">
+    <material>Gazebo/DarkGrey</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_rightfinger">
+    <material>Gazebo/DarkGrey</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_hand">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_leftfinger">
+    <material>Gazebo/White</material>
+  </gazebo>
+  
+  <gazebo reference="$(arg arm_id)_rightfinger">
+    <material>Gazebo/White</material>
+  </gazebo>
 </robot>

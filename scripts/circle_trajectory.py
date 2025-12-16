@@ -6,11 +6,14 @@ Faire un cercle avec l'effecteur du Franka Panda dans Gazebo
 """
 
 import rospy
+import rospkg
 import moveit_commander
 import sys
 from geometry_msgs.msg import Pose
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+import json
+import os
 
 def create_pose_with_orientation(x, y, z, roll_deg, pitch_deg, yaw_deg):
     """Créer une pose avec position et orientation en angles Euler"""
@@ -30,6 +33,19 @@ def create_pose_with_orientation(x, y, z, roll_deg, pitch_deg, yaw_deg):
     
     return pose
 
+def create_pose_with_quaternion(xyz, quat):
+    """Créer une pose avec position et orientation en quaternions"""
+    pose = Pose()
+    pose.position.x = xyz[0]
+    pose.position.y = xyz[1]
+    pose.position.z = xyz[2]
+    
+    pose.orientation.x = quat[0]
+    pose.orientation.y = quat[1]
+    pose.orientation.z = quat[2]
+    pose.orientation.w = quat[3]
+    
+    return pose
 def move_through_waypoints(move_group, waypoints, speed=0.1):
     """Exécute une trajectoire cartésienne"""
     rospy.loginfo(f"Planification à travers {len(waypoints)} waypoints...")
@@ -133,8 +149,8 @@ def main():
     center_x = current_pose.position.x
     center_y = current_pose.position.y
     center_z = current_pose.position.z
-    radius = 0.05  # 5 cm de rayon
-    n_points = 16  # 16 points
+    radius = 0.2  # 5 cm de rayon
+    n_points = 200  # 16 points
     
     # Orientation fixe: effecteur vers le bas
     # Pour Gazebo, roll=-180° fait pointer l'effecteur vers le bas
@@ -149,19 +165,42 @@ def main():
     waypoints = []
     angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
     
-    for angle in angles:
-        x = center_x + radius * np.cos(angle)
-        y = center_y + radius * np.sin(angle)
-        z = center_z
+    package_path = rospkg.RosPack().get_path('vision_processing')
+    step = 10
+    json_path = os.path.join(package_path, 'datas', 'Trajectories_preprocess', f'Trajectory_{step}', f'trajectory_{step}.json')
+    with open(json_path, 'r') as f:
+        datas = json.load(f)
+        states = datas['states']
+        for state in states:
+            end_effector_position = state['end_effector_position']
+            end_effector_orientation = state['end_effector_orientation']
+            pose = create_pose_with_quaternion(end_effector_position, end_effector_orientation)
+            if not waypoints:
+                waypoints.append(pose)
+            else:
+                last_pose = waypoints[-1]
+                import math
+                dist = math.sqrt(
+                    (pose.position.x - last_pose.position.x)**2 +
+                    (pose.position.y - last_pose.position.y)**2 +
+                    (pose.position.z - last_pose.position.z)**2
+                )
+                if dist >= 1e-5:
+                    waypoints.append(pose)
+            
+    # for angle in angles:
+    #     x = center_x + radius * np.cos(angle)
+    #     y = center_y + radius * np.sin(angle)
+    #     z = center_z
         
-        # Créer la pose avec orientation contrôlée
-        pose = create_pose_with_orientation(
-            x, y, z,
-            roll_deg=target_roll,
-            pitch_deg=target_pitch,
-            yaw_deg=target_yaw
-        )
-        waypoints.append(pose)
+    #     # Créer la pose avec orientation contrôlée
+    #     pose = create_pose_with_orientation(
+    #         x, y, z,
+    #         roll_deg=target_roll,
+    #         pitch_deg=target_pitch,
+    #         yaw_deg=target_yaw
+    #     )
+    #     waypoints.append(pose)
     
     # Fermer le cercle
     waypoints.append(waypoints[0])
