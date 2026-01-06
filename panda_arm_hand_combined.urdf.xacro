@@ -40,4 +40,24 @@
     safety_distance="0.03"
     gazebo="false"/>
   
+  <!-- Add fork tip link and joint -->
+  <link name="fork_tip">
+    <visual>
+      <geometry>
+        <mesh filename="$(find vision_processing)/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="$(find vision_processing)/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="fork_tip_joint" type="fixed">
+    <origin rpy="0 ${-(30+90)/360*2*pi} ${-(45+5)/360*2*pi}" xyz="-0.009 0.009 0.233"/>
+    <parent link="panda_link8"/>
+    <child link="fork_tip"/>
+  </joint>
+
 </robot>

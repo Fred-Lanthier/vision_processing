@@ -1,0 +1,31 @@
+# Backend Framework
+fastapi
+uvicorn[standard]
+sqlalchemy
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+python-dotenv
+
+# AI & Processing
+google-genai
+torch
+torchvision
+numpy
+opencv-python
+pillow
+requests
+scikit-learn
+scipy
+typing-extensions>=4.10.0
+
+# DUSt3R & Dependencies
+roma
+gradio
+matplotlib
+tqdm
+einops
+trimesh
+tensorboard
+pyglet<2
+huggingface-hub[torch]>=0.22.0

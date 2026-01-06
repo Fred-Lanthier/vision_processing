@@ -338,33 +338,7 @@ class FoodSegmenterTotal:
 
     def get_food_list_from_gemini(self, image_pil):
         print("🤖 [GEMINI] Analyse de l'image...")
-        prompt_text = """
-        You are the vision system for a robotic arm. Your task is to identify "Graspable Targets".
-        
-        Analyze the image and return a Python list of strings based on these STRICT structural rules:
-
-        1. THE "COATING" RULE (CRITICAL):
-           - If a substance is poured over, mixed into, or coating another item, it is NOT a target. It is just an attribute of the main item.
-           - Example: Pasta with tomato sauce -> Detect ONLY 'penne pasta'. (Ignore the sauce, ignore chunks of tomato in the sauce).
-           - Example: Salad with dressing -> Detect ONLY 'lettuce', 'cucumber'. (Ignore the dressing).
-           
-        2. THE "MOUND" RULE:
-           - Semi-solids (pastes, dips, mashes) are VALID targets ONLY if they form a standalone, vertical mound or reside in a dedicated container/corner.
-           - Example: A scoop of guacamole next to chips -> Detect 'guacamole'.
-           - Example: A pile of mashed potatoes -> Detect 'mashed potatoes'.
-
-        3. THE "CHUNK" RULE:
-           - Distinct solid pieces are valid.
-           - Example: Sausage slices on top of pasta -> Detect 'sausage slices'.
-           - Example: Meatballs in sauce -> Detect 'meatballs'.
-
-        INSTRUCTIONS:
-        - Return ONLY the names of the solid base items or standalone mounds.
-        - Do NOT include adjectives describing the sauce (e.g., return 'pasta', NOT 'pasta with sauce').
-        - Do NOT output descriptions, just the list.
-        
-        Output format: ['item1', 'item2', 'item3']
-        """
+        prompt_text = 
         try:
             response = self.client.models.generate_content(
                 model="gemini-2.5-flash",

@@ -2,14 +2,14 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 import rospkg
 import json
 from scipy.spatial.transform import Rotation as R
 
 # Import du modèle et des outils
 from Train_3DDP import DP3AgentRobust, Normalizer
-from Data_Loader_3DDP import Robot3DDataset
+from Data_Loader_3DDP import Robot3DDataset, seed_everything
 
 # --- UTILITAIRES ROTATION ---
 def ortho6d_to_rotation_matrix(d6):
@@ -53,6 +53,7 @@ def compute_errors(gt_action, pred_action):
     return mean_pos_err_cm, mean_rot_err_deg
 
 def evaluate_robust():
+    seed_everything(42)
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🚀 Evaluation Avancée sur {DEVICE}")
 
@@ -71,7 +72,7 @@ def evaluate_robust():
     normalizer = Normalizer(stats)
 
     # 2. Dataset
-    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.1)
+    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42)
     print(f"📦 Validation Set: {len(val_dataset)} séquences")
 
     # 3. Modèle
@@ -84,7 +85,7 @@ def evaluate_robust():
     model.eval()
 
     # 4. Scheduler
-    noise_scheduler = DDPMScheduler(
+    noise_scheduler = DDIMScheduler(
         num_train_timesteps=100,
         beta_schedule='squaredcos_cap_v2',
         clip_sample=True,
@@ -92,6 +93,7 @@ def evaluate_robust():
     )
 
     # 5. Évaluation sur 10 exemples aléatoires
+    np.random.seed(42)
     indices = np.random.choice(len(val_dataset), 10, replace=False)
     # indices = np.array([150,175,200])
     for i, idx in enumerate(indices):
@@ -111,7 +113,7 @@ def evaluate_robust():
             global_cond = torch.cat([p_feat, r_feat], dim=-1)
             
             noisy_action = torch.randn((1, 16, 9), device=DEVICE)
-            noise_scheduler.set_timesteps(100)
+            noise_scheduler.set_timesteps(10)
             
             for t in noise_scheduler.timesteps:
                 timesteps = torch.tensor([t], device=DEVICE).long()
@@ -165,7 +167,7 @@ def visualize_advanced(pcd, obs_hist, gt_action, pred_action, idx, pos_err, rot_
     print(f"✅ Image sauvegardée : {save_name}")
 
 def setup_plot_3d(ax, pcd, obs, gt, pred, title):
-    ax.scatter(pcd[::5, 0], pcd[::5, 1], pcd[::5, 2], s=1, c='gray', alpha=0.2)
+    ax.scatter(pcd[::5, 0], pcd[::5, 1], pcd[::5, 2], s=1, c='gray', alpha=0.1)
     ax.plot(obs[:,0], obs[:,1], obs[:,2], c='blue', label='Passé')
     ax.plot(gt[:,0], gt[:,1], gt[:,2], c='green', linestyle='--', label='Vérité')
     ax.plot(pred[:,0], pred[:,1], pred[:,2], c='red', linewidth=2, label='Pred')
@@ -211,20 +213,20 @@ def analyze_horizon_error():
     with open(stats_path, 'r') as f: stats = json.load(f)
     normalizer = Normalizer(stats)
 
-    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.1)
+    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=32, shuffle=False)
     
     model = DP3AgentRobust(action_dim=9, robot_state_dim=9, obs_horizon=2, pred_horizon=16).to(DEVICE)
     model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
     model.eval()
 
-    noise_scheduler = DDPMScheduler(
+    noise_scheduler = DDIMScheduler(
         num_train_timesteps=100,
         beta_schedule='squaredcos_cap_v2',
         clip_sample=True,
         prediction_type='epsilon'
     )
-    noise_scheduler.set_timesteps(100)
+    noise_scheduler.set_timesteps(10)
 
     print("📊 Calcul en cours sur le set de validation...")
     

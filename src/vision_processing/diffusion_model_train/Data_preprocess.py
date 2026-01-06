@@ -16,6 +16,7 @@ from PIL import Image
 import numpy as np
 import gc
 from tqdm import tqdm
+import fpsample
 from scipy.spatial.transform import Rotation as R
 
 # --- IMPORTS SAM 3 ---
@@ -703,6 +704,14 @@ def merge_pcd_trajectory():
                 else:
                     merged_points = robot_points_world
 
+                # --- AJOUT FPS ICI ---
+                num_target_points = 1024 
+                if merged_points.shape[0] > num_target_points:
+                    # Utilisation de fpsample pour réduire à 1024 points immédiatement
+                    indices = fpsample.bucket_fps_kdline_sampling(merged_points.astype(np.float32), num_target_points, h=5)
+                    merged_points = merged_points[indices]
+                # ----------------------
+
                 # 5. SAVE
                 save_name = f"Merged_{step_str}.npy"
                 save_path = os.path.join(output_dir, save_name)
@@ -738,10 +747,10 @@ def merge_pcd_trajectory_urdf():
         traj_folder_rec = os.path.join(base_path_record, folder_name)
         robot_urdf_folder = os.path.join(traj_folder_rec, f'images_{folder_name}')
         
-        output_dir = os.path.join(traj_folder_proc, f'Merged_urdf_{folder_name}')
+        output_dir = os.path.join(traj_folder_proc, f'Merged_urdf_fork_{folder_name}')
         os.makedirs(output_dir, exist_ok=True)
 
-        print(f"\n📂 Traitement URDF : {folder_name}")
+        print(f"\n📂 Traitement URDF avec fork: {folder_name}")
 
         if not os.path.exists(json_path): continue
         with open(json_path, 'r') as f: json_data = json.load(f)
@@ -806,7 +815,15 @@ def merge_pcd_trajectory_urdf():
                 else:
                     merged_points = robot_points_world
 
-                save_name = f"Merged_urdf_{step_str}.npy"
+                # --- AJOUT FPS ICI ---
+                num_target_points = 1024 
+                if merged_points.shape[0] > num_target_points:
+                    # Utilisation de fpsample pour réduire à 1024 points immédiatement
+                    indices = fpsample.bucket_fps_kdline_sampling(merged_points.astype(np.float32), num_target_points, h=5)
+                    merged_points = merged_points[indices]
+                # ----------------------
+
+                save_name = f"Merged_urdf_fork_{step_str}.npy"
                 save_path = os.path.join(output_dir, save_name)
                 np.save(save_path, merged_points)
 
@@ -860,8 +877,8 @@ def update_json_merged_pcd():
                     # Comme c'est la dernière modification, elle sera à la fin du bloc state
                     state['Merged_point_cloud'] = merged_filename
 
-                    merged_filename = f"Merged_urdf_{int(step_num):04d}.npy" # <--- CHANGEMENT ICI
-                    state['Merged_urdf_point_cloud'] = merged_filename
+                    merged_filename = f"Merged_urdf_fork_{int(step_num):04d}.npy" # <--- CHANGEMENT ICI
+                    state['Merged_urdf_fork_point_cloud'] = merged_filename
 
         # 3. Sauvegarde du JSON mis à jour
         try:

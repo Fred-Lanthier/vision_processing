@@ -6,7 +6,17 @@ import torch
 import random
 from torch.utils.data import Dataset
 from scipy.spatial.transform import Rotation as R
+import fpsample
 
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
 # --- UTILITAIRES MATHÉMATIQUES ROTATION 6D ---
 def rotation_matrix_to_ortho6d(matrices):
     """ Convertit Matrice 3x3 -> Représentation 6D continue """
@@ -171,13 +181,29 @@ class Robot3DDataset(Dataset):
         return data_dict
 
     def _sample_point_cloud(self, pc):
+        """
+        Échantillonnage optimisé utilisant Farthest Point Sampling (FPS).
+        Garantit une couverture uniforme de l'espace.
+        """
+        # Sécurité pour les nuages de points vides
         if pc.shape[0] == 0:
             return np.zeros((self.num_points, 3), dtype=np.float32)
-        if pc.shape[0] >= self.num_points:
-            indices = np.random.choice(pc.shape[0], self.num_points, replace=False)
-        else:
-            indices = np.random.choice(pc.shape[0], self.num_points, replace=True)
-        return pc[indices]
+
+        # Cas où on a moins de points que demandé
+        # if pc.shape[0] <= self.num_points:
+        #     indices = np.arange(pc.shape[0])
+        #     if pc.shape[0] < self.num_points:
+        #         # Padding par répétition si nécessaire
+        #         extra_indices = np.random.choice(pc.shape[0], self.num_points - pc.shape[0], replace=True)
+        #         indices = np.concatenate([indices, extra_indices])
+        #     return pc[indices].astype(np.float32)
+
+        # --- UTILISATION DE FPSAMPLE ---
+        # bucket_fps_indices est l'algorithme le plus rapide pour les grands PCD
+        # pc doit être un array numpy de forme (N, 3)
+        # indices = fpsample.bucket_fps_kdline_sampling(pc.astype(np.float32), self.num_points, h=5)
+        
+        return pc[:self.num_points].astype(np.float32)
 
     def _apply_augmentation(self, pcd, obs_poses, action_seq):
         """

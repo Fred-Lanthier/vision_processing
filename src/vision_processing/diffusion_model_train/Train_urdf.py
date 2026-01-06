@@ -11,6 +11,7 @@ import copy
 import math
 import rospkg
 import json
+import pickle
 
 # Import Dataset existant (On va le wrapper pour la normalisation)
 from Data_Loader_urdf import Robot3DDataset
@@ -326,8 +327,29 @@ class DP3AgentRobust(nn.Module):
 def main():
     BATCH_SIZE = 64
     NUM_EPOCHS = 1000 # On augmente un peu car le modèle est plus gros
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 1e-5
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    config_pickle = {
+        "seed": 42,
+        "batch_size": 64,
+        "num_epochs": 1000,
+        "lr": 1e-5,
+        "pred_horizon": 16,
+        "obs_horizon": 2,
+        "action_dim": 9,
+        "robot_state_dim": 9,
+        "num_diffusion_steps": 100,
+        "model_name": "DP3_Robust_V2_URDF"
+    }
+
+    history = {
+        "config": config_pickle,
+        'train_loss': [],
+        'val_loss': [],
+        'lr': [],
+        'best_val_loss': float('inf')
+    }
     
     rospack = rospkg.RosPack()
     pkg_path = rospack.get_path('vision_processing')
@@ -338,7 +360,7 @@ def main():
     full_dataset = Robot3DDataset(data_path, mode='all') # On charge tout pour calculer les stats
     
     # 2. Normalisation - CRUCIAL
-    stats_path = os.path.join(pkg_path, "normalization_stats.json")
+    stats_path = os.path.join(pkg_path, "normalization_stats_urdf_fork.json")
     if os.path.exists(stats_path):
         print("📂 Chargement des stats existantes...")
         with open(stats_path, 'r') as f:
@@ -351,8 +373,8 @@ def main():
     normalizer = Normalizer(stats)
     
     # Reload datasets en mode train/val
-    train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.1)
-    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.1)
+    train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.2, seed=42)
+    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
@@ -365,7 +387,7 @@ def main():
         num_train_timesteps=100,
         beta_schedule='squaredcos_cap_v2',
         clip_sample=True,
-        prediction_type='epsilon'
+        prediction_type='sample'
     )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
@@ -408,7 +430,11 @@ def main():
             
             train_loss_acc += loss.item()
             pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-            
+        
+        avg_train_loss = train_loss_acc / len(train_loader)
+        history['train_loss'].append(avg_train_loss)
+        history['lr'].append(optimizer.param_groups[0]['lr'])
+
         # Validation
         ema_model.eval()
         val_loss_acc = 0
@@ -426,15 +452,18 @@ def main():
                 val_loss_acc += F.mse_loss(pred, noise).item()
                 
         avg_val = val_loss_acc / len(val_loader) if len(val_loader) > 0 else 0
+        history['val_loss'].append(avg_val)
         print(f"Stats: Train Loss {train_loss_acc/len(train_loader):.4f} | Val Loss {avg_val:.4f}")
         
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_best_robust_urdf.ckpt"))
+            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_best_robust_urdf_FPS_fork.ckpt"))
             print("💾 Saved Best Model (Robust)")
         else:
-            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_last_robust_urdf.ckpt"))
+            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_last_robust_urdf_FPS_fork.ckpt"))
             print("💾 Saved Last Model (Robust)")
 
+        with open(os.path.join(pkg_path, "train_history_urdf_FPS_fork.pkl"), 'wb') as f:
+            pickle.dump(history, f)
 if __name__ == "__main__":
     main()

@@ -53,6 +53,7 @@ def compute_errors(gt_action, pred_action):
     return mean_pos_err_cm, mean_rot_err_deg
 
 def evaluate_robust():
+    seed_everything(42)
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🚀 Evaluation Avancée sur {DEVICE}")
 
@@ -71,7 +72,7 @@ def evaluate_robust():
     normalizer = Normalizer(stats)
 
     # 2. Dataset
-    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.1)
+    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42)
     print(f"📦 Validation Set: {len(val_dataset)} séquences")
 
     # 3. Modèle
@@ -92,6 +93,7 @@ def evaluate_robust():
     )
 
     # 5. Évaluation sur 10 exemples aléatoires
+    np.random.seed(42)
     indices = np.random.choice(len(val_dataset), 10, replace=False)
     # indices = np.array([150,175,200])
     for i, idx in enumerate(indices):
@@ -191,94 +193,6 @@ def setup_plot_2d(ax, pcd, obs, gt, pred, dim1, dim2, title):
     ax.grid(True, alpha=0.3)
     ax.set_aspect('equal', 'box')
 
-def analyze_horizon_error():
-    """
-    Analyse l'erreur de prédiction en fonction du pas de temps (t=1 à t=16).
-    """
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🚀 Analyse de l'Horizon sur {DEVICE}")
-
-    rospack = rospkg.RosPack()
-    pkg_path = rospack.get_path('vision_processing')
-    data_path = os.path.join(pkg_path, 'datas', 'Trajectories_preprocess')
-    ckpt_path = os.path.join(pkg_path, "dp3_policy_best_robust_urdf.ckpt")
-    stats_path = os.path.join(pkg_path, "normalization_stats.json")
-
-    if not os.path.exists(stats_path) or not os.path.exists(ckpt_path):
-        print("❌ Fichiers manquants (stats ou ckpt).")
-        return
-
-    with open(stats_path, 'r') as f: stats = json.load(f)
-    normalizer = Normalizer(stats)
-
-    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.1)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=32, shuffle=False)
-    
-    model = DP3AgentRobust(action_dim=9, robot_state_dim=9, obs_horizon=2, pred_horizon=16).to(DEVICE)
-    model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
-    model.eval()
-
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=100,
-        beta_schedule='squaredcos_cap_v2',
-        clip_sample=True,
-        prediction_type='epsilon'
-    )
-    noise_scheduler.set_timesteps(100)
-
-    print("📊 Calcul en cours sur le set de validation...")
-    
-    total_pos_errors = np.zeros(16)
-    total_samples = 0
-    max_batches = 5
-    
-    with torch.no_grad():
-        for i, batch in enumerate(val_loader):
-            if i >= max_batches: break
-            
-            pcd = batch['point_cloud'].to(DEVICE)
-            raw_agent = batch['agent_pos'].to(DEVICE)
-            gt_action = batch['action'].numpy() 
-
-            norm_agent = normalizer.normalize(raw_agent, 'agent_pos')
-            p_feat = model.point_encoder(pcd)
-            r_feat = model.robot_mlp(norm_agent.reshape(len(pcd), -1))
-            cond = torch.cat([p_feat, r_feat], dim=-1)
-
-            noisy = torch.randn((len(pcd), 16, 9), device=DEVICE)
-            for t in noise_scheduler.timesteps:
-                timesteps = torch.tensor([t], device=DEVICE).long().expand(len(pcd))
-                noise_pred = model.noise_pred_net(noisy, timesteps, cond)
-                noisy = noise_scheduler.step(noise_pred, t, noisy).prev_sample
-            
-            pred = normalizer.unnormalize(noisy, 'action').cpu().numpy()
-
-            dist = np.linalg.norm(gt_action[..., :3] - pred[..., :3], axis=-1)
-            total_pos_errors += np.sum(dist, axis=0)
-            total_samples += len(pcd)
-            print(f"   Batch {i+1}/{max_batches} traité.")
-
-    avg_error_cm = (total_pos_errors / total_samples) * 100
-
-    print("\n📉 Résultats par Pas de Temps :")
-    for t in range(16):
-        print(f"   Step {t+1}: {avg_error_cm[t]:.2f} cm")
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, 17), avg_error_cm, marker='o', linewidth=2, color='purple')
-    plt.title("Dérive de l'Erreur de Position sur l'Horizon (16 steps)")
-    plt.xlabel("Pas de Temps (Futur)")
-    plt.ylabel("Erreur Moyenne (cm)")
-    plt.grid(True, alpha=0.3)
-    plt.xticks(range(1, 17))
-    
-    save_path = "error_horizon_analysis.png"
-    plt.savefig(save_path)
-    print(f"✅ Graphique sauvegardé : {save_path}")
-
 if __name__ == "__main__":
     # Décommente la ligne suivante pour visualiser des exemples complets
     evaluate_robust()
-    
-    # Lance l'analyse temporelle par défaut
-    # analyze_horizon_error()
