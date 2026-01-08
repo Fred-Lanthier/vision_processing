@@ -11,13 +11,38 @@ class UserCreate(UserBase):
     password: str
     height_cm: float = 175.0
     weight_kg: float = 70.0
+    target_weight_kg: float = 65.0
     daily_calorie_goal: int = 2500
+    objective: str = "maintain"
+    dietary_likes: List[str] = []
+    dietary_dislikes: List[str] = []
+
+class WeightEntryBase(BaseModel):
+    weight_kg: float
+    date: datetime
+    
+    class Config:
+        from_attributes = True
+
+class UserUpdate(BaseModel):
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
+    target_weight_kg: Optional[float] = None
+    daily_calorie_goal: Optional[int] = None
+    objective: Optional[str] = None
+    dietary_likes: Optional[List[str]] = None
+    dietary_dislikes: Optional[List[str]] = None
 
 class User(UserBase):
     id: int
     current_streak: int
     xp_points: int
     daily_calorie_goal: int
+    target_weight_kg: float
+    objective: str
+    dietary_likes: List[str]
+    dietary_dislikes: List[str]
+    weight_history: List[WeightEntryBase] = []
     
     class Config:
         from_attributes = True

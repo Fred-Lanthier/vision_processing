@@ -9,6 +9,7 @@ import CalendarPage from './pages/Calendar';
 import StatsPage from './pages/Stats';
 import ProfilePage from './pages/Profile';
 import MealDetailsPage from './pages/MealDetails';
+import CoachPage from './pages/Coach';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const { isAuthenticated, isLoading } = useAuthStore();
@@ -67,6 +68,12 @@ export default function App() {
                     <Route path="/scan" element={
                         <ProtectedRoute>
                             <ScanPage />
+                        </ProtectedRoute>
+                    } />
+                    
+                    <Route path="/coach" element={
+                        <ProtectedRoute>
+                            <CoachPage />
                         </ProtectedRoute>
                     } />
 

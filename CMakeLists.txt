@@ -12,6 +12,8 @@ find_package(catkin REQUIRED COMPONENTS
   moveit_ros_planning
   moveit_ros_planning_interface
   message_generation
+  message_filters
+  eigen_conversions
 )
 
 find_package(OpenCV REQUIRED)
@@ -44,14 +46,21 @@ catkin_package(
     moveit_ros_planning
     moveit_ros_planning_interface
     message_runtime
+    eigen_conversions
 )
 
 include_directories(
   ${catkin_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
 )
 
 add_executable(franka_state_camera_reader src/vision_processing/gazebo_simulation/franka_state_camera_reader.cpp)
-target_link_libraries(franka_state_camera_reader ${catkin_LIBRARIES})
+
+target_link_libraries(
+  franka_state_camera_reader 
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBS}
+)
 set(PYTHON_EXECUTABLE "/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3")
 
 catkin_install_python(PROGRAMS

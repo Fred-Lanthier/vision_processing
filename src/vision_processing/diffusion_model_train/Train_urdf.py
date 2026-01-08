@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from diffusers.training_utils import EMAModel 
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from tqdm.auto import tqdm
@@ -176,7 +177,6 @@ class ConditionalUnet1D(nn.Module):
 # ==============================================================================
 
 class DP3Encoder(nn.Module):
-
     def __init__(self, input_dim=3, output_dim=64):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -192,24 +192,15 @@ class DP3Encoder(nn.Module):
         return self.projection(x)
     
     def save_gradient(self, module, grad_input, grad_output):
-        """
-        for grad-cam
-        """
         self.gradient = grad_output[0]
 
     def save_feature(self, module, input, output):
-        """
-        for grad-cam
-        """
         if isinstance(output, tuple):
             self.feature = output[0].detach()
         else:
             self.feature = output.detach()
     
     def save_input(self, module, input, output):
-        """
-        for grad-cam
-        """
         self.input_pointcloud = input[0].detach()
 
 class Normalizer:
@@ -311,8 +302,7 @@ class DP3AgentRobust(nn.Module):
         # 1. Encode Vision
         point_features = self.point_encoder(point_cloud) # (B, 64)
         
-        # 2. Encode Proprioception (Garder un vecteur plat est OK, mais concaténer est mieux)
-        # Mais pour rester simple sans changer toute l'architecture Unet :
+        # 2. Encode Proprioception
         B = robot_state.shape[0]
         robot_features_flat = self.robot_mlp(robot_state.reshape(B, -1))
         
@@ -325,22 +315,17 @@ class DP3AgentRobust(nn.Module):
 # ==============================================================================
 
 def main():
-    BATCH_SIZE = 64
-    NUM_EPOCHS = 1000 # On augmente un peu car le modèle est plus gros
-    LEARNING_RATE = 1e-5
+    BATCH_SIZE = 128
+    NUM_EPOCHS = 1000 
+    LEARNING_RATE = 1e-4
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     config_pickle = {
         "seed": 42,
-        "batch_size": 64,
-        "num_epochs": 1000,
-        "lr": 1e-5,
-        "pred_horizon": 16,
-        "obs_horizon": 2,
-        "action_dim": 9,
-        "robot_state_dim": 9,
-        "num_diffusion_steps": 100,
-        "model_name": "DP3_Robust_V2_URDF"
+        "batch_size": BATCH_SIZE,
+        "num_epochs": NUM_EPOCHS,
+        "lr": LEARNING_RATE,
+        "model_name": "DP3_Robust_DiffusersEMA_URDF"
     }
 
     history = {
@@ -357,10 +342,10 @@ def main():
     
     # 1. Dataset
     print("⏳ Chargement du Dataset...")
-    full_dataset = Robot3DDataset(data_path, mode='all') # On charge tout pour calculer les stats
+    full_dataset = Robot3DDataset(data_path, mode='all')
     
-    # 2. Normalisation - CRUCIAL
-    stats_path = os.path.join(pkg_path, "normalization_stats_urdf_fork.json")
+    # 2. Normalisation
+    stats_path = os.path.join(pkg_path, "normalization_stats_urdf_fork_SAMPLE.json")
     if os.path.exists(stats_path):
         print("📂 Chargement des stats existantes...")
         with open(stats_path, 'r') as f:
@@ -373,27 +358,41 @@ def main():
     normalizer = Normalizer(stats)
     
     # Reload datasets en mode train/val
-    train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.2, seed=42)
-    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42)
+    train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.2, seed=42, augment=True)
+    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42, augment=False)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
     # 3. Setup Model
     model = DP3AgentRobust(action_dim=9, robot_state_dim=9).to(DEVICE)
-    ema_model = copy.deepcopy(model)
+    
+    # 🔥 INITIALISATION DIFFUSERS EMA 🔥
+    ema_model = EMAModel(
+        model.parameters(),
+        decay=0.9999,               # Start low (Warmup)
+        min_decay=0.0,
+        update_after_step=0,
+        use_ema_warmup=True,
+        inv_gamma=1.0,
+        power=0.75,
+        model_cls=None,
+        model_config=None
+    )
     
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=100,
         beta_schedule='squaredcos_cap_v2',
         clip_sample=True,
-        prediction_type='sample'
+        prediction_type='sample' # <--- ✅ CONFIGURATION CRUCIALE : SAMPLE PREDICTION
     )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
+    
+    # Warmup à 500 steps comme recommandé
     lr_scheduler = get_scheduler("cosine", optimizer=optimizer, num_warmup_steps=500, num_training_steps=len(train_loader)*NUM_EPOCHS)
 
-    print(f"🚀 Training Started on {DEVICE}")
+    print(f"🚀 Training Started on {DEVICE} with Sample Prediction & Diffusers EMA")
     best_val_loss = float('inf')
 
     for epoch in range(NUM_EPOCHS):
@@ -403,67 +402,80 @@ def main():
         
         for batch in pbar:
             # Load Data
-            pcd = batch['point_cloud'].to(DEVICE)
+            pcd = batch['point_cloud'].to(DEVICE, non_blocking=True)
             # NORMALISATION ON THE FLY
-            agent_pos = normalizer.normalize(batch['agent_pos'].to(DEVICE), 'agent_pos')
-            actions = normalizer.normalize(batch['action'].to(DEVICE), 'action')
+            agent_pos = normalizer.normalize(batch['agent_pos'].to(DEVICE, non_blocking=True), 'agent_pos')
+            actions = normalizer.normalize(batch['action'].to(DEVICE, non_blocking=True), 'action')
             
-            # Noise generation
+            # Noise generation (Standard Forward Process)
             noise = torch.randn_like(actions)
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (actions.shape[0],), device=DEVICE).long()
             noisy_actions = noise_scheduler.add_noise(actions, noise, timesteps)
             
             # Forward
-            noise_pred = model(pcd, agent_pos, noisy_actions, timesteps)
+            model_output = model(pcd, agent_pos, noisy_actions, timesteps)
             
-            # Loss & Backprop
-            loss = F.mse_loss(noise_pred, noise)
+            # Loss & Backprop - ✅ SAMPLE PREDICTION LOSS
+            # On compare la sortie du modèle aux ACTIONS originales (sample), pas au bruit (epsilon)
+            loss = F.mse_loss(model_output, actions)
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
             
-            # EMA Update
-            with torch.no_grad():
-                for p, ema_p in zip(model.parameters(), ema_model.parameters()):
-                    ema_p.mul_(0.999).add_(p.data, alpha=0.001) # Decay 0.999 pour robustesse
+            # 🔥 EMA STEP 🔥
+            # Met à jour les poids fantômes
+            ema_model.step(model.parameters())
             
             train_loss_acc += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'decay': f"{ema_model.get_decay(ema_model.optimization_step):.4f}"})
         
         avg_train_loss = train_loss_acc / len(train_loader)
         history['train_loss'].append(avg_train_loss)
         history['lr'].append(optimizer.param_groups[0]['lr'])
 
-        # Validation
-        ema_model.eval()
+        # --- VALIDATION (LOGIQUE DE SWAP) ---
+        # A. On sauvegarde les poids d'entraînement actuels
+        ema_model.store(model.parameters())
+        # B. On charge les poids EMA dans le modèle principal pour validation
+        ema_model.copy_to(model.parameters())
+        
+        # Le modèle contient maintenant les poids lissés !
+        model.eval()
         val_loss_acc = 0
         with torch.no_grad():
             for batch in val_loader:
-                pcd = batch['point_cloud'].to(DEVICE)
-                agent_pos = normalizer.normalize(batch['agent_pos'].to(DEVICE), 'agent_pos')
-                actions = normalizer.normalize(batch['action'].to(DEVICE), 'action')
+                pcd = batch['point_cloud'].to(DEVICE, non_blocking=True)
+                agent_pos = normalizer.normalize(batch['agent_pos'].to(DEVICE, non_blocking=True), 'agent_pos')
+                actions = normalizer.normalize(batch['action'].to(DEVICE, non_blocking=True), 'action')
                 
                 noise = torch.randn_like(actions)
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (actions.shape[0],), device=DEVICE).long()
                 noisy_actions = noise_scheduler.add_noise(actions, noise, timesteps)
                 
-                pred = ema_model(pcd, agent_pos, noisy_actions, timesteps)
-                val_loss_acc += F.mse_loss(pred, noise).item()
+                # Validation avec Sample Prediction
+                pred = model(pcd, agent_pos, noisy_actions, timesteps)
+                val_loss_acc += F.mse_loss(pred, actions).item() # Compare à actions, pas noise
                 
         avg_val = val_loss_acc / len(val_loader) if len(val_loader) > 0 else 0
         history['val_loss'].append(avg_val)
-        print(f"Stats: Train Loss {train_loss_acc/len(train_loader):.4f} | Val Loss {avg_val:.4f}")
+        print(f"Stats: Train Loss {avg_train_loss:.4f} | Val Loss {avg_val:.4f}")
         
+        # --- SAVING ---
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_best_robust_urdf_FPS_fork.ckpt"))
-            print("💾 Saved Best Model (Robust)")
+            # Sauvegarde le modèle courant (qui contient les poids EMA à cause du copy_to)
+            torch.save(model.state_dict(), os.path.join(pkg_path, "models", "dp3_policy_best_robust_urdf_FPS_fork_SAMPLE.ckpt"))
+            print("💾 Saved Best EMA Model")
         else:
-            torch.save(ema_model.state_dict(), os.path.join(pkg_path, "dp3_policy_last_robust_urdf_FPS_fork.ckpt"))
-            print("💾 Saved Last Model (Robust)")
+            torch.save(model.state_dict(), os.path.join(pkg_path, "models", "dp3_policy_last_robust_urdf_FPS_fork_SAMPLE.ckpt"))
+            print("💾 Saved Last EMA Model")
 
-        with open(os.path.join(pkg_path, "train_history_urdf_FPS_fork.pkl"), 'wb') as f:
+        # C. On restaure les poids d'entraînement pour continuer l'entraînement
+        ema_model.restore(model.parameters())
+
+        with open(os.path.join(pkg_path, "pkl_files", "train_history_urdf_FPS_fork_SAMPLE.pkl"), 'wb') as f:
             pickle.dump(history, f)
 if __name__ == "__main__":
     main()

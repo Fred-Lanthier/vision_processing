@@ -5,21 +5,41 @@
   <xacro:include filename="$(find franka_description)/robots/common/franka_hand.xacro"/>
   
   <xacro:arg name="arm_id" default="panda" />
-  
   <link name="world" />
 
-  <xacro:franka_arm arm_id="$(arg arm_id)" 
-                    connected_to="world" 
-                    xyz="0 0 0" 
-                    safety_distance="0.03" 
-                    gazebo="true" 
+  <xacro:franka_arm arm_id="$(arg arm_id)" connected_to="world" xyz="0 0 0" 
+                    safety_distance="0.03" gazebo="true" 
                     joint_limits="${xacro.load_yaml('$(find franka_description)/robots/panda/joint_limits.yaml')}"/>
 
-  <xacro:franka_hand arm_id="$(arg arm_id)" 
-                     rpy="0 0 ${-pi/4}" 
-                     connected_to="$(arg arm_id)_link8" 
-                     safety_distance="0.03" 
-                     gazebo="true"/>
+  <xacro:franka_hand arm_id="$(arg arm_id)" rpy="0 0 ${-pi/4}" 
+                     connected_to="$(arg arm_id)_link8" safety_distance="0.03" gazebo="true"/>
+
+  <link name="panda_TCP"/>
+  <joint name="panda_TCP_joint" type="fixed">
+    <parent link="panda_hand"/>
+    <child link="panda_TCP"/>
+    <origin xyz="0 0 0.1034" rpy="0 0 0"/>
+  </joint>
+
+  <link name="fork_tip">
+    <visual>
+      <origin xyz="-0.033 -0.02 0.0171378" rpy="0 ${27.5 * pi / 180} 0"/>
+      <geometry><mesh filename="$(find vision_processing)/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="-0.033 -0.02 0.0171378" rpy="0 ${27.5 * pi / 180} 0"/>
+      <geometry><mesh filename="$(find vision_processing)/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/></geometry>
+    </collision>
+    <inertial> <mass value="0.1" />
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001" />
+    </inertial>
+  </link>
+
+  <joint name="fork_tip_joint" type="fixed">
+    <origin rpy="0 ${-(180+27.5)/360*2*pi} 0" xyz="-0.0055 0 ${0.233-0.1034}"/>
+    <parent link="panda_TCP"/>
+    <child link="fork_tip"/>
+  </joint>
 
   <xacro:macro name="create_transmission" params="joint_name">
     <transmission name="${joint_name}_tran">
@@ -41,54 +61,86 @@
   <xacro:create_transmission joint_name="$(arg arm_id)_joint5"/>
   <xacro:create_transmission joint_name="$(arg arm_id)_joint6"/>
   <xacro:create_transmission joint_name="$(arg arm_id)_joint7"/>
-  <xacro:create_transmission joint_name="$(arg arm_id)_finger_joint1"/>
-  <xacro:create_transmission joint_name="$(arg arm_id)_finger_joint2"/>
 
-  <joint name="camera_joint" type="fixed">
-    <parent link="$(arg arm_id)_hand"/> <child link="camera_link"/>
-    <origin xyz="0.04 0 0.04" rpy="0 0 0"/> </joint>
+  <joint name="camera_static_joint" type="fixed">
+    <parent link="world" />
+    <child link="camera_static_link" />
+    <origin xyz="1.1593 1.2922 1.1910" rpy="0.0000 0.6013 -2.3020" />
+    <!-- <origin xyz="1.1593 1.2922 1.1910" rpy="-1.967 0.009 2.559" /> -->
+  </joint>
 
-  <link name="camera_link">
+  <link name="camera_static_link">
     <visual>
-      <geometry><box size="0.02 0.05 0.02"/></geometry>
-      <material name="blue"><color rgba="0 0 1 1"/></material>
+      <geometry><box size="0.025 0.09 0.02"/></geometry>
     </visual>
     <inertial>
-      <mass value="0.01"/>
-      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+      <mass value="0.1" /><inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4" />
     </inertial>
   </link>
-  <joint name="camera_optical_joint" type="fixed">
-    <parent link="camera_link"/> <child link="camera_optical_frame"/>
+
+  <joint name="camera_static_optical_joint" type="fixed">
+    <parent link="camera_static_link"/><child link="camera_static_optical_frame"/>
     <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
   </joint>
-  <link name="camera_optical_frame"/>
+  <link name="camera_static_optical_frame"/>
 
-  <gazebo reference="camera_link">
-    <sensor type="depth" name="camera">
+  <joint name="camera_wrist_joint" type="fixed">
+    <parent link="panda_TCP"/> 
+    <child link="camera_wrist_link"/>
+    <origin xyz="-0.052 0.035 -0.045" rpy="0 ${-pi/2} 0"/> 
+  </joint>
+
+  <link name="camera_wrist_link">
+    <visual>
+      <geometry><box size="0.025 0.09 0.02"/></geometry>
+    </visual>
+    <inertial>
+      <mass value="0.1" /><inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4" />
+    </inertial>
+  </link>
+
+  <joint name="camera_wrist_optical_joint" type="fixed">
+    <parent link="camera_wrist_link"/><child link="camera_wrist_optical_frame"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <link name="camera_wrist_optical_frame"/>
+
+  <gazebo reference="camera_static_link">
+    <material>Gazebo/Red</material>
+    <sensor type="depth" name="camera_static">
       <update_rate>30.0</update_rate>
       <camera>
-        <horizontal_fov>1.047</horizontal_fov>
-        <image>
-          <width>640</width>
-          <height>480</height>
-          <format>R8G8B8</format>
-        </image>
-        <clip><near>0.1</near><far>3.0</far></clip>
+        <horizontal_fov>0.958</horizontal_fov> 
+        <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+        <clip><near>0.1</near><far>10.0</far></clip>
       </camera>
-      <plugin name="camera_controller" filename="libgazebo_ros_openni_kinect.so">
-        <baseline>0.2</baseline>
+      <plugin name="static_camera_controller" filename="libgazebo_ros_openni_kinect.so">
+        <cameraName>camera_static</cameraName>
         <alwaysOn>true</alwaysOn>
-        <updateRate>0.0</updateRate>
-        <cameraName>camera_wrist</cameraName>
         <imageTopicName>color/image_raw</imageTopicName>
-        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
         <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>
-        <depthImageCameraInfoTopicName>aligned_depth_to_color/camera_info</depthImageCameraInfoTopicName>
-        <pointCloudTopicName>depth/color/points</pointCloudTopicName>
-        <frameName>camera_optical_frame</frameName>
-        <pointCloudCutoff>0.1</pointCloudCutoff>
-        <pointCloudCutoffMax>3.0</pointCloudCutoffMax>
+        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
+        <frameName>camera_static_optical_frame</frameName>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="camera_wrist_link">
+    <material>Gazebo/Blue</material>
+    <sensor type="depth" name="camera_wrist">
+      <update_rate>30.0</update_rate>
+      <camera>
+        <horizontal_fov>0.973</horizontal_fov>
+        <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+        <clip><near>0.05</near><far>3.0</far></clip>
+      </camera>
+      <plugin name="wrist_camera_controller" filename="libgazebo_ros_openni_kinect.so">
+        <cameraName>camera_wrist</cameraName>
+        <alwaysOn>true</alwaysOn>
+        <imageTopicName>color/image_raw</imageTopicName>
+        <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>
+        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
+        <frameName>camera_wrist_optical_frame</frameName>
       </plugin>
     </sensor>
   </gazebo>
@@ -98,71 +150,5 @@
       <robotNamespace>/</robotNamespace>
       <robotSimType>gazebo_ros_control/DefaultRobotHWSim</robotSimType>
     </plugin>
-  </gazebo>
-	
-<!-- ============================================ -->
-  <!-- MATÉRIAUX GAZEBO (pour les couleurs)         -->
-  <!-- ============================================ -->
-  
-  <!-- Couleur blanche pour tous les liens du bras -->
-  <gazebo reference="$(arg arm_id)_link0">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_link1">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_link2">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_link3">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_link4">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_link5">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_link6">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_link7">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_link8">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <!-- Gripper en gris foncé -->
-  <gazebo reference="$(arg arm_id)_hand">
-    <material>Gazebo/DarkGrey</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_leftfinger">
-    <material>Gazebo/DarkGrey</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_rightfinger">
-    <material>Gazebo/DarkGrey</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_hand">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_leftfinger">
-    <material>Gazebo/White</material>
-  </gazebo>
-  
-  <gazebo reference="$(arg arm_id)_rightfinger">
-    <material>Gazebo/White</material>
   </gazebo>
 </robot>

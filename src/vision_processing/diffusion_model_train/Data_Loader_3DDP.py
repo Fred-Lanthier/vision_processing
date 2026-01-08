@@ -6,7 +6,6 @@ import torch
 import random
 from torch.utils.data import Dataset
 from scipy.spatial.transform import Rotation as R
-import fpsample
 
 def seed_everything(seed=42):
     random.seed(seed)

@@ -6,6 +6,12 @@ interface User {
     username: string;
     daily_calorie_goal: number;
     current_streak: number;
+    weight_kg: number;
+    target_weight_kg: number;
+    height_cm: number;
+    objective: string;
+    dietary_likes: string[];
+    dietary_dislikes: string[];
 }
 
 interface AuthState {
@@ -16,12 +22,14 @@ interface AuthState {
     register: (data: any) => Promise<void>;
     logout: () => void;
     checkAuth: () => Promise<void>;
+    setUser: (user: User) => void;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
     user: null,
     isAuthenticated: false,
     isLoading: true,
+    setUser: (user) => set({ user }),
     login: async (u, p) => {
         await authService.login(u, p);
         const user = await authService.getMe();

@@ -18,6 +18,21 @@
   <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
         args="-param robot_description -urdf -model panda -z 0.0"/>
 
+  <param name="food_description" textfile="$(find vision_processing)/urdf/food.urdf" />
+
+  <node name="spawn_food" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -param food_description -model food_cube -x 0.5 -y 0.0 -z 0.05" />
+
+  <node name="joint_state_publisher" pkg="joint_state_publisher" type="joint_state_publisher">
+    <param name="use_gui" value="false"/>
+    <rosparam param="source_list">[/joint_states]</rosparam>
+    <rosparam>
+      zeros:
+        panda_finger_joint1: 0.0
+        panda_finger_joint2: 0.0
+    </rosparam>
+  </node>
+
   <!-- Contrôleurs Gazebo -->
   <rosparam file="$(find vision_processing)/config/simple_controllers.yaml" command="load"/>
   

@@ -96,6 +96,20 @@ export default function Dashboard() {
                 </div>
             </Card>
 
+            {/* Coach Banner */}
+            <div 
+                onClick={() => navigate('/coach')}
+                className="bg-gradient-to-r from-indigo-500 to-purple-600 rounded-2xl p-4 text-white shadow-lg cursor-pointer transform transition hover:scale-[1.02] flex items-center justify-between"
+            >
+                <div>
+                    <h3 className="font-bold text-lg">Need inspiration?</h3>
+                    <p className="text-indigo-100 text-sm">Get meal ideas from your AI Coach.</p>
+                </div>
+                <div className="bg-white/20 p-2 rounded-full">
+                    <ChevronRight />
+                </div>
+            </div>
+
             {/* Recent Activity Feed */}
             <div>
                 <div className="flex justify-between items-center mb-4">

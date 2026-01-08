@@ -50,13 +50,43 @@ export const mealService = {
         files.forEach(file => {
             formData.append('files', file);
         });
-        const res = await api.post('/scan/', formData, {
+        const res = await api.post('/meals/scan/', formData, {
             headers: { 'Content-Type': 'multipart/form-data' }
         });
         return res.data;
     },
     getHistory: async (skip = 0, limit = 50) => {
         const res = await api.get(`/meals/?skip=${skip}&limit=${limit}`);
+        return res.data;
+    },
+    getMealsByDate: async (date) => {
+        const res = await api.get(`/meals/?date=${date}`);
+        return res.data;
+    }
+};
+
+export const userService = {
+    updateProfile: async (data) => {
+        const res = await api.put('/users/me/', data);
+        return res.data;
+    },
+    addWeight: async (weight_kg, date = null) => {
+        const payload = { 
+            weight_kg, 
+            date: date || new Date().toISOString() 
+        };
+        const res = await api.post('/users/me/weight', payload);
+        return res.data;
+    },
+    getWeightHistory: async () => {
+        const res = await api.get('/users/me/weight');
+        return res.data;
+    }
+};
+
+export const coachService = {
+    getSuggestions: async () => {
+        const res = await api.get('/coach/suggest');
         return res.data;
     }
 };

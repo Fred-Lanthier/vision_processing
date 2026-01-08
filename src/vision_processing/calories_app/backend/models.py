@@ -14,10 +14,16 @@ class User(Base):
     # Objectifs & Profil
     height_cm = Column(Float, default=175.0)
     weight_kg = Column(Float, default=70.0)
+    target_weight_kg = Column(Float, default=65.0) # Goal Weight
     age = Column(Integer, default=30)
     gender = Column(String, default="M") # M/F
     activity_level = Column(String, default="moderate") # sedentary, light, moderate, active, extreme
     daily_calorie_goal = Column(Integer, default=2500)
+    
+    # New Coach Features
+    objective = Column(String, default="maintain") # lose_weight, maintain, gain_muscle
+    dietary_likes = Column(JSON, default=[]) # ["Italian", "Spicy", "Chicken"]
+    dietary_dislikes = Column(JSON, default=[]) # ["Mushrooms", "Fish"]
     
     # Gamification
     current_streak = Column(Integer, default=0)
@@ -25,6 +31,17 @@ class User(Base):
     xp_points = Column(Integer, default=0) # Pour monter de niveau
     
     meals = relationship("Meal", back_populates="owner")
+    weight_history = relationship("WeightEntry", back_populates="user")
+
+class WeightEntry(Base):
+    __tablename__ = "weight_history"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    weight_kg = Column(Float)
+    date = Column(DateTime, default=datetime.utcnow)
+    
+    user = relationship("User", back_populates="weight_history")
 
 class Meal(Base):
     __tablename__ = "meals"

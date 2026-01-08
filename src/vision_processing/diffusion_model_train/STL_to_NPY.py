@@ -29,13 +29,20 @@ ax = fig.add_subplot(111, projection='3d')
 # Extraire un échantillon de points pour la visualisation (plus rapide qu'un rendu complet)
 points = mesh.sample(2000)
 
+angles = np.array([0, 27.5, 0])
+rotation_matrix = trimesh.transformations.euler_matrix(*np.radians(angles))[:3, :3]
+points = points @ rotation_matrix.T
+
+points[:,0] = points[:,0] - 0.033
+points[:,1] = points[:,1] - 0.02
+print(np.min(points[:,2]))
+points[:,2] = points[:,2] - np.min(points[:,2])
+
 # Afficher le nuage de points de la fourchette
-ax.scatter(points[:, 0]-0.03, points[:, 1]-0.02, points[:, 2] - min(points[:, 2]), s=1, c='gray', alpha=0.5)
-print(max(points[:, 0]))
-print(max(points[:, 1]))
-print(min(points[:, 2]))
+ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, c='gray', alpha=0.5)
+
 # 4. Dessiner les axes à l'origine (0,0,0)
-length = 0.05 # 5cm pour bien voir les axes
+length = 0.075 # 5cm pour bien voir les axes
 ax.quiver(0, 0, 0, length, 0, 0, color='r', label='X')
 ax.quiver(0, 0, 0, 0, length, 0, color='g', label='Y')
 ax.quiver(0, 0, 0, 0, 0, length, color='b', label='Z')
@@ -47,7 +54,7 @@ mid = (all_points.max(axis=0) + all_points.min(axis=0)) * 0.5
 ax.set_xlim(mid[0] - max_range, mid[0] + max_range)
 ax.set_ylim(mid[1] - max_range, mid[1] + max_range)
 ax.set_zlim(mid[2] - max_range, mid[2] + max_range)
-ax.view_init(elev=90, azim=0)
+ax.view_init(elev=0, azim=90)
 
 ax.set_title("Visualisation de l'origine du STL (Mètres)")
 ax.legend()

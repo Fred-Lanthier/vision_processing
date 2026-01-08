@@ -60,7 +60,7 @@ def evaluate_robust():
     rospack = rospkg.RosPack()
     pkg_path = rospack.get_path('vision_processing')
     data_path = os.path.join(pkg_path, 'datas', 'Trajectories_preprocess')
-    ckpt_path = os.path.join(pkg_path, "dp3_policy_last_robust_urdf.ckpt")
+    ckpt_path = os.path.join(pkg_path, "models", "dp3_policy_last_robust_urdf.ckpt")
     stats_path = os.path.join(pkg_path, "normalization_stats.json")
 
     # 1. Chargement Stats

@@ -1,262 +1,176 @@
-/**
- * @file franka_state_camera_reader.cpp
- * @brief Lecture complète de l'état du robot Franka + caméra
- */
-
 #include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/TwistStamped.h>
-#include <moveit/robot_model_loader/robot_model_loader.h>
-#include <moveit/robot_state/robot_state.h>
-#include <opencv2/opencv.hpp>
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/synchronizer.h>
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/JointState.h>
 
-class FrankaStateCameraReader {
+// MoveIt
+#include <moveit/robot_model_loader/robot_model_loader.h>
+#include <moveit/robot_state/robot_state.h>
+
+// Eigen conversions
+#include <eigen_conversions/eigen_msg.h>
+
+class FrankaUltimateSyncReader {
 public:
-  FrankaStateCameraReader() : has_new_image_(false), has_new_depth_(false) {
+  FrankaUltimateSyncReader() {
     ros::NodeHandle nh;
 
-    // Load robot model
-    ROS_INFO("Loading robot model...");
+    // 1. Initialisation MoveIt (Cinématique)
     robot_model_loader::RobotModelLoader robot_model_loader(
         "robot_description");
     robot_model_ = robot_model_loader.getModel();
-
-    if (!robot_model_) {
-      ROS_ERROR("Failed to load robot model!");
-      return;
-    }
-
     robot_state_.reset(new moveit::core::RobotState(robot_model_));
-    robot_state_->setToDefaultValues();
-
     joint_model_group_ = robot_model_->getJointModelGroup("panda_arm");
+    ee_link_ = robot_model_->getLinkModel(
+        "panda_hand_tcp"); // Assurez-vous que ce lien existe dans votre URDF
 
-    ee_link_ = robot_model_->getLinkModel("panda_hand_tcp");
-    if (!ee_link_) {
-      ROS_WARN("Using panda_link8 as end effector");
-      ee_link_ = robot_model_->getLinkModel("panda_link8");
-    }
+    // 2. Configuration des Subscribers (Entrées)
+    wrist_rgb_sub_.subscribe(nh, "/camera_wrist/color/image_raw", 1);
+    wrist_depth_sub_.subscribe(
+        nh, "/camera_wrist/aligned_depth_to_color/image_raw", 1);
+    static_rgb_sub_.subscribe(nh, "/camera_static/color/image_raw", 1);
+    static_depth_sub_.subscribe(
+        nh, "/camera_static/aligned_depth_to_color/image_raw", 1);
+    joint_sub_.subscribe(nh, "/joint_states", 1);
 
-    ROS_INFO("Robot model loaded!");
+    // 3. Configuration des Publishers (Sorties Synchronisées)
+    // On utilise un namespace "synced" pour clarifier que ces données sont
+    // alignées
+    pub_wrist_rgb_ =
+        nh.advertise<sensor_msgs::Image>("/synced/camera_wrist/rgb", 1);
+    pub_wrist_depth_ =
+        nh.advertise<sensor_msgs::Image>("/synced/camera_wrist/depth", 1);
+    pub_static_rgb_ =
+        nh.advertise<sensor_msgs::Image>("/synced/camera_static/rgb", 1);
+    pub_static_depth_ =
+        nh.advertise<sensor_msgs::Image>("/synced/camera_static/depth", 1);
+    pub_ee_pose_ =
+        nh.advertise<geometry_msgs::PoseStamped>("/synced/ee_pose", 1);
+    pub_joint_ =
+        nh.advertise<sensor_msgs::JointState>("/synced/joint_states", 1);
 
-    // Publishers pour les données du robot
-    ee_pose_pub_ = nh.advertise<geometry_msgs::PoseStamped>(
-        "franka/end_effector_pose", 10);
-    ee_velocity_pub_ = nh.advertise<geometry_msgs::TwistStamped>(
-        "franka/end_effector_velocity", 10);
+    // 4. Synchroniseur
+    // Queue size de 10 est suffisant pour absorber le jitter de Gazebo
+    sync_.reset(new Sync(MySyncPolicy(10), wrist_rgb_sub_, wrist_depth_sub_,
+                         static_rgb_sub_, static_depth_sub_, joint_sub_));
 
-    // Subscribers
-    joint_state_sub_ =
-        nh.subscribe("/joint_states", 10,
-                     &FrankaStateCameraReader::jointStateCallback, this);
+    sync_->registerCallback(boost::bind(&FrankaUltimateSyncReader::syncCallback,
+                                        this, _1, _2, _3, _4, _5));
 
-    // Camera subscribers
-    camera_rgb_sub_ =
-        nh.subscribe("/camera_wrist/color/image_raw", 10,
-                     &FrankaStateCameraReader::cameraRGBCallback, this);
-    camera_depth_sub_ =
-        nh.subscribe("/camera_wrist/aligned_depth_to_color/image_raw", 10,
-                     &FrankaStateCameraReader::cameraDepthCallback, this);
-
-    ROS_INFO("Franka State + Camera Reader initialized!");
-    ROS_INFO("Subscribing to:");
-    ROS_INFO("  - /joint_states");
-    ROS_INFO("  - /camera_wrist/color/image_raw");
-    ROS_INFO("  - /camera_wrist/aligned_depth_to_color/image_raw");
+    ROS_INFO("Franka Synchronizer Ready: Publishing to /synced/* topics");
   }
 
-  void jointStateCallback(const sensor_msgs::JointState::ConstPtr &msg) {
-    // Extract panda joints
-    std::vector<double> joint_positions;
-    std::vector<double> joint_velocities;
+  void syncCallback(const sensor_msgs::ImageConstPtr &w_rgb,
+                    const sensor_msgs::ImageConstPtr &w_depth,
+                    const sensor_msgs::ImageConstPtr &s_rgb,
+                    const sensor_msgs::ImageConstPtr &s_depth,
+                    const sensor_msgs::JointStateConstPtr &joints) {
 
-    for (size_t i = 0; i < msg->name.size(); ++i) {
-      if (msg->name[i].find("panda_joint") != std::string::npos) {
-        joint_positions.push_back(msg->position[i]);
-        if (!msg->velocity.empty())
-          joint_velocities.push_back(msg->velocity[i]);
-      }
+    // --- ÉTAPE 0 : Définir le "Temps Maître" ---
+    // On utilise le timestamp de la caméra poignet comme référence absolue pour
+    // ce frame.
+    ros::Time master_time = w_rgb->header.stamp;
+
+    // --- ÉTAPE 1 : Calcul de la Pose EE (FK) ---
+    std::vector<double> q;
+    // Extraction propre des joints du panda (en ignorant les joints "finger" ou
+    // autres)
+    for (size_t i = 0; i < joints->name.size(); ++i) {
+      if (joints->name[i].find("panda_joint") != std::string::npos)
+        q.push_back(joints->position[i]);
     }
 
-    if (joint_positions.size() != 7)
+    // Vérification de sécurité
+    if (q.size() < 7) {
+      ROS_WARN_THROTTLE(1, "Joint state incomplet reçu.");
       return;
-
-    // Store joint angles
-    {
-      std::lock_guard<std::mutex> lock(joint_mutex_);
-      current_joint_angles_ = joint_positions;
-      current_joint_velocities_ = joint_velocities;
-      current_stamp_ = msg->header.stamp;
     }
 
-    // Update robot state
-    robot_state_->setJointGroupPositions(joint_model_group_, joint_positions);
-    if (joint_velocities.size() == 7)
-      robot_state_->setJointGroupVelocities(joint_model_group_,
-                                            joint_velocities);
-
+    // Mise à jour du modèle cinématique
+    robot_state_->setJointGroupPositions(joint_model_group_, q);
     robot_state_->update();
-
-    // Publish end effector pose
-    publishEndEffectorPose(msg->header.stamp);
-
-    // Publish end effector velocity if we have velocities
-    if (joint_velocities.size() == 7)
-      publishEndEffectorVelocity(msg->header.stamp);
-  }
-
-  void cameraRGBCallback(const sensor_msgs::Image::ConstPtr &msg) {
-    try {
-      cv_bridge::CvImagePtr cv_ptr =
-          cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-
-      std::lock_guard<std::mutex> lock(image_mutex_);
-      current_rgb_image_ = cv_ptr->image.clone();
-      has_new_image_ = true;
-      image_stamp_ = msg->header.stamp;
-    } catch (cv_bridge::Exception &e) {
-      ROS_ERROR("cv_bridge exception: %s", e.what());
-    }
-  }
-
-  void cameraDepthCallback(const sensor_msgs::Image::ConstPtr &msg) {
-    try {
-      cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg);
-
-      std::lock_guard<std::mutex> lock(depth_mutex_);
-      current_depth_image_ = cv_ptr->image.clone();
-      has_new_depth_ = true;
-      depth_stamp_ = msg->header.stamp;
-    } catch (cv_bridge::Exception &e) {
-      ROS_ERROR("cv_bridge exception: %s", e.what());
-    }
-  }
-
-  void publishEndEffectorPose(const ros::Time &stamp) {
     const Eigen::Isometry3d &ee_transform =
         robot_state_->getGlobalLinkTransform(ee_link_);
 
-    geometry_msgs::PoseStamped pose_msg;
-    pose_msg.header.stamp = stamp;
-    pose_msg.header.frame_id = robot_model_->getModelFrame();
+    // Création du message de Pose
+    geometry_msgs::PoseStamped ee_pose_msg;
+    ee_pose_msg.header.stamp = master_time;
+    ee_pose_msg.header.frame_id = "world"; // Ou "panda_link0" selon votre setup
+    tf::poseEigenToMsg(ee_transform, ee_pose_msg.pose);
 
-    pose_msg.pose.position.x = ee_transform.translation().x();
-    pose_msg.pose.position.y = ee_transform.translation().y();
-    pose_msg.pose.position.z = ee_transform.translation().z();
+    // --- ÉTAPE 2 : Republication avec Timestamp Unique ---
 
-    Eigen::Quaterniond quat(ee_transform.rotation());
-    pose_msg.pose.orientation.x = quat.x();
-    pose_msg.pose.orientation.y = quat.y();
-    pose_msg.pose.orientation.z = quat.z();
-    pose_msg.pose.orientation.w = quat.w();
+    // Pour republier, on fait une copie superficielle (ne copie pas les pixels,
+    // juste les headers) et on écrase le timestamp pour garantir l'alignement
+    // parfait.
 
-    ee_pose_pub_.publish(pose_msg);
-  }
+    sensor_msgs::Image out_w_rgb = *w_rgb;
+    out_w_rgb.header.stamp = master_time;
 
-  void publishEndEffectorVelocity(const ros::Time &stamp) {
-    Eigen::Vector3d reference_point(0.0, 0.0, 0.0);
-    Eigen::MatrixXd jacobian;
-    robot_state_->getJacobian(joint_model_group_, ee_link_, reference_point,
-                              jacobian);
+    sensor_msgs::Image out_w_depth = *w_depth;
+    out_w_depth.header.stamp = master_time;
 
-    std::vector<double> joint_velocities;
-    robot_state_->copyJointGroupVelocities(joint_model_group_,
-                                           joint_velocities);
+    sensor_msgs::Image out_s_rgb = *s_rgb;
+    out_s_rgb.header.stamp = master_time;
 
-    if (joint_velocities.size() != 7)
-      return;
+    sensor_msgs::Image out_s_depth = *s_depth;
+    out_s_depth.header.stamp = master_time;
 
-    Eigen::VectorXd joint_vel_eigen(7);
-    for (size_t i = 0; i < 7; ++i)
-      joint_vel_eigen[i] = joint_velocities[i];
+    sensor_msgs::JointState out_joints = *joints;
+    out_joints.header.stamp = master_time;
 
-    Eigen::VectorXd twist = jacobian * joint_vel_eigen;
+    // Publication
+    pub_wrist_rgb_.publish(out_w_rgb);
+    pub_wrist_depth_.publish(out_w_depth);
+    pub_static_rgb_.publish(out_s_rgb);
+    pub_static_depth_.publish(out_s_depth);
+    pub_ee_pose_.publish(ee_pose_msg);
+    pub_joint_.publish(out_joints);
 
-    geometry_msgs::TwistStamped velocity_msg;
-    velocity_msg.header.stamp = stamp;
-    velocity_msg.header.frame_id = robot_model_->getModelFrame();
-
-    velocity_msg.twist.linear.x = twist[0];
-    velocity_msg.twist.linear.y = twist[1];
-    velocity_msg.twist.linear.z = twist[2];
-    velocity_msg.twist.angular.x = twist[3];
-    velocity_msg.twist.angular.y = twist[4];
-    velocity_msg.twist.angular.z = twist[5];
-
-    ee_velocity_pub_.publish(velocity_msg);
-  }
-
-  // Getters thread-safe
-  std::vector<double> getJointAngles() {
-    std::lock_guard<std::mutex> lock(joint_mutex_);
-    return current_joint_angles_;
-  }
-
-  cv::Mat getRGBImage() {
-    std::lock_guard<std::mutex> lock(image_mutex_);
-    has_new_image_ = false;
-    return current_rgb_image_.clone();
-  }
-
-  cv::Mat getDepthImage() {
-    std::lock_guard<std::mutex> lock(depth_mutex_);
-    has_new_depth_ = false;
-    return current_depth_image_.clone();
-  }
-
-  bool hasNewImage() {
-    std::lock_guard<std::mutex> lock(image_mutex_);
-    return has_new_image_;
-  }
-
-  bool hasNewDepth() {
-    std::lock_guard<std::mutex> lock(depth_mutex_);
-    return has_new_depth_;
+    // Debugging léger (1 fois par seconde max)
+    ROS_INFO_THROTTLE(
+        1, "Published synced frame at %f. EE Pos: [%.3f, %.3f, %.3f]",
+        master_time.toSec(), ee_pose_msg.pose.position.x,
+        ee_pose_msg.pose.position.y, ee_pose_msg.pose.position.z);
   }
 
 private:
+  typedef message_filters::sync_policies::ApproximateTime<
+      sensor_msgs::Image, sensor_msgs::Image, sensor_msgs::Image,
+      sensor_msgs::Image, sensor_msgs::JointState>
+      MySyncPolicy;
+
+  typedef message_filters::Synchronizer<MySyncPolicy> Sync;
+
+  // Subscribers
+  message_filters::Subscriber<sensor_msgs::Image> wrist_rgb_sub_,
+      wrist_depth_sub_;
+  message_filters::Subscriber<sensor_msgs::Image> static_rgb_sub_,
+      static_depth_sub_;
+  message_filters::Subscriber<sensor_msgs::JointState> joint_sub_;
+
+  // Publishers
+  ros::Publisher pub_wrist_rgb_, pub_wrist_depth_;
+  ros::Publisher pub_static_rgb_, pub_static_depth_;
+  ros::Publisher pub_ee_pose_;
+  ros::Publisher pub_joint_;
+
+  boost::shared_ptr<Sync> sync_;
+
+  // MoveIt
   moveit::core::RobotModelPtr robot_model_;
   moveit::core::RobotStatePtr robot_state_;
   const moveit::core::JointModelGroup *joint_model_group_;
   const moveit::core::LinkModel *ee_link_;
-
-  ros::Subscriber joint_state_sub_;
-  ros::Subscriber camera_rgb_sub_;
-  ros::Subscriber camera_depth_sub_;
-  ros::Publisher ee_pose_pub_;
-  ros::Publisher ee_velocity_pub_;
-
-  // Data storage
-  std::mutex joint_mutex_;
-  std::mutex image_mutex_;
-  std::mutex depth_mutex_;
-
-  std::vector<double> current_joint_angles_;
-  std::vector<double> current_joint_velocities_;
-  cv::Mat current_rgb_image_;
-  cv::Mat current_depth_image_;
-
-  ros::Time current_stamp_;
-  ros::Time image_stamp_;
-  ros::Time depth_stamp_;
-
-  bool has_new_image_;
-  bool has_new_depth_;
 };
 
 int main(int argc, char **argv) {
-  ros::init(argc, argv, "franka_state_camera_reader");
-
-  ROS_INFO("==============================================");
-  ROS_INFO("Franka State + Camera Reader");
-  ROS_INFO("==============================================");
-
-  FrankaStateCameraReader reader;
-
+  ros::init(argc, argv, "franka_ultimate_sync");
+  FrankaUltimateSyncReader reader;
   ros::spin();
-
   return 0;
 }

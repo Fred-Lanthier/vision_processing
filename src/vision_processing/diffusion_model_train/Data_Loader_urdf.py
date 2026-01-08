@@ -6,7 +6,6 @@ import torch
 import random
 from torch.utils.data import Dataset
 from scipy.spatial.transform import Rotation as R
-import fpsample
 
 def seed_everything(seed=42):
     random.seed(seed)
@@ -104,8 +103,8 @@ class Robot3DDataset(Dataset):
                 # Pose finale 9D = [x, y, z, r1...r6]
                 pose_9d = np.concatenate([pos, rot_6d]).astype(np.float32)
                 
-                pcd_name = state.get('Merged_urdf_point_cloud')
-                pcd_path = os.path.join(folder, f'Merged_urdf_{folder_name}', pcd_name) if pcd_name else None
+                pcd_name = state.get('Merged_urdf_fork_point_cloud')
+                pcd_path = os.path.join(folder, f'Merged_urdf_fork_{folder_name}', pcd_name) if pcd_name else None
 
                 parsed_traj.append({
                     'pose_9d': pose_9d,
@@ -190,18 +189,13 @@ class Robot3DDataset(Dataset):
             return np.zeros((self.num_points, 3), dtype=np.float32)
 
         # Cas où on a moins de points que demandé
-        # if pc.shape[0] <= self.num_points:
-        #     indices = np.arange(pc.shape[0])
-        #     if pc.shape[0] < self.num_points:
-        #         # Padding par répétition si nécessaire
-        #         extra_indices = np.random.choice(pc.shape[0], self.num_points - pc.shape[0], replace=True)
-        #         indices = np.concatenate([indices, extra_indices])
-        #     return pc[indices].astype(np.float32)
-
-        # --- UTILISATION DE FPSAMPLE ---
-        # bucket_fps_indices est l'algorithme le plus rapide pour les grands PCD
-        # pc doit être un array numpy de forme (N, 3)
-        # indices = fpsample.bucket_fps_kdline_sampling(pc.astype(np.float32), self.num_points, h=5)
+        if pc.shape[0] <= self.num_points:
+            indices = np.arange(pc.shape[0])
+            if pc.shape[0] < self.num_points:
+                # Padding par répétition si nécessaire
+                extra_indices = np.random.choice(pc.shape[0], self.num_points - pc.shape[0], replace=True)
+                indices = np.concatenate([indices, extra_indices])
+            return pc[indices].astype(np.float32)
         
         return pc[:self.num_points].astype(np.float32)
 
@@ -212,7 +206,7 @@ class Robot3DDataset(Dataset):
         """
         # 1. Shift Global (+/- 2cm)
         # On déplace tout le monde (Robot + Env) ensemble
-        shift = np.random.uniform(low=-0.05, high=0.05, size=(1, 3))
+        shift = np.random.uniform(low=-0.02, high=0.02, size=(1, 3))
         
         pcd = pcd + shift
         obs_poses[:, :3] += shift
