@@ -16,7 +16,17 @@
          command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro arm_id:=$(arg arm_id)" />
 
   <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
-        args="-param robot_description -urdf -model panda -z 0.0"/>
+        args="-param robot_description 
+              -urdf 
+              -model panda 
+              -z 0.0
+              -J panda_joint1 -0.000059
+              -J panda_joint2 -0.125928
+              -J panda_joint3  0.000117
+              -J panda_joint4 -2.193312
+              -J panda_joint5 -0.000251
+              -J panda_joint6  2.064780
+              -J panda_joint7  0.785511" />
 
   <param name="food_description" textfile="$(find vision_processing)/urdf/food.urdf" />
 
@@ -37,8 +47,10 @@
   <rosparam file="$(find vision_processing)/config/simple_controllers.yaml" command="load"/>
   
   <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="false" output="screen"
-        args="joint_state_controller effort_joint_trajectory_controller"/>
+        args="joint_state_controller joint_group_position_controller"/>
 
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" respawn="true" output="screen" />
+  
   <!-- ============================================ -->
   <!-- MOVEIT                                       -->
   <!-- ============================================ -->

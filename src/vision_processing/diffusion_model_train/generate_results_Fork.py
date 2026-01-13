@@ -76,7 +76,7 @@ def infer_single(model, normalizer, sample, scheduler, DEVICE):
 
         for t in scheduler.timesteps:
             timesteps = torch.tensor([t], device=DEVICE).long()
-            noise_pred = model.noise_pred_net(noisy_action, timesteps, global_cond)
+            noise_pred = model.noise_pred_net(noisy_action, torch.tensor([t], device=DEVICE).long(), global_cond)
             noisy_action = scheduler.step(noise_pred, t, noisy_action).prev_sample
         
         pred_action = normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0]
@@ -107,7 +107,7 @@ def generate_train_history():
     rospack = rospkg.RosPack()
     package_path = rospack.get_path('vision_processing')
     # Chemin spécifique du Code 2
-    pkl_file = os.path.join(package_path, 'pkl_files', 'train_history_fork_only_SAMPLE.pkl')
+    pkl_file = os.path.join(package_path, 'pkl_files', 'train_history_fork_only_SAMPLE_NO_AUG.pkl')
     
     if not os.path.exists(pkl_file):
         print(f"⚠️ Fichier historique introuvable : {pkl_file}")
@@ -406,7 +406,7 @@ def main():
     data_path = os.path.join(pkg_path, 'datas', 'Trajectories_preprocess')
     
     # Chemins spécifiques demandés
-    ckpt_path = os.path.join(pkg_path, "models", "dp3_policy_last_diffusers_fork_only_SAMPLE.ckpt") 
+    ckpt_path = os.path.join(pkg_path, "models", "dp3_policy_best_diffusers_fork_only_SAMPLE_NO_AUG.ckpt") 
     stats_path = os.path.join(pkg_path, "normalization_stats_fork_only.json")
 
     # 2. Chargement Données & Modèle

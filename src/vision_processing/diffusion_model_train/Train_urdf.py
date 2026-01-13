@@ -203,39 +203,49 @@ class DP3Encoder(nn.Module):
     def save_input(self, module, input, output):
         self.input_pointcloud = input[0].detach()
 
-class Normalizer:
+class Normalizer(nn.Module):
     def __init__(self, stats=None):
-        self.stats = stats
-    
-    def normalize(self, data, key):
-        # data: (B, T, 9)
-        if self.stats is None: return data
+        super().__init__()
+        # On enregistre les buffers. Ils seront sauvegardés dans le .ckpt !
+        self.register_buffer('pos_min', torch.zeros(3))
+        self.register_buffer('pos_max', torch.ones(3))
+        # On sauvegarde aussi l'état d'initialisation (booléen)
+        self.register_buffer('is_initialized', torch.tensor(False, dtype=torch.bool))
+
+        if stats is not None:
+            self.load_stats_from_dict(stats)
+
+    def load_stats_from_dict(self, stats):
+        # Cette fonction sert uniquement lors du PREMIER entraînement
+        print("📥 Injection des statistiques dans le modèle...")
+        self.pos_min[:] = torch.tensor(stats['agent_pos']['min'])
+        self.pos_max[:] = torch.tensor(stats['agent_pos']['max'])
+        self.is_initialized.fill_(True)
+
+    def normalize(self, x, key='agent_pos'): 
+        # Note: key est gardé pour compatibilité, mais ici on gère surtout agent_pos
+        if not self.is_initialized:
+            return x
+            
+        # Séparation Pos / Rot (Spécifique à votre format 9D)
+        pos = x[..., :3]
+        rot = x[..., 3:]
         
-        # Séparer Position (3) et Rotation (6)
-        pos = data[..., :3]
-        rot = data[..., 3:]
+        # Formule MinMax [-1, 1]
+        denom = (self.pos_max - self.pos_min).clamp(min=1e-5)
+        pos_norm = 2 * (pos - self.pos_min) / denom - 1
         
-        # Récupérer stats (sur CPU ou GPU selon data)
-        min_val = torch.tensor(self.stats[key]['min'], device=data.device)[..., :3]
-        max_val = torch.tensor(self.stats[key]['max'], device=data.device)[..., :3]
-        
-        # Normaliser Position [-1, 1]
-        pos_norm = 2 * (pos - min_val) / (max_val - min_val + 1e-5) - 1
-        
-        # Renvoie Position Normalisée + Rotation Intacte
         return torch.cat([pos_norm, rot], dim=-1)
 
-    def unnormalize(self, data, key):
-        if self.stats is None: return data
+    def unnormalize(self, x, key='action'):
+        if not self.is_initialized:
+            return x
+            
+        pos_norm = x[..., :3]
+        rot = x[..., 3:]
         
-        pos_norm = data[..., :3]
-        rot = data[..., 3:]
-        
-        min_val = torch.tensor(self.stats[key]['min'], device=data.device)[..., :3]
-        max_val = torch.tensor(self.stats[key]['max'], device=data.device)[..., :3]
-        
-        # Denormaliser Position
-        pos = (pos_norm + 1) / 2 * (max_val - min_val + 1e-5) + min_val
+        denom = (self.pos_max - self.pos_min).clamp(min=1e-5)
+        pos = (pos_norm + 1) / 2 * denom + self.pos_min
         
         return torch.cat([pos, rot], dim=-1)
 
@@ -275,12 +285,14 @@ def compute_dataset_stats(dataset):
 # ==============================================================================
 
 class DP3AgentRobust(nn.Module):
-    def __init__(self, action_dim=9, robot_state_dim=9, obs_horizon=2, pred_horizon=16):
+    def __init__(self, action_dim=9, robot_state_dim=9, obs_horizon=2, pred_horizon=16, stats=None):
         super().__init__()
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
         self.action_dim = action_dim
         
+        self.normalizer = Normalizer(stats)
+
         self.point_encoder = DP3Encoder(input_dim=3, output_dim=64)
         
         # Robot State Encoder
@@ -319,17 +331,36 @@ def main():
     NUM_EPOCHS = 1000 
     LEARNING_RATE = 1e-4
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    config_pickle = {
+    ACTION_DIM = 9
+    ROBOT_STATE_DIM = 9
+    OBS_HORIZON = 2
+    PRED_HORIZON = 16
+    NUM_POINTS = 1024
+
+    # Diffusion Params
+    NOISE_STEPS = 100
+    BETA_SCHEDULE = 'squaredcos_cap_v2'
+    CLIP_SAMPLE = True
+    PREDICTION_TYPE = 'sample'
+
+    config = {
         "seed": 42,
         "batch_size": BATCH_SIZE,
         "num_epochs": NUM_EPOCHS,
         "lr": LEARNING_RATE,
-        "model_name": "DP3_Robust_DiffusersEMA_URDF"
+        "model_name": "DP3_Robust_DiffusersEMA_URDF",
+        "action_dim": ACTION_DIM,
+        "robot_state_dim": ROBOT_STATE_DIM,
+        "obs_horizon": OBS_HORIZON,
+        "pred_horizon": PRED_HORIZON,
+        "num_points": NUM_POINTS,
+        "noise_steps": NOISE_STEPS,
+        "beta_schedule": BETA_SCHEDULE,
+        "clip_sample": CLIP_SAMPLE,
+        "prediction_type": PREDICTION_TYPE
     }
 
     history = {
-        "config": config_pickle,
         'train_loss': [],
         'val_loss': [],
         'lr': [],
@@ -345,27 +376,30 @@ def main():
     full_dataset = Robot3DDataset(data_path, mode='all')
     
     # 2. Normalisation
-    stats_path = os.path.join(pkg_path, "normalization_stats_urdf_fork_SAMPLE.json")
-    if os.path.exists(stats_path):
-        print("📂 Chargement des stats existantes...")
-        with open(stats_path, 'r') as f:
-            stats = json.load(f)
-    else:
-        stats = compute_dataset_stats(full_dataset)
-        with open(stats_path, 'w') as f:
-            json.dump(stats, f)
-            
+    # stats_path = os.path.join(pkg_path, "normalization_stats_urdf_fork_SAMPLE.json")
+    # if os.path.exists(stats_path):
+    #     print("📂 Chargement des stats existantes...")
+    #     with open(stats_path, 'r') as f:
+    #         stats = json.load(f)
+    # else:
+    #     stats = compute_dataset_stats(full_dataset)
+    #     with open(stats_path, 'w') as f:
+    #         json.dump(stats, f)
+    stats = None
     normalizer = Normalizer(stats)
     
     # Reload datasets en mode train/val
-    train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.2, seed=42, augment=True)
-    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42, augment=False)
+    train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.2, seed=42, 
+                                    num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=True)
+    val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42, 
+                                num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=False)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
     # 3. Setup Model
-    model = DP3AgentRobust(action_dim=9, robot_state_dim=9).to(DEVICE)
+    model = DP3AgentRobust(action_dim=ACTION_DIM, robot_state_dim=ROBOT_STATE_DIM,
+                        obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON).to(DEVICE)
     
     # 🔥 INITIALISATION DIFFUSERS EMA 🔥
     ema_model = EMAModel(
@@ -381,10 +415,10 @@ def main():
     )
     
     noise_scheduler = DDPMScheduler(
-        num_train_timesteps=100,
-        beta_schedule='squaredcos_cap_v2',
-        clip_sample=True,
-        prediction_type='sample' # <--- ✅ CONFIGURATION CRUCIALE : SAMPLE PREDICTION
+        num_train_timesteps=NOISE_STEPS,
+        beta_schedule=BETA_SCHEDULE,
+        clip_sample=CLIP_SAMPLE,
+        prediction_type=PREDICTION_TYPE
     )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-6)
@@ -394,6 +428,9 @@ def main():
 
     print(f"🚀 Training Started on {DEVICE} with Sample Prediction & Diffusers EMA")
     best_val_loss = float('inf')
+
+    models_dir = os.path.join(pkg_path, "models")
+    os.makedirs(models_dir, exist_ok=True)
 
     for epoch in range(NUM_EPOCHS):
         model.train()
@@ -466,16 +503,27 @@ def main():
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             # Sauvegarde le modèle courant (qui contient les poids EMA à cause du copy_to)
-            torch.save(model.state_dict(), os.path.join(pkg_path, "models", "dp3_policy_best_robust_urdf_FPS_fork_SAMPLE.ckpt"))
+            save_name = "dp3_policy_best_robust_urdf_FPS_fork_SAMPLE.ckpt"
             print("💾 Saved Best EMA Model")
         else:
-            torch.save(model.state_dict(), os.path.join(pkg_path, "models", "dp3_policy_last_robust_urdf_FPS_fork_SAMPLE.ckpt"))
+            save_name = "dp3_policy_last_robust_urdf_FPS_fork_SAMPLE.ckpt"
             print("💾 Saved Last EMA Model")
+        
+        checkpoint_payload = {
+            'state_dict': model.state_dict(),
+            'history': history,
+            'config': config,
+            'stats': stats, # Les stats de normalisation JSON directes !
+            'epoch': epoch,
+            'best_val_loss': best_val_loss,
+            'model_class': 'DP3AgentRobust'
+        }
 
+        torch.save(checkpoint_payload, os.path.join(pkg_path, "models", save_name))
         # C. On restaure les poids d'entraînement pour continuer l'entraînement
         ema_model.restore(model.parameters())
 
-        with open(os.path.join(pkg_path, "pkl_files", "train_history_urdf_FPS_fork_SAMPLE.pkl"), 'wb') as f:
-            pickle.dump(history, f)
+        # with open(os.path.join(pkg_path, "pkl_files", "train_history_urdf_FPS_fork_SAMPLE.pkl"), 'wb') as f:
+        #     pickle.dump(history, f)
 if __name__ == "__main__":
     main()

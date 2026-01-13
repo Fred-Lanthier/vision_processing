@@ -163,7 +163,6 @@ def main():
     
     # Générer les waypoints du cercle
     waypoints = []
-    angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
     
     package_path = rospkg.RosPack().get_path('vision_processing')
     step = 10

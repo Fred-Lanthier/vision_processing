@@ -24,12 +24,12 @@
   <link name="fork_tip">
     <visual>
       <origin xyz="-0.033 -0.02 0.0171378" rpy="0 ${27.5 * pi / 180} 0"/>
-      <geometry><mesh filename="$(find vision_processing)/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/></geometry>
+      <geometry><mesh filename="package://vision_processing/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/></geometry>
     </visual>
-    <collision>
+    <!-- <collision>
       <origin xyz="-0.033 -0.02 0.0171378" rpy="0 ${27.5 * pi / 180} 0"/>
-      <geometry><mesh filename="$(find vision_processing)/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/></geometry>
-    </collision>
+      <geometry><mesh filename="package://vision_processing/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/></geometry>
+    </collision> -->
     <inertial> <mass value="0.1" />
       <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001" />
     </inertial>
@@ -108,7 +108,7 @@
   <gazebo reference="camera_static_link">
     <material>Gazebo/Red</material>
     <sensor type="depth" name="camera_static">
-      <update_rate>30.0</update_rate>
+      <update_rate>15.0</update_rate>
       <camera>
         <horizontal_fov>0.958</horizontal_fov> 
         <image><width>640</width><height>480</height><format>R8G8B8</format></image>
@@ -128,12 +128,20 @@
   <gazebo reference="camera_wrist_link">
     <material>Gazebo/Blue</material>
     <sensor type="depth" name="camera_wrist">
-      <update_rate>30.0</update_rate>
+      <update_rate>15.0</update_rate>
+      
       <camera>
         <horizontal_fov>0.973</horizontal_fov>
-        <image><width>640</width><height>480</height><format>R8G8B8</format></image>
-        <clip><near>0.05</near><far>3.0</far></clip>
+        <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+        </image>
+        <clip>
+            <near>0.01</near> <far>10.0</far>
+        </clip>
       </camera>
+
       <plugin name="wrist_camera_controller" filename="libgazebo_ros_openni_kinect.so">
         <cameraName>camera_wrist</cameraName>
         <alwaysOn>true</alwaysOn>
@@ -141,6 +149,11 @@
         <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>
         <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
         <frameName>camera_wrist_optical_frame</frameName>
+        
+        <pointCloudCutoff>0.01</pointCloudCutoff>
+        <pointCloudCutoffMax>10.0</pointCloudCutoffMax>
+        
+        <updateRate>15.0</updateRate>
       </plugin>
     </sensor>
   </gazebo>

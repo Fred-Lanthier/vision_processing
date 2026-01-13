@@ -66,6 +66,9 @@ set(PYTHON_EXECUTABLE "/home/flanthier/Github/src/vision_processing/venv_sam3/bi
 catkin_install_python(PROGRAMS
   scripts/vision_server_food_segmentation.py
   scripts/vision_server_robot_segmentation.py
+  scripts/trajectory_node.py
+  scripts/inference_node.py
+  
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

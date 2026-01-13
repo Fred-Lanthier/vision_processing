@@ -1,207 +1,263 @@
 #!/usr/bin/env python3
 import rospy
 import numpy as np
-import open3d as o3d
 import message_filters
+from sensor_msgs.msg import Image, PointCloud2, JointState, CameraInfo
+from geometry_msgs.msg import PoseStamped, PointStamped, Point
+from visualization_msgs.msg import Marker
+import std_msgs.msg
 import sensor_msgs.point_cloud2 as pc2
-from sensor_msgs.msg import Image, JointState
-from geometry_msgs.msg import PoseStamped
-from cv_bridge import CvBridge
 import tf.transformations as tft
-import rospkg
-import os
 import sys
+import os
+import rospkg
+import fpsample
+import torch
+import time
+from PIL import Image as PILImage
 
-# --- IMPORT DU LOADER ---
-# Ajoutez le chemin vers votre dossier contenant Compute_3D_point_cloud_from_mesh.py
-# Adaptez 'vision_processing' et le chemin si nécessaire
-rospack = rospkg.RosPack()
-sys.path.append(os.path.join(rospack.get_path('vision_processing'), 'scripts'))
-
+# --- 1. IMPORTS & SÉCURITÉ ---
 try:
-    from Compute_3D_point_cloud_from_mesh import RobotMeshLoaderOptimized
+    from sam3.model_builder import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
 except ImportError:
-    print("❌ ERREUR: Impossible d'importer RobotMeshLoaderOptimized.")
-    print("Vérifiez que Compute_3D_point_cloud_from_mesh.py est bien accessible.")
+    print("❌ ERREUR: Activez venv_sam3 !")
     sys.exit(1)
 
-class InferenceVisualizer:
+rospack = rospkg.RosPack()
+sys.path.append(os.path.join(rospack.get_path('vision_processing'), 'scripts'))
+try:
+    from Compute_3D_point_cloud_from_mesh import RobotMeshLoaderOptimized
+    LOADER_AVAILABLE = True
+except ImportError:
+    print("⚠️ Attention: RobotMeshLoaderOptimized introuvable.")
+    LOADER_AVAILABLE = False
+
+class MergedCloudNode:
     def __init__(self):
-        rospy.init_node('inference_visualizer', anonymous=True)
+        rospy.init_node('merged_cloud_node', anonymous=True)
         
-        # 1. Chargement du Robot (URDF)
-        print("⏳ Chargement du modèle URDF...")
-        # On cherche le fichier combiné
-        pkg_path = rospack.get_path('vision_processing') # Ou fl_read_pose selon votre setup
-        # Tente de trouver le fichier xacro/urdf
-        urdf_path = os.path.join(rospack.get_path('fl_read_pose'), 'scripts', 'panda_arm_hand_combined.urdf.xacro')
-        if not os.path.exists(urdf_path):
-             # Fallback sur une valeur par défaut ou paramètre ROS
-             urdf_path = rospy.get_param('/robot_description_file', '')
+        # --- CONFIGURATION ---
+        self.target_object = "cube"
         
-        if not os.path.exists(urdf_path):
-            rospy.logerr(f"URDF introuvable: {urdf_path}")
-            # NOTE: Assurez-vous que le chemin est bon ou hardcodez-le pour le test
+        # --- VARIABLES D'ÉTAT ---
+        self.cube_locked = False
+        self.is_grasped = False
+        self.static_cube_cloud = None
+        self.current_cube_cloud = None
         
-        self.mesh_loader = RobotMeshLoaderOptimized(urdf_path)
-        print("✅ Modèle Robot chargé.")
+        # Seuil de contact (en mètres)
+        # 3 cm est suffisant pour détecter si la fourchette touche le cube
+        self.contact_threshold = -0.01 
 
-        # 2. Variables d'état
-        self.food_pcd_world = None # Ce sera le nuage fixe
-        self.bridge = CvBridge()
-        self.is_initialized = False
+        # --- GÉOMÉTRIE FOURCHETTE (Basé sur ton Xacro) ---
+        # Joint: fork_tip_joint -> origin xyz="-0.0055 0 0.1296"
+        # C'est la position du bout de la fourchette par rapport au frame TCP
+        self.fork_tip_offset_tcp = np.array([-0.0055, 0.0, 0.1296, 1.0]) 
 
-        # Paramètres Caméra (À ajuster selon votre calibration réelle ou CameraInfo)
-        self.fx = 607.18
-        self.fy = 606.91
-        self.cx = 320.85
-        self.cy = 243.40
-        
-        # Transform EE -> Camera (Offset physique)
-        # D'après votre xacro : <origin xyz="-0.052 0.035 -0.045" rpy="${-pi/2} 0 ${-pi/2}"/>
-        # C'est la transfo TCP -> Camera Link
-        # Attention : C'est souvent TCP -> Optical Frame qu'on veut.
-        # Vérifions votre xacro :
-        # wrist_link -> optical_frame : rpy="${-pi/2} 0 ${-pi/2}" (Standard ROS to CV)
-        # TCP -> wrist_link : xyz="-0.052 0.035 -0.045" rpy="${-pi/2} 0 ${-pi/2}"
-        
-        # Calcul de T_tcp_cam (Matrice 4x4)
-        # NOTE : Simplification pour le test, ajustez si le nuage food est décalé
-        T_tcp_wrist = tft.compose_matrix(
-            translate=[-0.052, 0.035, -0.045],
-            angles=tft.euler_from_quaternion(tft.quaternion_from_euler(-np.pi/2, 0, -np.pi/2))
-        )
-        # Optical frame offset souvent nécessaire
-        T_wrist_optical = tft.compose_matrix(translate=[0,0,0], angles=tft.euler_from_quaternion(tft.quaternion_from_euler(-np.pi/2, 0, -np.pi/2)))
-        
-        self.T_tcp_optical = np.dot(T_tcp_wrist, T_wrist_optical)
+        # Matrices pour le mouvement relatif
+        self.T_world_tcp_at_grasp = None
+        self.T_tcp_at_grasp_inv = None
 
-        # 3. Subscribers Synchronisés
+        # --- SAM 3 ---
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        rospy.loginfo(f"⏳ Chargement SAM 3 sur {self.device}...")
+        self.sam_model = build_sam3_image_model()
+        if hasattr(self.sam_model, "to"): self.sam_model.to(self.device)
+        self.sam_processor = Sam3Processor(self.sam_model, confidence_threshold=0.1)
+        rospy.loginfo("✅ SAM 3 chargé.")
+
+        # --- ROBOT LOADER ---
+        self.mesh_loader = None
+        if LOADER_AVAILABLE:
+            urdf_path = os.path.join(rospack.get_path('vision_processing'), 'urdf', 'panda_camera.xacro')
+            try: self.mesh_loader = RobotMeshLoaderOptimized(urdf_path)
+            except: pass
+
+        # --- PUBLISHERS ---
+        self.pub_merged = rospy.Publisher('/vision/merged_cloud', PointCloud2, queue_size=1)
+        self.pub_marker = rospy.Publisher('/vision/marker', Marker, queue_size=1)
+        
+        # Debug: Visualiser où le code pense que se trouve le bout de la fourchette
+        self.pub_fork_tip = rospy.Publisher('/vision/debug_fork_tip', PointStamped, queue_size=1)
+
+        # --- CAMÉRA INFO ---
+        self.fx, self.fy, self.cx, self.cy = 604.9, 604.9, 320.0, 240.0
+        self.sub_info = rospy.Subscriber("/camera_wrist/color/camera_info", CameraInfo, self.cam_info_cb)
+
+        # --- TRANSFORMATIQUE ---
+        T_tcp_wrist = tft.compose_matrix(translate=[-0.052, 0.035, -0.045], angles=tft.euler_from_quaternion(tft.quaternion_from_euler(0, -np.pi/2, 0)))
+        T_wrist_opt = tft.compose_matrix(translate=[0, 0, 0], angles=tft.euler_from_quaternion(tft.quaternion_from_euler(-np.pi/2, 0, -np.pi/2)))
+        self.T_tcp_optical = np.dot(T_tcp_wrist, T_wrist_opt)
+
+        # --- SUBSCRIBERS ---
+        sub_rgb = message_filters.Subscriber("/synced/camera_wrist/rgb", Image)
         sub_depth = message_filters.Subscriber("/synced/camera_wrist/depth", Image)
         sub_pose = message_filters.Subscriber("/synced/ee_pose", PoseStamped)
         sub_joints = message_filters.Subscriber("/synced/joint_states", JointState)
-        
-        # On n'a pas besoin de RGB pour le dummy test, mais nécessaire plus tard pour SAM3
-        # sub_rgb = ...
 
         self.ts = message_filters.ApproximateTimeSynchronizer(
-            [sub_depth, sub_pose, sub_joints], queue_size=5, slop=0.1
+            [sub_rgb, sub_depth, sub_pose, sub_joints], queue_size=5, slop=0.2
         )
         self.ts.registerCallback(self.callback)
+        rospy.loginfo("🚀 Noeud de Fusion prêt avec détection de contact Fourchette.")
 
-        # 4. Visualisation Open3D
-        self.vis = o3d.visualization.Visualizer()
-        self.vis.create_window(window_name="Inference Input Debug", width=1280, height=720)
-        
-        # Création des géométries vides
-        self.pcd_robot = o3d.geometry.PointCloud()
-        self.pcd_food = o3d.geometry.PointCloud()
-        
-        self.vis.add_geometry(self.pcd_robot)
-        self.vis.add_geometry(self.pcd_food)
-        
-        # Repère visuel (origine)
-        axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
-        self.vis.add_geometry(axis)
+    def cam_info_cb(self, msg):
+        self.fx = msg.K[0]; self.cx = msg.K[2]; self.fy = msg.K[4]; self.cy = msg.K[5]
+        self.sub_info.unregister()
 
-        print("🚀 Visualizer prêt. En attente de données...")
+    def imgmsg_to_numpy(self, msg):
+        if msg.encoding == "rgb8": return np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        elif "32FC1" in msg.encoding: return np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+        return None
 
     def pose_to_matrix(self, pose_msg):
-        p = pose_msg.position
-        q = pose_msg.orientation
-        trans = [p.x, p.y, p.z]
-        rot = [q.x, q.y, q.z, q.w]
-        return tft.compose_matrix(translate=trans, angles=tft.euler_from_quaternion(rot))
+        p = pose_msg.position; q = pose_msg.orientation
+        return tft.compose_matrix(translate=[p.x, p.y, p.z], angles=tft.euler_from_quaternion([q.x, q.y, q.z, q.w]))
 
-    def process_depth_to_cloud(self, depth_img, mask=None):
-        # Conversion profondeur -> Nuage (Camera Frame)
-        # Vectorized implementation
-        h, w = depth_img.shape
-        u, v = np.meshgrid(np.arange(w), np.arange(h))
-        
-        z = depth_img / 1000.0 # mm to meters
-        
-        # Filtre basique : ignorer ce qui est trop loin (>1m) ou vide
-        valid = (z > 0.1) & (z < 1.0)
-        
-        if mask is not None:
-            valid = valid & mask
-            
-        x = (u - self.cx) * z / self.fx
-        y = (v - self.cy) * z / self.fy
-        
-        # Stack (N, 3)
-        points = np.stack([x[valid], y[valid], z[valid]], axis=-1)
-        return points
+    def publish_cloud(self, points, frame_id="world"):
+        if points is None or len(points) == 0: return
+        header = std_msgs.msg.Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = frame_id
+        cloud_msg = pc2.create_cloud_xyz32(header, points)
+        self.pub_merged.publish(cloud_msg)
 
-    def callback(self, depth_msg, ee_pose_msg, joint_msg):
-        # 1. Update Robot State
-        joint_map = {}
-        for i, name in enumerate(joint_msg.name):
-            if "panda" in name:
-                joint_map[name] = joint_msg.position[i]
+    def callback(self, rgb_msg, depth_msg, ee_pose_msg, joint_msg):
         
-        robot_points = self.mesh_loader.create_point_cloud(joint_map)
-        self.pcd_robot.points = o3d.utility.Vector3dVector(robot_points)
-        self.pcd_robot.paint_uniform_color([0.5, 0.5, 0.5])
-
-        # 2. Gestion Food (Debug amélioré)
-        if self.food_pcd_world is None:
+        # --- 1. ROBOT CLOUD ---
+        current_robot_points = None
+        if self.mesh_loader:
             try:
-                # Convertir en float32 (mètres ou millimètres)
-                cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
-                
-                # Conversion mm -> mètres si nécessaire (Gazebo sort souvent du float32 en mètres directement, ou uint16 en mm)
-                if cv_depth.dtype == np.uint16:
-                    z_img = cv_depth / 1000.0
-                else:
-                    z_img = cv_depth # Supposons mètres pour float32
-                
-                # Stats de débogage
-                valid_mask = ~np.isnan(z_img) & (z_img > 0.1) & (z_img < 3.0)
-                valid_count = np.sum(valid_mask)
-                
-                if valid_count > 0:
-                    min_dist = np.min(z_img[valid_mask])
-                    max_dist = np.max(z_img[valid_mask])
-                    print(f"👀 Vision active ! {valid_count} points valides. Distances: [{min_dist:.2f}m - {max_dist:.2f}m]")
-                    
-                    # On prend TOUT ce qui est valide (pas de crop central pour l'instant)
-                    points_cam = self.process_depth_to_cloud(cv_depth, mask=None) # Mask None = Tout prendre
-                    
-                    # Transformation vers World
-                    T_world_tcp = self.pose_to_matrix(ee_pose_msg.pose)
-                    T_world_cam = np.dot(T_world_tcp, self.T_tcp_optical)
-                    
-                    ones = np.ones((points_cam.shape[0], 1))
-                    points_hom = np.hstack([points_cam, ones])
-                    points_world = np.dot(T_world_cam, points_hom.T).T[:, :3]
-                    
-                    self.food_pcd_world = points_world
-                    self.pcd_food.points = o3d.utility.Vector3dVector(self.food_pcd_world)
-                    self.pcd_food.paint_uniform_color([0, 1, 0]) # Vert pour voir que ça a marché
-                    print("✅ SNAPSHOT RÉUSSI ! Nuage fixé.")
-                
-                else:
-                    # Affiche ce qui ne va pas pour comprendre
-                    print("⚠️ Image DEPTH reçue mais vide (NaN ou hors range).")
-                    print(f"   Valeurs brutes -> Min: {np.nanmin(z_img):.2f}, Max: {np.nanmax(z_img):.2f}")
-                    print("   👉 BOUGEZ LE ROBOT pour viser le cube/sol.")
+                joint_map = {name: joint_msg.position[i] for i, name in enumerate(joint_msg.name) if "panda" in name}
+                current_robot_points = self.mesh_loader.create_point_cloud(joint_map)
+            except: pass
 
-            except Exception as e:
-                print(f"Erreur processing: {e}")
+        # --- 2. DETECCIÓN INITIALE DU CUBE (SAM 3) ---
+        if not self.cube_locked:
+            try:
+                cv_rgb = self.imgmsg_to_numpy(rgb_msg)
+                cv_depth = self.imgmsg_to_numpy(depth_msg)
+                
+                if cv_rgb is not None and cv_depth is not None:
+                    pil_image = PILImage.fromarray(cv_rgb)
+                    inference_state = self.sam_processor.set_image(pil_image)
+                    output = self.sam_processor.set_text_prompt(state=inference_state, prompt=self.target_object)
+                    
+                    raw_scores = output["scores"]
+                    raw_masks = output["masks"]
+                    
+                    if len(raw_scores) > 0:
+                        scores = np.array(raw_scores).flatten() if not isinstance(raw_scores, torch.Tensor) else raw_scores.detach().cpu().numpy().flatten()
+                        masks = np.array(raw_masks) if not isinstance(raw_masks, torch.Tensor) else raw_masks.detach().cpu().numpy()
+                        
+                        best_idx = np.argmax(scores)
+                        if scores[best_idx] > 0.20:
+                            final_mask = masks[best_idx]
+                            while final_mask.ndim > 2: final_mask = final_mask[0]
+                            
+                            z = cv_depth if cv_depth.dtype == np.float32 else cv_depth / 1000.0
+                            valid = (final_mask > 0) & (z > 0.01) & (z < 2.0) & np.isfinite(z)
+                            
+                            if np.sum(valid) > 100:
+                                v, u = np.where(valid)
+                                z_val = z[valid]
+                                x = (u - self.cx) * z_val / self.fx
+                                y = (v - self.cy) * z_val / self.fy
+                                points_cam = np.stack([x, y, z_val], axis=-1)
+                                
+                                T_world_tcp = self.pose_to_matrix(ee_pose_msg.pose)
+                                T_world_cam = np.dot(T_world_tcp, self.T_tcp_optical)
+                                ones = np.ones((points_cam.shape[0], 1))
+                                points_world = np.dot(T_world_cam, np.hstack([points_cam, ones]).T).T[:, :3]
+                                
+                                self.static_cube_cloud = points_world
+                                self.cube_locked = True
+                                
+                                # Visu Marker
+                                c = np.mean(points_world, axis=0)
+                                m = Marker(); m.header.frame_id="world"; m.header.stamp=rospy.Time.now(); m.type=Marker.SPHERE; m.action=Marker.ADD
+                                m.pose.position.x=c[0]; m.pose.position.y=c[1]; m.pose.position.z=c[2]
+                                m.scale.x=0.05; m.scale.y=0.05; m.scale.z=0.05; m.color.a=1.0; m.color.g=1.0
+                                self.pub_marker.publish(m)
+                                print(f"\n✅ CUBE DÉTECTÉ ET VERROUILLÉ.")
+            except Exception: pass
 
-        # 3. Render
-        self.vis.update_geometry(self.pcd_robot)
-        if self.food_pcd_world is not None:
-            self.vis.update_geometry(self.pcd_food)
-        self.vis.poll_events()
-        self.vis.update_renderer()
+        # --- 3. GESTION DU GRASP (BASÉE SUR LE BOUT DE LA FOURCHETTE) ---
+        self.current_cube_cloud = None
+        
+        if self.cube_locked and self.static_cube_cloud is not None:
+            
+            # A. Calcul de la position actuelle du BOUT DE LA FOURCHETTE
+            T_world_tcp_current = self.pose_to_matrix(ee_pose_msg.pose)
+            
+            # Application de l'offset Xacro : P_world = T_world_tcp * P_local_offset
+            fork_tip_world_hom = np.dot(T_world_tcp_current, self.fork_tip_offset_tcp)
+            fork_tip_pos = fork_tip_world_hom[:3]
+            
+            # Debug: Publier où on pense que le bout est
+            p_msg = PointStamped()
+            p_msg.header.frame_id = "world"
+            p_msg.header.stamp = rospy.Time.now()
+            p_msg.point.x = fork_tip_pos[0]; p_msg.point.y = fork_tip_pos[1]; p_msg.point.z = fork_tip_pos[2]
+            self.pub_fork_tip.publish(p_msg)
+
+            # B. Logique de Contact
+            if not self.is_grasped:
+                # Calcul de distance : Bout fourchette <-> Nuage Cube
+                # On utilise la norme L2 min entre le point unique (fourchette) et tous les points du cube
+                dists = np.linalg.norm(self.static_cube_cloud - fork_tip_pos, axis=1)
+                min_dist = np.min(dists)
+                
+                # Si le bout de la fourchette touche le cube
+                if min_dist < self.contact_threshold:
+                    print(f"\n🍴 CONTACT FOURCHETTE ! (Dist: {min_dist:.3f}m). Objet attaché.")
+                    self.is_grasped = True
+                    self.T_world_tcp_at_grasp = T_world_tcp_current
+                    self.T_tcp_at_grasp_inv = np.linalg.inv(T_world_tcp_current)
+
+            # C. Mise à jour position Cube
+            if self.is_grasped:
+                # Mouvement relatif du TCP (le cube suit le TCP)
+                T_motion = np.dot(T_world_tcp_current, self.T_tcp_at_grasp_inv)
+                
+                ones = np.ones((self.static_cube_cloud.shape[0], 1))
+                pts_hom = np.hstack([self.static_cube_cloud, ones])
+                self.current_cube_cloud = np.dot(T_motion, pts_hom.T).T[:, :3]
+            else:
+                self.current_cube_cloud = self.static_cube_cloud
+
+        # --- 4. FUSION ET PUBLICATION ---
+        merged = []
+        if current_robot_points is not None: merged.append(current_robot_points)
+        if self.current_cube_cloud is not None: merged.append(self.current_cube_cloud)
+            
+        if len(merged) > 0:
+            full_cloud = np.vstack(merged)
+            if full_cloud.shape[0] > 1024:
+                # --- DEBUT CHRONO ---
+                start_t = time.time()
+                
+                # Ton code existant
+                indices = fpsample.bucket_fps_kdline_sampling(full_cloud.astype(np.float32), 1024, h=7)
+                full_cloud = full_cloud[indices]
+                
+                # --- FIN CHRONO ---
+                end_t = time.time()
+                duration = end_t - start_t
+                
+                # On affiche le temps en millisecondes
+                print(f"⏱️ FPS Sampling ({len(indices)} pts): {duration:.4f} sec")
+            
+            self.publish_cloud(full_cloud, frame_id="world")
+            
+            if self.is_grasped:
+                print(f"\r🚀 Transport en cours... ", end="")
+            elif self.cube_locked:
+                print(f"\r👀 Cible verrouillée, en approche... ", end="")
 
     def run(self):
         rospy.spin()
-        self.vis.destroy_window()
 
 if __name__ == '__main__':
-    viz = InferenceVisualizer()
-    viz.run()
+    MergedCloudNode().run()
