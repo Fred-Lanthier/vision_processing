@@ -108,7 +108,7 @@
   <gazebo reference="camera_static_link">
     <material>Gazebo/Red</material>
     <sensor type="depth" name="camera_static">
-      <update_rate>15.0</update_rate>
+      <update_rate>6.0</update_rate>
       <camera>
         <horizontal_fov>0.958</horizontal_fov> 
         <image><width>640</width><height>480</height><format>R8G8B8</format></image>
@@ -128,7 +128,7 @@
   <gazebo reference="camera_wrist_link">
     <material>Gazebo/Blue</material>
     <sensor type="depth" name="camera_wrist">
-      <update_rate>15.0</update_rate>
+      <update_rate>6.0</update_rate>
       
       <camera>
         <horizontal_fov>0.973</horizontal_fov>
@@ -153,7 +153,7 @@
         <pointCloudCutoff>0.01</pointCloudCutoff>
         <pointCloudCutoffMax>10.0</pointCloudCutoffMax>
         
-        <updateRate>15.0</updateRate>
+        <updateRate>6.0</updateRate>
       </plugin>
     </sensor>
   </gazebo>

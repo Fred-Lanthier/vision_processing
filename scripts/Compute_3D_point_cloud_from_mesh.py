@@ -285,8 +285,26 @@ class RobotMeshLoaderOptimized:
                 # Application de la matrice T (4x4) sur tous les points (Nx4)
                 transformed = (T @ points_homo.T).T[:, :3]
                 all_transformed_points.append(transformed)
-                # if link_name == 'fork_tip':
-                    # all_transformed_points.append(transformed)
+
+        return np.vstack(all_transformed_points)
+    
+    def create_point_cloud_fork_tip(self, joint_angles=None):
+        transforms = self.compute_link_transforms(joint_angles)
+        all_transformed_points = []
+
+        for link_name, local_points in self.static_point_clouds.items():
+            if (link_name in transforms):
+                T = transforms[link_name]
+            
+                # Transformation vectorisée (NumPy)
+                # On ajoute une colonne de 1 pour la multiplication matricielle
+                ones = np.ones((len(local_points), 1))
+                points_homo = np.hstack([local_points, ones])
+                
+                # Application de la matrice T (4x4) sur tous les points (Nx4)
+                transformed = (T @ points_homo.T).T[:, :3]
+                if link_name == 'fork_tip':
+                    all_transformed_points.append(transformed)
 
         return np.vstack(all_transformed_points)
     

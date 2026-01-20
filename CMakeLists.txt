@@ -14,6 +14,9 @@ find_package(catkin REQUIRED COMPONENTS
   message_generation
   message_filters
   eigen_conversions
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 find_package(OpenCV REQUIRED)
@@ -47,6 +50,9 @@ catkin_package(
     moveit_ros_planning_interface
     message_runtime
     eigen_conversions
+    tf2
+    tf2_ros
+    tf2_geometry_msgs
 )
 
 include_directories(

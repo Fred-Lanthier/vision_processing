@@ -14,6 +14,7 @@ import sensor_msgs.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import PoseArray, Pose
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from utils import compute_T_child_parent_xacro
 
 # --- 1. IMPORTS DYNAMIQUES ---
 rospack = rospkg.RosPack()
@@ -21,7 +22,7 @@ pkg_path = rospack.get_path('vision_processing')
 sys.path.append(os.path.join(pkg_path, 'src', 'vision_processing', 'diffusion_model_train'))
 
 try:
-    from Train_urdf import DP3AgentRobust, Normalizer
+    from Train_Fork import DP3AgentRobust, Normalizer
 except ImportError as e:
     rospy.logerr(f"Erreur Import: {e}")
     sys.exit(1)
@@ -41,9 +42,18 @@ def ortho6d_to_rotation_matrix(d6):
 class DiffusionInferenceNode:
     def __init__(self):
         rospy.init_node("diffusion_inference_node")
-        
+
+        # --- COMPUTE T_FORK_TCP ---
+        rospack = rospkg.RosPack()
+        package_path = rospack.get_path('vision_processing')
+        xacro_file = os.path.join(package_path, 'urdf', 'panda_camera.xacro')
+        self.T_tcp_fork_tip = compute_T_child_parent_xacro(xacro_file, 'fork_tip', 'panda_TCP')
+
+        # --- DEVICE ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model_name = rospy.get_param("~model_name", "dp3_policy_last_robust_urdf_FPS_fork_SAMPLE.ckpt")
+        
+        # --- MODEL ---
+        model_name = rospy.get_param("~model_name", "dp3_policy_last_diffusers_fork_only_SAMPLE_NO_AUG.ckpt")
         self.model_path = os.path.join(pkg_path, 'models', model_name)
         
         if not os.path.exists(self.model_path):
@@ -83,7 +93,7 @@ class DiffusionInferenceNode:
             if 'stats' in payload:
                 self.model.normalizer = Normalizer(payload['stats']).to(self.device)
             else:
-                json_path = os.path.join(pkg_path, "normalization_stats_urdf_fork_SAMPLE.json")
+                json_path = os.path.join(pkg_path, "normalization_stats_fork_only.json")
                 with open(json_path, 'r') as f: stats = json.load(f)
                 self.model.normalizer = Normalizer(stats).to(self.device)
 
@@ -111,13 +121,9 @@ class DiffusionInferenceNode:
     def cloud_callback(self, msg):
         """ Lecture ultra-rapide du PointCloud2 sans ros_numpy """
         # 1. Lire les dimensions
-        # width = msg.width
-        # height = msg.height
         self.latest_cloud_stamp = msg.header.stamp
         point_step = msg.point_step
-        # row_step = msg.row_step
         data = msg.data
-        # is_bigendian = msg.is_bigendian
 
         # 2. Créer une vue Numpy brute sur les données binaires
         # On suppose que les champs sont x, y, z en float32 (standard)
@@ -168,20 +174,25 @@ class DiffusionInferenceNode:
             
         self.latest_cloud = final_points
 
-    def get_robot_pose(self):
+    def get_fork_pose(self):
         try:
-            (trans, rot) = self.tf_listener.lookupTransform('/world', '/panda_hand_tcp', rospy.Time(0))
-            mat = tft.quaternion_matrix(rot)[:3, :3]
+            (trans_tcp, rot_tcp) = self.tf_listener.lookupTransform('/world', '/panda_hand_tcp', rospy.Time(0))
+            T_world_tcp = tft.quaternion_matrix(rot_tcp)
+            T_world_tcp[:3, 3] = trans_tcp
+            T_world_fork_tip = T_world_tcp @ self.T_tcp_fork_tip
+            mat = T_world_fork_tip[:3, :3]
             rot_6d = rotation_matrix_to_ortho6d(mat)
-            return np.concatenate([trans, rot_6d.flatten()])
+            return np.concatenate([T_world_fork_tip[:3, 3], rot_6d.flatten()])
         except: return None
 
     def control_loop(self, event):
         if self.latest_cloud is None: return
 
-        # 1. Historique Robot
-        current_pose = self.get_robot_pose()
+        # 1. Historique Fourchette
+        current_pose = self.get_fork_pose()
         if current_pose is None: return
+        rospy.loginfo(f"[DEBUG] Robot fork_tip in world frame: {current_pose[:3]}")
+        rospy.loginfo(f"[DEBUG] Point cloud centroid: {np.mean(self.latest_cloud, axis=0)}")
         self.obs_queue.append(current_pose)
         if len(self.obs_queue) < self.obs_horizon: return
 
@@ -204,9 +215,14 @@ class DiffusionInferenceNode:
                 model_output = self.model.noise_pred_net(noisy_action, t, global_cond)
                 noisy_action = self.noise_scheduler.step(model_output, t, noisy_action).prev_sample
 
+            # 5. Denormalisation
             final_action = self.model.normalizer.unnormalize(noisy_action, 'action')
-
-        # 5. Publication
+            
+            for i in range(min(16, final_action.shape[1])):
+                pos = final_action[0, i, :3].cpu().detach().numpy()
+                rospy.loginfo(f"final_action shape: {final_action.shape}")
+                rospy.loginfo(f"Pose {i}: X={pos[0]:.3f}, Y={pos[1]:.3f}, Z={pos[2]:.3f}")
+        # 6. Publication
         action_chunk = final_action[0, :self.action_horizon].cpu().numpy()
         self.publish_trajectory(action_chunk)
 

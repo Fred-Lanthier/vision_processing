@@ -3,9 +3,8 @@ import rospy
 import numpy as np
 import message_filters
 from sensor_msgs.msg import Image, PointCloud2, JointState, CameraInfo
-from geometry_msgs.msg import PoseStamped, PointStamped, Point, Vector3
+from geometry_msgs.msg import PoseStamped, PointStamped, Point
 from visualization_msgs.msg import Marker
-from std_msgs.msg import ColorRGBA
 import std_msgs.msg
 import sensor_msgs.point_cloud2 as pc2
 import tf
@@ -17,6 +16,7 @@ import fpsample
 import torch
 import time
 from PIL import Image as PILImage
+from utils import compute_T_child_parent_xacro
 
 # --- IMPORTS SAM 3 & LOADER ---
 try:
@@ -43,48 +43,57 @@ class MergedCloudNode:
         self.is_grasped = False
         self.static_cube_cloud = None
         self.current_cube_cloud = None
-        self.contact_threshold = 0.01 
+        self.contact_threshold = -0.02 
 
-        self.fork_tip_offset_tcp = np.array([-0.0055, 0.0, 0.1296, 1.0]) 
+        # Offset manuel vectoriel pour la distance (Xacro)
+        self.fork_tip_offset_vec = np.array([-0.0055, 0.0, 0.1296, 1.0]) 
+
+        # Matrices calculées UNE SEULE FOIS au démarrage (Gain de temps CPU)
+        
+        rospack = rospkg.RosPack()
+        package_path = rospack.get_path('vision_processing')
+        xacro_file = os.path.join(package_path, 'urdf', 'panda_camera.xacro')
+        self.T_tcp_wrist = compute_T_child_parent_xacro(xacro_file, "camera_wrist_link", "panda_TCP")
+        self.T_wrist_opt = compute_T_child_parent_xacro(xacro_file, "camera_wrist_optical_frame", "camera_wrist_link")
+        self.T_tcp_cam = np.dot(self.T_tcp_wrist, self.T_wrist_opt)
+        self.T_tcp_fork_tip = compute_T_child_parent_xacro(xacro_file, 'fork_tip', 'panda_TCP')
+
         self.T_world_tcp_at_grasp = None
         self.T_tcp_at_grasp_inv = None
-
+        
         # SAM 3
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.sam_model = build_sam3_image_model()
         if hasattr(self.sam_model, "to"): self.sam_model.to(self.device)
         self.sam_processor = Sam3Processor(self.sam_model, confidence_threshold=0.1)
-        
+
         # Robot Loader
         self.mesh_loader = None
         if LOADER_AVAILABLE:
-            urdf_path = os.path.join(rospack.get_path('vision_processing'), 'urdf', 'panda_camera.xacro')
+            urdf_path = os.path.join(package_path, 'urdf', 'panda_camera.xacro')
             try: self.mesh_loader = RobotMeshLoaderOptimized(urdf_path)
             except: pass
-
+        
         # Publishers
         self.pub_merged = rospy.Publisher('/vision/merged_cloud', PointCloud2, queue_size=1)
         self.pub_marker = rospy.Publisher('/vision/marker', Marker, queue_size=1)
         self.pub_fork_tip = rospy.Publisher('/vision/debug_fork_tip', PointStamped, queue_size=1)
-        
-        # --- DEBUG PUBLISHERS ---
-        self.pub_debug_cam_axis = rospy.Publisher('/debug/camera_axis', Marker, queue_size=1)
-        self.pub_debug_tcp_axis = rospy.Publisher('/debug/tcp_z_axis', Marker, queue_size=1) # <--- NOUVEAU
 
         self.fx, self.fy, self.cx, self.cy = 604.9, 604.9, 320.0, 240.0
         self.sub_info = rospy.Subscriber("/camera_wrist/color/camera_info", CameraInfo, self.cam_info_cb)
-
         self.tf_listener = tf.TransformListener()
 
+        # Subscribers (Note: on écoute le topic C++ /synced/ee_pose)
         sub_rgb = message_filters.Subscriber("/synced/camera_wrist/rgb", Image)
         sub_depth = message_filters.Subscriber("/synced/camera_wrist/depth", Image)
         sub_joints = message_filters.Subscriber("/synced/joint_states", JointState)
 
+        # Synchronisation sur 4 topics
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [sub_rgb, sub_depth, sub_joints], queue_size=5, slop=0.1
         )
         self.ts.registerCallback(self.callback)
-        rospy.loginfo("🚀 DEBUG NODE PRÊT : Topics /debug/camera_axis (Bleu) et /debug/tcp_z_axis (Vert)")
+        rospy.loginfo("🚀 MERGED CLOUD (MODE C++ SYNC) PRÊT")
 
     def cam_info_cb(self, msg):
         self.fx = msg.K[0]; self.cx = msg.K[2]; self.fy = msg.K[4]; self.cy = msg.K[5]
@@ -96,7 +105,7 @@ class MergedCloudNode:
         return None
 
     def pose_to_matrix(self, pose_msg):
-        p = pose_msg.position; q = pose_msg.orientation
+        p = pose_msg.pose.position; q = pose_msg.pose.orientation
         return tft.compose_matrix(translate=[p.x, p.y, p.z], angles=tft.euler_from_quaternion([q.x, q.y, q.z, q.w]))
 
     def publish_cloud(self, points, frame_id="world"):
@@ -106,91 +115,31 @@ class MergedCloudNode:
         header.frame_id = frame_id
         cloud_msg = pc2.create_cloud_xyz32(header, points)
         self.pub_merged.publish(cloud_msg)
-
-    # --- DEBUG CAMÉRA (LIGNE BLEUE) ---
-    def publish_debug_cam_axis(self, T_world_cam, frame_id="world"):
-        start_point = tft.translation_from_matrix(T_world_cam)
-        # Point à 50cm devant la caméra (Axe Z local)
-        point_in_front_local = np.array([0, 0, 0.5, 1.0]) 
-        point_in_front_world = np.dot(T_world_cam, point_in_front_local)
-        
-        m = Marker()
-        m.header.frame_id = frame_id; m.header.stamp = rospy.Time.now()
-        m.ns = "camera_line_of_sight"; m.id = 0; m.type = Marker.ARROW; m.action = Marker.ADD
-        
-        p_start = Point(start_point[0], start_point[1], start_point[2])
-        p_end = Point(point_in_front_world[0], point_in_front_world[1], point_in_front_world[2])
-        m.points = [p_start, p_end]
-        
-        m.scale.x = 0.01; m.scale.y = 0.02; m.scale.z = 0.05
-        m.color = ColorRGBA(0.0, 0.0, 1.0, 1.0) # BLEU (Cam Z)
-        self.pub_debug_cam_axis.publish(m)
-
-    # --- DEBUG TCP (LIGNE VERTE) ---
-    def publish_debug_tcp_axis(self, T_world_tcp, frame_id="world"):
-        start_point = tft.translation_from_matrix(T_world_tcp)
-        
-        # Point à 20cm devant le TCP (Axe Z local)
-        # C'est la direction d'approche de la pince
-        point_in_front_local = np.array([0, 0, 0.2, 1.0]) 
-        point_in_front_world = np.dot(T_world_tcp, point_in_front_local)
-        
-        m = Marker()
-        m.header.frame_id = frame_id; m.header.stamp = rospy.Time.now()
-        m.ns = "tcp_approach_vector"; m.id = 1; m.type = Marker.ARROW; m.action = Marker.ADD
-        
-        p_start = Point(start_point[0], start_point[1], start_point[2])
-        p_end = Point(point_in_front_world[0], point_in_front_world[1], point_in_front_world[2])
-        m.points = [p_start, p_end]
-        
-        m.scale.x = 0.01; m.scale.y = 0.02; m.scale.z = 0.05
-        m.color = ColorRGBA(0.0, 1.0, 0.0, 1.0) # VERT (TCP Z)
-        self.pub_debug_tcp_axis.publish(m)
-
+    
     def callback(self, rgb_msg, depth_msg, joint_msg):
-        target_time = joint_msg.header.stamp
+        # 1. RÉCUPÉRATION POSE (Instantanée grâce au C++)
+        # On ne fait plus de TF lookup, on trust le message reçu.
+        (trans_world_tcp, rot_world_tcp) = self.tf_listener.lookupTransform("world", "panda_hand_tcp", rospy.Time(0))
+        T_world_tcp = tft.compose_matrix(translate=trans_world_tcp, angles=tft.euler_from_quaternion(rot_world_tcp))
         
-        # --- 1. TF LOOKUP MULTIPLE ---
-        try:
-            # A. Caméra Optique
-            self.tf_listener.waitForTransform("world", "camera_wrist_optical_frame", target_time, rospy.Duration(0.1))
-            (trans_cam, rot_cam) = self.tf_listener.lookupTransform("world", "camera_wrist_optical_frame", target_time)
-            
-            # B. TCP Principal (IK)
-            self.tf_listener.waitForTransform("world", "panda_TCP", target_time, rospy.Duration(0.1))
-            (trans_tcp, rot_tcp) = self.tf_listener.lookupTransform("world", "panda_TCP", target_time)
+        # 2. CALCULS GÉOMÉTRIQUES LOCAUX (Multiplication matricielle simple)
+        T_world_cam = T_world_tcp @ self.T_tcp_cam
+        # Optionnel si besoin de la pose fourchette sous forme de matrice
+        # T_world_fork = np.dot(T_world_tcp, self.T_tcp_fork_tip)
 
-            # C. TCP Demandé (Hand TCP) - Pour visualiser l'axe demandé
-            self.tf_listener.waitForTransform("world", "panda_hand_tcp", target_time, rospy.Duration(0.1))
-            (trans_hand, rot_hand) = self.tf_listener.lookupTransform("world", "panda_hand_tcp", target_time)
-
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
-            return
-
-        # Matrices
-        T_world_cam = tft.compose_matrix(translate=trans_cam, angles=tft.euler_from_quaternion(rot_cam))
-        T_world_tcp = tft.compose_matrix(translate=trans_tcp, angles=tft.euler_from_quaternion(rot_tcp))
-        T_world_hand = tft.compose_matrix(translate=trans_hand, angles=tft.euler_from_quaternion(rot_hand))
-
-        # --- VISUALISATION DEBUG AXES ---
-        self.publish_debug_cam_axis(T_world_cam) # Ligne Bleue
-        self.publish_debug_tcp_axis(T_world_hand) # Ligne Verte (Sur panda_hand_tcp)
-
-        # Création messages PoseStamped (Basé sur panda_TCP pour le code existant)
-        ee_pose_msg = PoseStamped()
-        ee_pose_msg.header = joint_msg.header
-        ee_pose_msg.pose.position.x = trans_tcp[0]; ee_pose_msg.pose.position.y = trans_tcp[1]; ee_pose_msg.pose.position.z = trans_tcp[2]
-        ee_pose_msg.pose.orientation.x = rot_tcp[0]; ee_pose_msg.pose.orientation.y = rot_tcp[1]; ee_pose_msg.pose.orientation.z = rot_tcp[2]; ee_pose_msg.pose.orientation.w = rot_tcp[3]
-
-        # --- 2. ROBOT CLOUD ---
+        # T_tcp_wrist = tft.compose_matrix(translate=[-0.052, 0.035, -0.045], angles=tft.euler_from_quaternion(tft.quaternion_from_euler(0, -np.pi/2, 0)))
+        # T_wrist_opt = tft.compose_matrix(translate=[0, 0, 0], angles=tft.euler_from_quaternion(tft.quaternion_from_euler(-np.pi/2, 0, -np.pi/2)))
+        # self.T_tcp_optical = np.dot(T_tcp_wrist, T_wrist_opt)
+        
+        # --- 3. ROBOT CLOUD ---
         current_robot_points = None
         if self.mesh_loader:
             try:
                 joint_map = {name: joint_msg.position[i] for i, name in enumerate(joint_msg.name) if "panda" in name}
-                current_robot_points = self.mesh_loader.create_point_cloud(joint_map)
+                current_robot_points = self.mesh_loader.create_point_cloud_fork_tip(joint_map)
             except: pass
 
-        # --- 3. DÉTECTION CUBE (SAM 3) ---
+        # --- 4. DÉTECTION CUBE (SAM 3) ---
         if not self.cube_locked:
             try:
                 cv_rgb = self.imgmsg_to_numpy(rgb_msg)
@@ -221,11 +170,11 @@ class MergedCloudNode:
                                 y = (v - self.cy) * z_val / self.fy
                                 points_cam = np.stack([x, y, z_val], axis=-1)
                                 
-                                # Projection TF
+                                # PROJECTION ROBUSTE (Utilise la matrice T_world_cam calculée plus haut)
                                 ones = np.ones((points_cam.shape[0], 1))
                                 points_world = np.dot(T_world_cam, np.hstack([points_cam, ones]).T).T[:, :3]
                                 
-                                self.static_cube_cloud = points_world
+                                self.static_cube_cloud = points_world.astype(np.float32)
                                 self.cube_locked = True
                                 
                                 c = np.mean(points_world, axis=0)
@@ -236,13 +185,13 @@ class MergedCloudNode:
                                 print(f"✅ CUBE DÉTECTÉ à {c}")
             except Exception: pass
 
-        # --- 4. VISU & GRASP ---
+        # --- 5. VISU & GRASP ---
         merged = []
         if current_robot_points is not None: merged.append(current_robot_points)
         
         if self.cube_locked and self.static_cube_cloud is not None:
-             # Offset manuel TCP (Par rapport au panda_TCP utilisé pour le calcul)
-            fork_tip_world_hom = np.dot(T_world_tcp, self.fork_tip_offset_tcp)
+             # Offset manuel TCP (Calcul vectoriel rapide)
+            fork_tip_world_hom = np.dot(T_world_tcp, self.fork_tip_offset_vec)
             fork_tip_pos = fork_tip_world_hom[:3]
             
             p_msg = PointStamped()
@@ -251,8 +200,12 @@ class MergedCloudNode:
             self.pub_fork_tip.publish(p_msg)
 
             if not self.is_grasped:
-                dists = np.linalg.norm(self.static_cube_cloud - fork_tip_pos, axis=1)
-                if np.min(dists) < self.contact_threshold:
+                # Optimisation: Check sur échantillon réduit
+                cloud_check = self.static_cube_cloud
+                if len(cloud_check) > 500: cloud_check = cloud_check[::5]
+                
+                dists = fork_tip_pos[2] - np.max(cloud_check[:, 2])
+                if dists < self.contact_threshold:
                     self.is_grasped = True
                     self.T_world_tcp_at_grasp = T_world_tcp
                     self.T_tcp_at_grasp_inv = np.linalg.inv(T_world_tcp)
@@ -270,8 +223,14 @@ class MergedCloudNode:
         if len(merged) > 0:
             full_cloud = np.vstack(merged)
             if full_cloud.shape[0] > 1024:
+                # OPTIMISATION: Random Sampling (O(1)) est bien plus rapide que FPS (O(N^2))
+                # Si tu veux de la vitesse pure, décommente la ligne suivante :
+                # indices = np.random.choice(full_cloud.shape[0], 1024, replace=False)
+                
+                # FPS (Plus lent mais plus joli)
                 indices = fpsample.bucket_fps_kdline_sampling(full_cloud.astype(np.float32), 1024, h=7)
                 full_cloud = full_cloud[indices]
+                
             self.publish_cloud(full_cloud, frame_id="world")
 
     def run(self):

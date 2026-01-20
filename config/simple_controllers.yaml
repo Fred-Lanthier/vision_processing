@@ -37,12 +37,12 @@ joint_group_position_controller:
 
 gazebo_ros_control:
   pid_gains:
-    panda_joint1: {p: 12000.0, i: 10.0, d: 50.0, i_clamp: 10000.0}
-    panda_joint2: {p: 30000.0, i: 10.0, d: 100.0, i_clamp: 10000.0} # Gros moteur épaule
-    panda_joint3: {p: 18000.0, i: 10.0, d: 50.0, i_clamp: 10000.0}
-    panda_joint4: {p: 18000.0, i: 10.0, d: 70.0, i_clamp: 10000.0} # Coude (souvent responsable du drift)
-    panda_joint5: {p: 12000.0, i: 10.0, d: 70.0, i_clamp: 10000.0}
-    panda_joint6: {p: 7000.0,  i: 10.0, d: 50.0, i_clamp: 10000.0}
-    panda_joint7: {p: 2000.0,  i: 10.0, d: 20.0, i_clamp: 10000.0}
+    panda_joint1: {p: 6000.0, i: 0.0, d: 50.0, i_clamp: 10000.0}
+    panda_joint2: {p: 15000.0, i: 0.0, d: 100.0, i_clamp: 10000.0} # Gros moteur épaule
+    panda_joint3: {p: 9000.0, i: 0.0, d: 50.0, i_clamp: 10000.0}
+    panda_joint4: {p: 9000.0, i: 0.0, d: 70.0, i_clamp: 10000.0} # Coude (souvent responsable du drift)
+    panda_joint5: {p: 6000.0, i: 0.0, d: 70.0, i_clamp: 10000.0}
+    panda_joint6: {p: 3500.0,  i: 0.0, d: 50.0, i_clamp: 10000.0}
+    panda_joint7: {p: 2000.0,  i: 0.0, d: 20.0, i_clamp: 10000.0}
     panda_finger_joint1: {p: 100, d: 10, i: 1}
     panda_finger_joint2: {p: 100, d: 10, i: 1}

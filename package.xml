@@ -20,6 +20,9 @@
   <build_depend>moveit_ros_planning_interface</build_depend>
   <build_depend>message_generation</build_depend>
   <build_depend>eigen_conversions</build_depend>
+  <build_depend>tf2</build_depend>
+  <build_depend>tf2_ros</build_depend>
+  <build_depend>tf2_geometry_msgs</build_depend>
 
   <build_export_depend>rospy</build_export_depend>
   <build_export_depend>roscpp</build_export_depend>
@@ -32,7 +35,13 @@
   <build_export_depend>moveit_ros_planning_interface</build_export_depend>
   <build_export_depend>message_runtime</build_export_depend>
   <build_export_depend>eigen_conversions</build_export_depend>
+  <build_export_depend>tf2</build_export_depend>
+  <build_export_depend>tf2_ros</build_export_depend>
+  <build_export_depend>tf2_geometry_msgs</build_export_depend>
 
+  <exec_depend>tf2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>rospy</exec_depend>
   <exec_depend>roscpp</exec_depend>
   <exec_depend>std_msgs</exec_depend>
@@ -44,6 +53,9 @@
   <exec_depend>moveit_ros_planning_interface</exec_depend>
   <exec_depend>message_runtime</exec_depend>
   <exec_depend>eigen_conversions</exec_depend>
+  <exec_depend>tf2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
 
   <export>
   </export>

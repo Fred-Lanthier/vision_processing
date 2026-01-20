@@ -327,6 +327,8 @@ class DP3AgentRobust(nn.Module):
 # ==============================================================================
 
 def main():
+    seed_everything(42)
+    
     BATCH_SIZE = 128
     NUM_EPOCHS = 1000 
     LEARNING_RATE = 1e-4
