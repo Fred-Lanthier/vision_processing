@@ -19,12 +19,7 @@ from PIL import Image as PILImage
 from utils import compute_T_child_parent_xacro
 
 # --- IMPORTS SAM 3 & LOADER ---
-try:
-    from sam3.model_builder import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
-except ImportError:
-    print("❌ ERREUR: Activez venv_sam3 !")
-    sys.exit(1)
+from sam3_client import Sam3Client
 
 rospack = rospkg.RosPack()
 sys.path.append(os.path.join(rospack.get_path('vision_processing'), 'scripts'))
@@ -39,6 +34,7 @@ class MergedCloudNode:
         rospy.init_node('merged_cloud_node', anonymous=True)
         
         self.target_object = "cube"
+        self.detection_confidence = 0.10
         self.cube_locked = False
         self.is_grasped = False
         self.static_cube_cloud = None
@@ -62,10 +58,7 @@ class MergedCloudNode:
         self.T_tcp_at_grasp_inv = None
         
         # SAM 3
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.sam_model = build_sam3_image_model()
-        if hasattr(self.sam_model, "to"): self.sam_model.to(self.device)
-        self.sam_processor = Sam3Processor(self.sam_model, confidence_threshold=0.1)
+        self.sam3 = Sam3Client()
 
         # Robot Loader
         self.mesh_loader = None
@@ -142,48 +135,44 @@ class MergedCloudNode:
         # --- 4. DÉTECTION CUBE (SAM 3) ---
         if not self.cube_locked:
             try:
-                cv_rgb = self.imgmsg_to_numpy(rgb_msg)
                 cv_depth = self.imgmsg_to_numpy(depth_msg)
                 
-                if cv_rgb is not None and cv_depth is not None:
-                    pil_image = PILImage.fromarray(cv_rgb)
-                    inference_state = self.sam_processor.set_image(pil_image)
-                    output = self.sam_processor.set_text_prompt(state=inference_state, prompt=self.target_object)
+                if cv_depth is not None:
+                    # Call SAM3 server (fast - model already loaded!)
+                    mask, score = self.sam3.segment(rgb_msg, self.target_object, self.detection_confidence)
                     
-                    raw_scores = output["scores"]
-                    if len(raw_scores) > 0:
-                        scores = np.array(raw_scores).flatten() if not isinstance(raw_scores, torch.Tensor) else raw_scores.detach().cpu().numpy().flatten()
-                        best_idx = np.argmax(scores)
+                    if mask is not None and score > self.detection_confidence:
+                        z = cv_depth if cv_depth.dtype == np.float32 else cv_depth / 1000.0
+                        valid = (mask > 0) & (z > 0.01) & (z < 2.0) & np.isfinite(z)
                         
-                        if scores[best_idx] > 0.20:
-                            masks = np.array(output["masks"]) if not isinstance(output["masks"], torch.Tensor) else output["masks"].detach().cpu().numpy()
-                            final_mask = masks[best_idx]
-                            while final_mask.ndim > 2: final_mask = final_mask[0]
+                        if np.sum(valid) > 100:
+                            v, u = np.where(valid)
+                            z_val = z[valid]
+                            x = (u - self.cx) * z_val / self.fx
+                            y = (v - self.cy) * z_val / self.fy
+                            points_cam = np.stack([x, y, z_val], axis=-1)
                             
-                            z = cv_depth if cv_depth.dtype == np.float32 else cv_depth / 1000.0
-                            valid = (final_mask > 0) & (z > 0.01) & (z < 2.0) & np.isfinite(z)
+                            ones = np.ones((points_cam.shape[0], 1))
+                            points_world = np.dot(T_world_cam, np.hstack([points_cam, ones]).T).T[:, :3]
                             
-                            if np.sum(valid) > 100:
-                                v, u = np.where(valid)
-                                z_val = z[valid]
-                                x = (u - self.cx) * z_val / self.fx
-                                y = (v - self.cy) * z_val / self.fy
-                                points_cam = np.stack([x, y, z_val], axis=-1)
-                                
-                                # PROJECTION ROBUSTE (Utilise la matrice T_world_cam calculée plus haut)
-                                ones = np.ones((points_cam.shape[0], 1))
-                                points_world = np.dot(T_world_cam, np.hstack([points_cam, ones]).T).T[:, :3]
-                                
-                                self.static_cube_cloud = points_world.astype(np.float32)
-                                self.cube_locked = True
-                                
-                                c = np.mean(points_world, axis=0)
-                                m = Marker(); m.header.frame_id="world"; m.header.stamp=rospy.Time.now(); m.type=Marker.SPHERE; m.action=Marker.ADD
-                                m.pose.position.x=c[0]; m.pose.position.y=c[1]; m.pose.position.z=c[2]
-                                m.scale.x=0.05; m.scale.y=0.05; m.scale.z=0.05; m.color.a=1.0; m.color.g=1.0
-                                self.pub_marker.publish(m)
-                                print(f"✅ CUBE DÉTECTÉ à {c}")
-            except Exception: pass
+                            self.static_cube_cloud = points_world
+                            self.cube_locked = True
+                            
+                            c = np.mean(points_world, axis=0)
+                            m = Marker()
+                            m.header.frame_id = "world"
+                            m.header.stamp = rospy.Time.now()
+                            m.type = Marker.SPHERE
+                            m.action = Marker.ADD
+                            m.pose.position.x, m.pose.position.y, m.pose.position.z = c
+                            m.scale.x = m.scale.y = m.scale.z = 0.05
+                            m.color.a = 1.0
+                            m.color.g = 1.0
+                            self.pub_marker.publish(m)
+                            
+                            rospy.loginfo(f"✅ CUBE DETECTED at {c} (score={score:.3f})")
+            except Exception as e:
+                rospy.logwarn_throttle(5, f"Detection error: {e}")
 
         # --- 5. VISU & GRASP ---
         merged = []

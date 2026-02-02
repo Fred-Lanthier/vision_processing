@@ -61,6 +61,7 @@ def infer_single(model, normalizer, sample, scheduler, DEVICE):
     Exécute une inférence unique et retourne la prédiction brute ainsi que les erreurs finales.
     """
     model.eval()
+    # normalizer = normalizer.to(DEVICE)
     pcd = sample['point_cloud'].unsqueeze(0).to(DEVICE)
     raw_agent_pos = sample['agent_pos'].unsqueeze(0).to(DEVICE)
     

@@ -1,0 +1,19 @@
+# Sam3Segment.srv
+# Service for SAM3 text-prompted segmentation
+#
+# Request: RGB image + text prompt + confidence threshold
+# Response: Binary mask + confidence score + bounding box
+
+# === REQUEST ===
+sensor_msgs/Image rgb_image
+string text_prompt
+float32 confidence_threshold
+
+---
+
+# === RESPONSE ===
+bool success
+string message
+sensor_msgs/Image mask
+float32 confidence
+float32[] bbox

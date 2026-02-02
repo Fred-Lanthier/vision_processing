@@ -26,6 +26,7 @@ add_service_files(
   FILES
   ProcessImage.srv
   ProcessRobot.srv
+  Sam3Segment.srv
 )
 
 ## Python setup

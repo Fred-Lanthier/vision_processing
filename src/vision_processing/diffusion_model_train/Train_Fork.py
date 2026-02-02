@@ -230,6 +230,56 @@ class Normalizer(nn.Module):
         
         return torch.cat([pos, rot], dim=-1)
 
+# class Normalizer:
+#     def __init__(self, stats=None):
+#         self.stats = stats
+
+#     def normalize(self, data, key):
+#         """
+#         data: Tensor de forme (B, T, 9) ou (B, 9)
+#         key: Clé pour accéder aux stats (ex: 'agent_pos')
+#         """
+#         if self.stats is None: 
+#             return data
+        
+#         # Séparer Position (3) et Rotation (6)
+#         pos = data[..., :3]
+#         rot = data[..., 3:]
+        
+#         # Récupérer stats (création du tenseur sur le même device que data)
+#         # On cast aussi vers le même dtype (float32, float16, etc.)
+#         min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
+#         max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
+        
+#         # Sécurité : on s'assure de ne prendre que les 3 premières valeurs (x, y, z)
+#         min_val = min_val[..., :3]
+#         max_val = max_val[..., :3]
+        
+#         # Normaliser Position [-1, 1]
+#         pos_norm = 2 * (pos - min_val) / (max_val - min_val + 1e-5) - 1
+        
+#         # Renvoie Position Normalisée + Rotation Intacte
+#         return torch.cat([pos_norm, rot], dim=-1)
+
+#     def unnormalize(self, data, key):
+#         if self.stats is None: 
+#             return data
+        
+#         pos_norm = data[..., :3]
+#         rot = data[..., 3:]
+        
+#         min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
+#         max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
+        
+#         min_val = min_val[..., :3]
+#         max_val = max_val[..., :3]
+        
+#         # Denormaliser Position
+#         pos = (pos_norm + 1) / 2 * (max_val - min_val + 1e-5) + min_val
+        
+#         return torch.cat([pos, rot], dim=-1)
+        
+
 def compute_dataset_stats(dataset):
     print("🔄 Calcul des statistiques de normalisation (Itératif)...")
     loader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4)
@@ -305,7 +355,7 @@ class DP3AgentRobust(nn.Module):
 def main():
     seed_everything(42)
     BATCH_SIZE = 128
-    NUM_EPOCHS = 1000 
+    NUM_EPOCHS = 500 
     LEARNING_RATE = 1e-4
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ACTION_DIM = 9
@@ -325,7 +375,7 @@ def main():
         "batch_size": BATCH_SIZE,
         "num_epochs": NUM_EPOCHS,
         "lr": LEARNING_RATE,
-        "model_name": "DP3_Robust_DiffusersEMA_URDF",
+        "model_name": "DP3_Robust_DiffusersEMA_FORK",
         "action_dim": ACTION_DIM,
         "robot_state_dim": ROBOT_STATE_DIM,
         "obs_horizon": OBS_HORIZON,
@@ -353,21 +403,21 @@ def main():
     full_dataset = Robot3DDataset(data_path, mode='all')
     
     # 2. Normalisation
-    stats_path = os.path.join(pkg_path, "normalization_stats_urdf_fork_SAMPLE.json")
-    if os.path.exists(stats_path):
-        print("📂 Chargement des stats existantes...")
-        with open(stats_path, 'r') as f:
-            stats = json.load(f)
-    else:
-        stats = compute_dataset_stats(full_dataset)
-        with open(stats_path, 'w') as f:
-            json.dump(stats, f)
-    stats = None
-    normalizer = Normalizer(stats)
+    # stats_path = os.path.join(pkg_path, "normalization_stats_urdf_fork_SAMPLE.json")
+    # if os.path.exists(stats_path):
+    #     print("📂 Chargement des stats existantes...")
+    #     with open(stats_path, 'r') as f:
+    #         stats = json.load(f)
+    # else:
+    #     stats = compute_dataset_stats(full_dataset)
+    #     with open(stats_path, 'w') as f:
+    #         json.dump(stats, f)
+    # stats = None
+    # normalizer = Normalizer(stats)
     
     # Reload datasets en mode train/val
     train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.2, seed=42, 
-                                    num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=True)
+                                    num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=False)
     val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42, 
                                 num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=False)
     
@@ -475,10 +525,10 @@ def main():
         # --- 5. SAVING (NEW FORMAT) ---
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            save_name = "dp3_policy_best_fork_unified.ckpt"
+            save_name = "test_best.ckpt"
             print("💾 Saved Best EMA Model")
         else:
-            save_name = "dp3_policy_last_fork_unified.ckpt"
+            save_name = "test_last.ckpt"
             print("💾 Saved Last EMA Model")
             
         # Payload complet comme dans le Code 2
@@ -486,7 +536,7 @@ def main():
             'state_dict': model.state_dict(), # Contient désormais les stats du Normalizer !
             'history': history,
             'config': config,
-            'stats': stats, # On garde aussi le JSON brut au cas où
+            # 'stats': stats, # On garde aussi le JSON brut au cas où
             'epoch': epoch,
             'best_val_loss': best_val_loss,
             'model_class': 'DP3AgentRobust'

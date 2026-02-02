@@ -59,31 +59,34 @@ def compute_angular_error(matrix1, matrix2):
 # 2. LOGIQUE D'INFÉRENCE (Issue du Code 1)
 # ==============================================================================
 
-def infer_single(model, normalizer, sample, scheduler, DEVICE):
+def infer_single(model, sample, scheduler, DEVICE):
     """
-    Exécute une inférence unique et retourne la prédiction brute ainsi que les erreurs finales.
+    Plus besoin de passer 'normalizer' en argument séparé.
+    Il est dans model.normalizer et déjà chargé avec les bons poids/stats.
     """
     model.eval()
     pcd = sample['point_cloud'].unsqueeze(0).to(DEVICE)
     raw_agent_pos = sample['agent_pos'].unsqueeze(0).to(DEVICE)
     
     with torch.no_grad():
-        norm_agent_pos = normalizer.normalize(raw_agent_pos, 'agent_pos')
+        # Utilisation directe du normalizer interne
+        norm_agent_pos = model.normalizer.normalize(raw_agent_pos, 'agent_pos')
+        
         global_cond = torch.cat([model.point_encoder(pcd),
                                  model.robot_mlp(norm_agent_pos.reshape(1, -1))], dim=-1)
 
         noisy_action = torch.randn((1, 16, 9), device=DEVICE)
 
         for t in scheduler.timesteps:
-            timesteps = torch.tensor([t], device=DEVICE).long()
+            # Note: Si tu utilises DDIM, assure-toi que scheduler est DDIMScheduler
             noise_pred = model.noise_pred_net(noisy_action, torch.tensor([t], device=DEVICE).long(), global_cond)
             noisy_action = scheduler.step(noise_pred, t, noisy_action).prev_sample
         
-        pred_action = normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0]
+        # Unnormalize avec l'interne
+        pred_action = model.normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0]
         gt_action = sample['action'].numpy()
 
-        # --- Calcul des Erreurs pour cette inférence ---
-        # 1. Distance Finale
+        # Calcul Erreurs
         final_dist = np.linalg.norm(pred_action[-1, :3] - gt_action[-1, :3])
         
         # 2. Erreur Angulaire Finale
@@ -102,34 +105,33 @@ def infer_single(model, normalizer, sample, scheduler, DEVICE):
 # 3. VISUALISATIONS (Fusion Code 1 & Code 2)
 # ==============================================================================
 
-def generate_train_history():
-    print("📊 Génération du Graphique d'Historique d'Entraînement...")
-    rospack = rospkg.RosPack()
-    package_path = rospack.get_path('vision_processing')
-    # Chemin spécifique du Code 2
-    pkl_file = os.path.join(package_path, 'pkl_files', 'train_history_fork_only_SAMPLE_NO_AUG.pkl')
-    
-    if not os.path.exists(pkl_file):
-        print(f"⚠️ Fichier historique introuvable : {pkl_file}")
-        return None
+def plot_training_history(history):
+    """
+    Prend directement le dictionnaire 'history' chargé du .ckpt
+    """
+    if history is None:
+        print("⚠️ Pas d'historique trouvé dans le checkpoint.")
+        return
 
-    with open(pkl_file, 'rb') as f:
-        history = pickle.load(f)
-    
+    print("📊 Génération du Graphique d'Historique...")
     plt.figure(figsize=(10, 5))
-    plt.plot(history['train_loss'], label='Train Loss', linewidth=2)
-    plt.plot(history['val_loss'], label='Validation Loss', linewidth=2)
+    
+    # Vérification que les clés existent
+    if 'train_loss' in history:
+        plt.plot(history['train_loss'], label='Train Loss', linewidth=2)
+    if 'val_loss' in history:
+        plt.plot(history['val_loss'], label='Validation Loss', linewidth=2)
+        
     plt.yscale('log')
-    plt.title(f"Convergence - {history['config'].get('model_name', 'DP3')}")
+    plt.title("Convergence de l'entraînement")
     plt.xlabel("Époques")
     plt.ylabel("MSE Loss (Log Scale)")
     plt.legend()
     plt.grid(True, which="both", ls="-", alpha=0.5)
-    plt.savefig('01_train_history.svg', format='svg')
+    plt.savefig('01_train_history_integrated.svg', format='svg')
     plt.close()
-    return history
 
-def plot_3d_multimodality_with_orientation(model, normalizer, sample, scheduler, DEVICE, idx, n_samples=20):
+def plot_3d_multimodality_with_orientation(model, sample, scheduler, DEVICE, idx, n_samples=20):
     """
     Affiche 3D complet (Code 2) : Nuage de points + Spaghettis + Orientation.
     Utilise infer_single pour la cohérence.
@@ -157,7 +159,7 @@ def plot_3d_multimodality_with_orientation(model, normalizer, sample, scheduler,
     final_preds = []
     for _ in range(n_samples):
         # Utilisation de la fonction d'inférence modulaire
-        pred_action, _, _ = infer_single(model, normalizer, sample, scheduler, DEVICE)
+        pred_action, _, _ = infer_single(model, sample, scheduler, DEVICE)
         final_preds.append(pred_action)
         ax.plot(pred_action[:, 0], pred_action[:, 1], pred_action[:, 2], color='red', alpha=0.15, linewidth=1)
 
@@ -187,7 +189,7 @@ def plot_3d_multimodality_with_orientation(model, normalizer, sample, scheduler,
     plt.savefig(f'02_3d_spaghetti_seq{idx}.png', dpi=200)
     plt.close()
 
-def plot_multimodality_spaghetti_2d(model, normalizer, sample, scheduler, DEVICE, idx, n_samples=50):
+def plot_multimodality_spaghetti_2d(model, sample, scheduler, DEVICE, idx, n_samples=50):
     """
     Analyse 2D (Code 1) : Utile pour voir la dispersion XY sans le bruit du PCD.
     """
@@ -200,7 +202,7 @@ def plot_multimodality_spaghetti_2d(model, normalizer, sample, scheduler, DEVICE
     final_angles = []
 
     for i in range(n_samples):
-        pred, final_dist, final_angle = infer_single(model, normalizer, sample, scheduler, DEVICE)
+        pred, final_dist, final_angle = infer_single(model, sample, scheduler, DEVICE)
         final_dists.append(final_dist)
         final_angles.append(final_angle)
         plt.plot(pred[:, 0], pred[:, 1], color='red', alpha=0.1, linewidth=1.5, label='Prédictions' if i == 0 else "")
@@ -243,7 +245,7 @@ def plot_rotation_error_over_time(gt_action, pred_action, idx):
     plt.savefig(f'05_rotation_error_seq{idx}.png')
     plt.close()
 
-def make_diffusion_gif(model, normalizer, sample, scheduler, DEVICE, idx):
+def make_diffusion_gif(model, sample, scheduler, DEVICE, idx):
     """
     Version fusionnée : Visuels riches du Code 2 (GT, PCD) + Pause "Clean" du Code 1.
     """
@@ -254,17 +256,17 @@ def make_diffusion_gif(model, normalizer, sample, scheduler, DEVICE, idx):
     frames = []
     
     with torch.no_grad():
-        norm_agent_pos = normalizer.normalize(raw_agent_pos, 'agent_pos')
+        norm_agent_pos = model.normalizer.normalize(raw_agent_pos, 'agent_pos')
         global_cond = torch.cat([model.point_encoder(pcd),
                                  model.robot_mlp(norm_agent_pos.reshape(1, -1))], dim=-1)
 
         noisy_action = torch.randn((1, 16, 9), device=DEVICE)
-        frames.append(normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0])
+        frames.append(model.normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0])
 
         for t in scheduler.timesteps:
             noise_pred = model.noise_pred_net(noisy_action, torch.tensor([t], device=DEVICE).long(), global_cond)
             noisy_action = scheduler.step(noise_pred, t, noisy_action).prev_sample
-            frames.append(normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0])
+            frames.append(model.normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0])
 
     # Pause à la fin (Code 1 feature)
     for _ in range(15): frames.append(frames[-1])
@@ -299,7 +301,7 @@ def make_diffusion_gif(model, normalizer, sample, scheduler, DEVICE, idx):
 # 4. ANALYSE QUANTITATIVE (Fusion Stats Code 1 + Seuils Code 2)
 # ==============================================================================
 
-def run_quantitative_analysis(model, normalizer, val_dataset, scheduler, DEVICE, n_samples=20):
+def run_quantitative_analysis(model, val_dataset, scheduler, DEVICE, n_samples=20):
     model.eval()
     results = []
     
@@ -321,7 +323,7 @@ def run_quantitative_analysis(model, normalizer, val_dataset, scheduler, DEVICE,
         seq_final_dists = []
         
         for _ in range(n_samples):
-            pred, final_dist, final_angle = infer_single(model, normalizer, sample, scheduler, DEVICE)
+            pred, final_dist, final_angle = infer_single(model, sample, scheduler, DEVICE)
             seq_preds.append(pred)
             seq_final_dists.append(final_dist)
             seq_final_angles.append(final_angle)
@@ -406,14 +408,8 @@ def main():
     data_path = os.path.join(pkg_path, 'datas', 'Trajectories_preprocess')
     
     # Chemins spécifiques demandés
-    ckpt_path = os.path.join(pkg_path, "models", "dp3_policy_best_diffusers_fork_only_SAMPLE_NO_AUG.ckpt") 
-    stats_path = os.path.join(pkg_path, "normalization_stats_fork_only.json")
+    ckpt_path = os.path.join(pkg_path, "models", "test_last.ckpt") 
 
-    # 2. Chargement Données & Modèle
-    print("📂 Chargement modèle et stats...")
-    with open(stats_path, 'r') as f: stats = json.load(f)
-    normalizer = Normalizer(stats)
-    
     val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42)
     print(f"✅ Validation Set : {len(val_dataset)} séquences")
 
@@ -424,6 +420,9 @@ def main():
         return
 
     checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+    if 'history' in checkpoint:
+        plot_training_history(checkpoint['history'])
+    
     weights = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
     model.load_state_dict(weights, strict=False) 
     print("✅ Poids chargés.")
@@ -439,20 +438,17 @@ def main():
     if len(val_dataset) > sample_idx:
         sample = val_dataset[sample_idx]
         
-        # A. Graphique Historique (Code 2)
-        generate_train_history()
-        
         # B. 3D Spaghetti + Orientation (Code 2)
-        plot_3d_multimodality_with_orientation(model, normalizer, sample, scheduler, DEVICE, sample_idx)
+        plot_3d_multimodality_with_orientation(model, sample, scheduler, DEVICE, sample_idx)
         
         # C. 2D Spaghetti Clean (Code 1 - Bonus)
-        plot_multimodality_spaghetti_2d(model, normalizer, sample, scheduler, DEVICE, sample_idx)
+        plot_multimodality_spaghetti_2d(model, sample, scheduler, DEVICE, sample_idx)
 
         # D. GIF (Fusion)
-        make_diffusion_gif(model, normalizer, sample, scheduler, DEVICE, sample_idx)
+        make_diffusion_gif(model, sample, scheduler, DEVICE, sample_idx)
 
     # 4. Analyse Globale
-    df = run_quantitative_analysis(model, normalizer, val_dataset, scheduler, DEVICE, n_samples=20)
+    df = run_quantitative_analysis(model, val_dataset, scheduler, DEVICE, n_samples=20)
     plot_error_distributions(df)
     
     # 5. Outlier Detection (Code 2 Logic)
@@ -465,10 +461,10 @@ def main():
     worst_sample = val_dataset[idx_worst]
     
     print(f"📸 Génération visuels pour l'outlier Seq {idx_worst}...")
-    plot_3d_multimodality_with_orientation(model, normalizer, worst_sample, scheduler, DEVICE, idx_worst)
+    plot_3d_multimodality_with_orientation(model, worst_sample, scheduler, DEVICE, idx_worst)
     
     # Générer une vraie prédiction pour le plot d'erreur temporelle
-    pred_worst, _, _ = infer_single(model, normalizer, worst_sample, scheduler, DEVICE)
+    pred_worst, _, _ = infer_single(model, worst_sample, scheduler, DEVICE)
     plot_rotation_error_over_time(worst_sample['action'].numpy(), pred_worst, idx_worst)
     
     print("\n✅ Analyse terminée. Vérifie les images PNG générées.")

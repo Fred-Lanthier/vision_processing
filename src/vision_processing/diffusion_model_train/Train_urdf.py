@@ -202,7 +202,55 @@ class DP3Encoder(nn.Module):
     
     def save_input(self, module, input, output):
         self.input_pointcloud = input[0].detach()
+# class Normalizer:
+#     def __init__(self, stats=None):
+#         self.stats = stats
 
+#     def normalize(self, data, key):
+#         """
+#         data: Tensor de forme (B, T, 9) ou (B, 9)
+#         key: Clé pour accéder aux stats (ex: 'agent_pos')
+#         """
+#         if self.stats is None: 
+#             return data
+        
+#         # Séparer Position (3) et Rotation (6)
+#         pos = data[..., :3]
+#         rot = data[..., 3:]
+        
+#         # Récupérer stats (création du tenseur sur le même device que data)
+#         # On cast aussi vers le même dtype (float32, float16, etc.)
+#         min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
+#         max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
+        
+#         # Sécurité : on s'assure de ne prendre que les 3 premières valeurs (x, y, z)
+#         min_val = min_val[..., :3]
+#         max_val = max_val[..., :3]
+        
+#         # Normaliser Position [-1, 1]
+#         pos_norm = 2 * (pos - min_val) / (max_val - min_val + 1e-5) - 1
+        
+#         # Renvoie Position Normalisée + Rotation Intacte
+#         return torch.cat([pos_norm, rot], dim=-1)
+
+#     def unnormalize(self, data, key):
+#         if self.stats is None: 
+#             return data
+        
+#         pos_norm = data[..., :3]
+#         rot = data[..., 3:]
+        
+#         min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
+#         max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
+        
+#         min_val = min_val[..., :3]
+#         max_val = max_val[..., :3]
+        
+#         # Denormaliser Position
+#         pos = (pos_norm + 1) / 2 * (max_val - min_val + 1e-5) + min_val
+        
+#         return torch.cat([pos, rot], dim=-1)
+        
 class Normalizer(nn.Module):
     def __init__(self, stats=None):
         super().__init__()
@@ -392,7 +440,7 @@ def main():
     
     # Reload datasets en mode train/val
     train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.2, seed=42, 
-                                    num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=True)
+                                    num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=False)
     val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42, 
                                 num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=False)
     

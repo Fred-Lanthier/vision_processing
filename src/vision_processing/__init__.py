@@ -6,4 +6,5 @@ from . import vision_segmentation
 from . import vision_tracking
 from . import diffusion_model_train
 from . import test_requests
-from . import simulation_gazebo
+from . import gazebo_simulation
+from . import SDF
