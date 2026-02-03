@@ -25,7 +25,8 @@ def visualize_comparison(original_file, repaired_file):
         p.subplot(0, 0)
         p.add_text("Avant : Avec Trous (BPA)", font_size=10)
         # On affiche les arêtes (show_edges=True) pour bien voir les trous
-        p.add_mesh(mesh_orig, color="cyan", pbr=True, metallic=0.6, roughness=0.2,show_edges=False)
+
+        p.add_mesh(mesh_orig, color="cyan", pbr=False, metallic=0.6, roughness=0.2,show_edges=True)
         p.add_axes()
 
     # --- Fenêtre de Droite (Réparé) ---
@@ -53,7 +54,7 @@ def visualize_comparison(original_file, repaired_file):
 
 if __name__ == "__main__":
     # Vos noms de fichiers
-    file_before = "Images_Test/Mesh.obj"          # Sortie du script BPA (avec trous)
-    file_after = "Images_Test/Mesh.obj"  # Sortie du script MeshLab (réparé)
+    file_before = "Images_Test/01_surface_raw.obj"          # Sortie du script BPA (avec trous)
+    file_after = "Images_Test/01_surface_raw.obj"  # Sortie du script MeshLab (réparé)
     
     visualize_comparison(file_before, file_after)

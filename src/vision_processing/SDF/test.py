@@ -1,79 +1,68 @@
 import numpy as np
 from meshlib import mrmeshpy as mm
-from meshlib import mrmeshnumpy as mn  # Module nécessaire pour l'interopérabilité NumPy
-from pathlib import Path
+from meshlib import mrmeshnumpy as mn
 
-def traiter_nuage_npy(input_file, output_file):
-    print(f"--- Début du traitement pour : {input_file} ---")
-
-    # ---------------------------------------------------------
-    # 1. Lire mon nuage de points (.npy)
-    # ---------------------------------------------------------
-    # On charge les données brutes avec numpy
-    raw_points = np.load(input_file)
+def depth_to_mesh_clean(input_file, output_file):
+    print(f"--- Traitement avancé pour : {input_file} ---")
     
-    # Vérification de sécurité : s'assurer que c'est du float32 (format standard pour MeshLib)
-    # et que la forme est bien (N, 3) pour X, Y, Z
-    if raw_points.dtype != np.float32:
-        raw_points = raw_points.astype(np.float32)
+    # 1. Chargement
+    depth_image = np.load(input_file)
+    h, w = depth_image.shape
+    print(f"Dimensions : {w}x{h}")
+
+    # ---------------------------------------------------------
+    # ÉTAPE CRUCIALE : REPROJECTION 3D (Pixel -> Mètres)
+    # ---------------------------------------------------------
+    # Sans intrinsèques réelles, on estime une caméra standard (FOV ~60-70°)
+    # Si vous avez les intrinsèques (fx, fy, cx, cy), remplacez les valeurs ci-dessous.
+    fx = w  # Estimation grossière de la focale (souvent proche de la largeur)
+    fy = w
+    cx = w / 2
+    cy = h / 2
+
+    # Grille de coordonnées
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
     
-    # Conversion du tableau NumPy vers l'objet PointCloud de MeshLib
-    pc = mn.pointCloudFromPoints(raw_points)
+    # Masque pour ignorer les points invalides (Z=0 ou trop loin)
+    mask = (depth_image > 0.1) & (depth_image < 3.0) # On ignore < 10cm et > 3m
     
-    print(f"1. Nuage chargé depuis .npy ({pc.validPoints.count()} points)")
-
-    # ---------------------------------------------------------
-    # 2. Remove les outliers (Supprimer les points aberrants)
-    # ---------------------------------------------------------
-    bbox = pc.computeBoundingBox()
-    diag = bbox.diagonal()
+    # Projection Pinhole : Z * (u - cx) / fx
+    z_m = depth_image[mask]
+    x_m = (u[mask] - cx) * z_m / fx
+    y_m = (v[mask] - cy) * z_m / fy
     
-    outlier_params = mm.OutlierParams()
-    # Rayon de recherche : 1% de la diagonale de l'objet
-    outlier_params.radius = diag * 0.01 
+    points_3d = np.column_stack((x_m, y_m, z_m)).astype(np.float32)
+    print(f"Points valides après filtrage : {len(points_3d)}")
+
+    # Conversion MeshLib
+    pc = mn.pointCloudFromPoints(points_3d)
+
+    # ---------------------------------------------------------
+    # TRIANGULATION & NETTOYAGE
+    # ---------------------------------------------------------
+    # Paramètres de triangulation
+    t_params = mm.TriangulatePointCloudSettings()
+    # maxEdgeLen est VITAL : empêche de relier un point à 1m d'un autre
+    # On met 5cm (0.05) comme distance max entre deux points connectés
+    t_params.maxEdgeLen = 0.05 
     
-    # Détection et suppression
-    outliers_mask = mm.findOutliers(pc, outlier_params)
-    pc.validPoints.subtract(outliers_mask)
-    print(f"2. Outliers supprimés (Reste {pc.validPoints.count()} points)")
+    print("Triangulation avec contrainte de distance...")
+    mesh = mm.triangulatePointCloud(pc, t_params)
 
     # ---------------------------------------------------------
-    # 3. Créé un premier jet de mesh (Triangulation)
+    # POST-TRAITEMENT
     # ---------------------------------------------------------
-    # On transforme les points en triangles
-    mesh = mm.triangulatePointCloud(pc)
-    print("3. Triangulation effectuée")
+    print("Lissage (Relaxation)...")
+    # Le 'relax' est souvent meilleur que le 'denoise' pour les depth maps organiques
+    relax_params = mm.MeshRelaxParams()
+    relax_params.iterations = 5
+    relax_params.force = 0.1
+    mm.relax(mesh, relax_params)
 
-    # ---------------------------------------------------------
-    # 4. Remplir les trous
-    # ---------------------------------------------------------
-    hole_edges = mesh.topology.findHoleRepresentiveEdges()
-    print(f"4. Remplissage de {len(hole_edges)} trous...")
-
-    for e in hole_edges:
-        params = mm.FillHoleParams()
-        params.metric = mm.getUniversalMetric(mesh)
-        mm.fillHole(mesh, e, params)
-
-    # ---------------------------------------------------------
-    # 5. Lisser (Enlever le bruit)
-    # ---------------------------------------------------------
-    mm.meshDenoiseViaNormals(mesh)
-    print("5. Lissage terminé")
-
-    # ---------------------------------------------------------
     # Sauvegarde
-    # ---------------------------------------------------------
     mm.saveMesh(mesh, output_file)
-    print(f"--- Terminé. Résultat sauvegardé dans : {output_file} ---")
+    print(f"Sauvegardé : {output_file}")
 
-# Exécution
 if __name__ == "__main__":
-    # Assurez-vous que votre fichier .npy contient un tableau de forme (N, 3)
-    fichier_entree = "Images_Test/resultat_depth_mask.npy"  
-    fichier_sortie = "Resultat_Final.stl"
-    
-    if Path(fichier_entree).exists():
-        traiter_nuage_npy(fichier_entree, fichier_sortie)
-    else:
-        print(f"Erreur : Le fichier {fichier_entree} est introuvable.")
+    traiter = depth_to_mesh_clean
+    traiter("Images_Test/resultat_depth_mask.npy", "Images_Test/resultat_final.obj")

@@ -160,8 +160,8 @@ if __name__ == "__main__":
     rospkg = rospkg.RosPack()
     pkg_path = rospkg.get_path("vision_processing")
     step = 11
-    IMAGE_PATH = os.path.join(pkg_path, f"src/vision_processing/SDF/Images_Test/image_rgb.png")
-    DEPTH_PATH = os.path.join(pkg_path, f"src/vision_processing/SDF/Images_Test/depth_map.npy") 
+    IMAGE_PATH = os.path.join(pkg_path, f"src/vision_processing/SDF/Images_Test/Plate_image_rgb.png")
+    DEPTH_PATH = os.path.join(pkg_path, f"src/vision_processing/SDF/Images_Test/Plate_depth_map.npy") 
     LIST_OBJECTS = ["Bowl", "Plate", "Shallow bowl", "Shallow plate"]
     
     segmenter = FoodSegmenterNative()
