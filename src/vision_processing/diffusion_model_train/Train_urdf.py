@@ -202,100 +202,100 @@ class DP3Encoder(nn.Module):
     
     def save_input(self, module, input, output):
         self.input_pointcloud = input[0].detach()
-# class Normalizer:
-#     def __init__(self, stats=None):
-#         self.stats = stats
-
-#     def normalize(self, data, key):
-#         """
-#         data: Tensor de forme (B, T, 9) ou (B, 9)
-#         key: Clé pour accéder aux stats (ex: 'agent_pos')
-#         """
-#         if self.stats is None: 
-#             return data
-        
-#         # Séparer Position (3) et Rotation (6)
-#         pos = data[..., :3]
-#         rot = data[..., 3:]
-        
-#         # Récupérer stats (création du tenseur sur le même device que data)
-#         # On cast aussi vers le même dtype (float32, float16, etc.)
-#         min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
-#         max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
-        
-#         # Sécurité : on s'assure de ne prendre que les 3 premières valeurs (x, y, z)
-#         min_val = min_val[..., :3]
-#         max_val = max_val[..., :3]
-        
-#         # Normaliser Position [-1, 1]
-#         pos_norm = 2 * (pos - min_val) / (max_val - min_val + 1e-5) - 1
-        
-#         # Renvoie Position Normalisée + Rotation Intacte
-#         return torch.cat([pos_norm, rot], dim=-1)
-
-#     def unnormalize(self, data, key):
-#         if self.stats is None: 
-#             return data
-        
-#         pos_norm = data[..., :3]
-#         rot = data[..., 3:]
-        
-#         min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
-#         max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
-        
-#         min_val = min_val[..., :3]
-#         max_val = max_val[..., :3]
-        
-#         # Denormaliser Position
-#         pos = (pos_norm + 1) / 2 * (max_val - min_val + 1e-5) + min_val
-        
-#         return torch.cat([pos, rot], dim=-1)
-        
-class Normalizer(nn.Module):
+class Normalizer:
     def __init__(self, stats=None):
-        super().__init__()
-        # On enregistre les buffers. Ils seront sauvegardés dans le .ckpt !
-        self.register_buffer('pos_min', torch.zeros(3))
-        self.register_buffer('pos_max', torch.ones(3))
-        # On sauvegarde aussi l'état d'initialisation (booléen)
-        self.register_buffer('is_initialized', torch.tensor(False, dtype=torch.bool))
+        self.stats = stats
 
-        if stats is not None:
-            self.load_stats_from_dict(stats)
-
-    def load_stats_from_dict(self, stats):
-        # Cette fonction sert uniquement lors du PREMIER entraînement
-        print("📥 Injection des statistiques dans le modèle...")
-        self.pos_min[:] = torch.tensor(stats['agent_pos']['min'])
-        self.pos_max[:] = torch.tensor(stats['agent_pos']['max'])
-        self.is_initialized.fill_(True)
-
-    def normalize(self, x, key='agent_pos'): 
-        # Note: key est gardé pour compatibilité, mais ici on gère surtout agent_pos
-        if not self.is_initialized:
-            return x
-            
-        # Séparation Pos / Rot (Spécifique à votre format 9D)
-        pos = x[..., :3]
-        rot = x[..., 3:]
+    def normalize(self, data, key):
+        """
+        data: Tensor de forme (B, T, 9) ou (B, 9)
+        key: Clé pour accéder aux stats (ex: 'agent_pos')
+        """
+        if self.stats is None: 
+            return data
         
-        # Formule MinMax [-1, 1]
-        denom = (self.pos_max - self.pos_min).clamp(min=1e-5)
-        pos_norm = 2 * (pos - self.pos_min) / denom - 1
+        # Séparer Position (3) et Rotation (6)
+        pos = data[..., :3]
+        rot = data[..., 3:]
         
+        # Récupérer stats (création du tenseur sur le même device que data)
+        # On cast aussi vers le même dtype (float32, float16, etc.)
+        min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
+        max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
+        
+        # Sécurité : on s'assure de ne prendre que les 3 premières valeurs (x, y, z)
+        min_val = min_val[..., :3]
+        max_val = max_val[..., :3]
+        
+        # Normaliser Position [-1, 1]
+        pos_norm = 2 * (pos - min_val) / (max_val - min_val + 1e-5) - 1
+        
+        # Renvoie Position Normalisée + Rotation Intacte
         return torch.cat([pos_norm, rot], dim=-1)
 
-    def unnormalize(self, x, key='action'):
-        if not self.is_initialized:
-            return x
-            
-        pos_norm = x[..., :3]
-        rot = x[..., 3:]
+    def unnormalize(self, data, key):
+        if self.stats is None: 
+            return data
         
-        denom = (self.pos_max - self.pos_min).clamp(min=1e-5)
-        pos = (pos_norm + 1) / 2 * denom + self.pos_min
+        pos_norm = data[..., :3]
+        rot = data[..., 3:]
+        
+        min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
+        max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
+        
+        min_val = min_val[..., :3]
+        max_val = max_val[..., :3]
+        
+        # Denormaliser Position
+        pos = (pos_norm + 1) / 2 * (max_val - min_val + 1e-5) + min_val
         
         return torch.cat([pos, rot], dim=-1)
+        
+# class Normalizer(nn.Module):
+#     def __init__(self, stats=None):
+#         super().__init__()
+#         # On enregistre les buffers. Ils seront sauvegardés dans le .ckpt !
+#         self.register_buffer('pos_min', torch.zeros(3))
+#         self.register_buffer('pos_max', torch.ones(3))
+#         # On sauvegarde aussi l'état d'initialisation (booléen)
+#         self.register_buffer('is_initialized', torch.tensor(False, dtype=torch.bool))
+
+#         if stats is not None:
+#             self.load_stats_from_dict(stats)
+
+#     def load_stats_from_dict(self, stats):
+#         # Cette fonction sert uniquement lors du PREMIER entraînement
+#         print("📥 Injection des statistiques dans le modèle...")
+#         self.pos_min[:] = torch.tensor(stats['agent_pos']['min'])
+#         self.pos_max[:] = torch.tensor(stats['agent_pos']['max'])
+#         self.is_initialized.fill_(True)
+
+#     def normalize(self, x, key='agent_pos'): 
+#         # Note: key est gardé pour compatibilité, mais ici on gère surtout agent_pos
+#         if not self.is_initialized:
+#             return x
+            
+#         # Séparation Pos / Rot (Spécifique à votre format 9D)
+#         pos = x[..., :3]
+#         rot = x[..., 3:]
+        
+#         # Formule MinMax [-1, 1]
+#         denom = (self.pos_max - self.pos_min).clamp(min=1e-5)
+#         pos_norm = 2 * (pos - self.pos_min) / denom - 1
+        
+#         return torch.cat([pos_norm, rot], dim=-1)
+
+#     def unnormalize(self, x, key='action'):
+#         if not self.is_initialized:
+#             return x
+            
+#         pos_norm = x[..., :3]
+#         rot = x[..., 3:]
+        
+#         denom = (self.pos_max - self.pos_min).clamp(min=1e-5)
+#         pos = (pos_norm + 1) / 2 * denom + self.pos_min
+        
+#         return torch.cat([pos, rot], dim=-1)
 
 def compute_dataset_stats(dataset):
     print("🔄 Calcul des statistiques de normalisation (Itératif)...")

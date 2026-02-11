@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="fr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Une question importante...</title>
+    <style>
+        body {
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background-color: #ffe6e9;
+            /* Fond rose pâle */
+            font-family: 'Arial', sans-serif;
+            overflow: hidden;
+            /* Empêche les barres de défilement si le bouton bouge trop loin */
+        }
+
+        h1 {
+            color: #d6336c;
+            font-size: 2.5rem;
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .container {
+            position: relative;
+            text-align: center;
+        }
+
+        /* Style des boutons */
+        button {
+            padding: 15px 30px;
+            font-size: 1.2rem;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 10px;
+            font-weight: bold;
+        }
+
+        #yes-btn {
+            background-color: #ff4d6d;
+            color: white;
+            box-shadow: 0 4px 6px rgba(255, 77, 109, 0.3);
+        }
+
+        #yes-btn:hover {
+            background-color: #d60036;
+            transform: scale(1.1);
+        }
+
+        #no-btn {
+            background-color: #fff;
+            color: #ff4d6d;
+            border: 2px solid #ff4d6d;
+            position: absolute;
+            /* Important pour le déplacement */
+        }
+
+        /* Message de succès caché par défaut */
+        #success-message {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            color: #d6336c;
+            animation: fadeIn 1s;
+        }
+
+        #success-message img {
+            width: 200px;
+            border-radius: 15px;
+            margin-top: 20px;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+
+            to {
+                opacity: 1;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="question-container" class="container">
+        <h1>Veux-tu être ma Valentine ? 💖</h1>
+        <div>
+            <button id="yes-btn" onclick="acceptLove()">OUI !</button>
+            <button id="no-btn" onmouseover="moveButton()" onclick="moveButton()">NON</button>
+        </div>
+    </div>
+
+    <div id="success-message">
+        <h1>Yay ! Je savais que tu dirais oui ! 🥰</h1>
+        <p>(De toute façon, tu n'avais pas vraiment le choix... 😉)</p>
+        <img src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExM2Q5eGZ6aG55Y3Vqb2c5ZnF5ZmNqN3Z5eGZ6aG55Y3Vqb2c5ZiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/MDJ9IbxxvDUQM/giphy.gif"
+            alt="Cute Cat">
+    </div>
+
+    <script>
+        function moveButton() {
+            const noBtn = document.getElementById('no-btn');
+
+            // Calculer des positions aléatoires
+            // On s'assure que le bouton reste dans la fenêtre visible
+            const x = Math.random() * (window.innerWidth - noBtn.offsetWidth);
+            const y = Math.random() * (window.innerHeight - noBtn.offsetHeight);
+
+            noBtn.style.left = `${x}px`;
+            noBtn.style.top = `${y}px`;
+
+            // Si le bouton n'était pas déjà en position absolue par rapport au body, on le change
+            // (La première fois qu'on le survole, il sort du flux normal)
+            if (noBtn.parentElement) {
+                document.body.appendChild(noBtn);
+            }
+        }
+
+        function acceptLove() {
+            document.getElementById('question-container').style.display = 'none';
+            document.getElementById('no-btn').style.display = 'none'; // On cache le bouton non
+            document.getElementById('success-message').style.display = 'flex';
+
+            // Optionnel : Lancer des confettis (nécessiterait une librairie externe, 
+            // mais ici on garde ça simple avec un GIF)
+        }
+    </script>
+</body>
+
+</html>

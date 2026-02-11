@@ -418,7 +418,7 @@ class DiffusionInferenceNodeFork:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # --- MODEL ---
-        model_name = rospy.get_param("~model_name", "dp3_policy_last_diffusers_fork_only_SAMPLE_NO_AUG.ckpt")
+        model_name = rospy.get_param("~model_name", "Last_Fork_256_points.ckpt")
         self.model_path = os.path.join(pkg_path, 'models', model_name)
         
         if not os.path.exists(self.model_path):

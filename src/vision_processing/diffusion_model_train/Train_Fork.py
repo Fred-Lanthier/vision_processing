@@ -199,8 +199,8 @@ class Normalizer(nn.Module):
     def load_stats_from_dict(self, stats):
         # Cette fonction sert uniquement lors du PREMIER entraînement
         print("📥 Injection des statistiques dans le modèle...")
-        self.pos_min[:] = torch.tensor(stats['agent_pos']['min'])
-        self.pos_max[:] = torch.tensor(stats['agent_pos']['max'])
+        self.pos_min[:] = torch.tensor(stats['obs']['agent_pos']['min'])
+        self.pos_max[:] = torch.tensor(stats['obs']['agent_pos']['max'])
         self.is_initialized.fill_(True)
 
     def normalize(self, x, key='agent_pos'): 
@@ -229,55 +229,6 @@ class Normalizer(nn.Module):
         pos = (pos_norm + 1) / 2 * denom + self.pos_min
         
         return torch.cat([pos, rot], dim=-1)
-
-# class Normalizer:
-#     def __init__(self, stats=None):
-#         self.stats = stats
-
-#     def normalize(self, data, key):
-#         """
-#         data: Tensor de forme (B, T, 9) ou (B, 9)
-#         key: Clé pour accéder aux stats (ex: 'agent_pos')
-#         """
-#         if self.stats is None: 
-#             return data
-        
-#         # Séparer Position (3) et Rotation (6)
-#         pos = data[..., :3]
-#         rot = data[..., 3:]
-        
-#         # Récupérer stats (création du tenseur sur le même device que data)
-#         # On cast aussi vers le même dtype (float32, float16, etc.)
-#         min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
-#         max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
-        
-#         # Sécurité : on s'assure de ne prendre que les 3 premières valeurs (x, y, z)
-#         min_val = min_val[..., :3]
-#         max_val = max_val[..., :3]
-        
-#         # Normaliser Position [-1, 1]
-#         pos_norm = 2 * (pos - min_val) / (max_val - min_val + 1e-5) - 1
-        
-#         # Renvoie Position Normalisée + Rotation Intacte
-#         return torch.cat([pos_norm, rot], dim=-1)
-
-#     def unnormalize(self, data, key):
-#         if self.stats is None: 
-#             return data
-        
-#         pos_norm = data[..., :3]
-#         rot = data[..., 3:]
-        
-#         min_val = torch.tensor(self.stats[key]['min'], device=data.device, dtype=data.dtype)
-#         max_val = torch.tensor(self.stats[key]['max'], device=data.device, dtype=data.dtype)
-        
-#         min_val = min_val[..., :3]
-#         max_val = max_val[..., :3]
-        
-#         # Denormaliser Position
-#         pos = (pos_norm + 1) / 2 * (max_val - min_val + 1e-5) + min_val
-        
-#         return torch.cat([pos, rot], dim=-1)
         
 
 def compute_dataset_stats(dataset):
@@ -290,7 +241,7 @@ def compute_dataset_stats(dataset):
     # On scanne tout le dataset pour trouver les min/max globaux
     for batch in tqdm(loader, desc="Scanning dataset"):
         # On regarde les positions de l'agent
-        pos_batch = batch['agent_pos'][..., :3].reshape(-1, 3)
+        pos_batch = batch['obs']['agent_pos'][..., :3].reshape(-1, 3)
         min_pos = torch.minimum(min_pos, pos_batch.min(dim=0)[0])
         max_pos = torch.maximum(max_pos, pos_batch.max(dim=0)[0])
         
@@ -301,9 +252,11 @@ def compute_dataset_stats(dataset):
         max_pos = torch.maximum(max_pos, act_batch.max(dim=0)[0])
 
     stats = {
-        'agent_pos': {'min': min_pos.tolist(), 'max': max_pos.tolist()},
-        # On peut garder la structure, même si on utilise les mêmes stats pour les deux
-        'action':    {'min': min_pos.tolist(), 'max': max_pos.tolist()}
+        'obs': {
+            'agent_pos': {'min': min_pos.tolist(), 'max': max_pos.tolist()},
+            # On peut garder la structure, même si on utilise les mêmes stats pour les deux
+            'action':    {'min': min_pos.tolist(), 'max': max_pos.tolist()}
+        }
     }
     print(f"✅ Stats calculées. Min: {min_pos}, Max: {max_pos}")
     return stats
@@ -362,7 +315,7 @@ def main():
     ROBOT_STATE_DIM = 9
     OBS_HORIZON = 2
     PRED_HORIZON = 16
-    NUM_POINTS = 1024
+    NUM_POINTS = 256
 
     # Diffusion Params
     NOISE_STEPS = 100
@@ -403,21 +356,11 @@ def main():
     full_dataset = Robot3DDataset(data_path, mode='all')
     
     # 2. Normalisation
-    # stats_path = os.path.join(pkg_path, "normalization_stats_urdf_fork_SAMPLE.json")
-    # if os.path.exists(stats_path):
-    #     print("📂 Chargement des stats existantes...")
-    #     with open(stats_path, 'r') as f:
-    #         stats = json.load(f)
-    # else:
-    #     stats = compute_dataset_stats(full_dataset)
-    #     with open(stats_path, 'w') as f:
-    #         json.dump(stats, f)
-    # stats = None
-    # normalizer = Normalizer(stats)
-    
-    # Reload datasets en mode train/val
+    STATS = compute_dataset_stats(full_dataset)
+
+
     train_dataset = Robot3DDataset(data_path, mode='train', val_ratio=0.2, seed=42, 
-                                    num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=False)
+                                    num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=True)
     val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42, 
                                 num_points=NUM_POINTS, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, augment=False)
     
@@ -426,7 +369,7 @@ def main():
 
     # 3. Setup Model
     model = DP3AgentRobust(action_dim=ACTION_DIM, robot_state_dim=ROBOT_STATE_DIM,
-                        obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON).to(DEVICE)
+                        obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON, stats=STATS).to(DEVICE)
     
     # 🔥 INITIALISATION DIFFUSERS EMA 🔥
     ema_model = EMAModel(
@@ -467,12 +410,12 @@ def main():
         pbar = tqdm(train_loader, desc=f"Ep {epoch+1}/{NUM_EPOCHS}")
         
         for batch in pbar:
-            pcd = batch['point_cloud'].to(DEVICE, non_blocking=True)
+            pcd = batch['obs']['point_cloud'].to(DEVICE, non_blocking=True)
             
             # Utilisation du normalizer interne du modèle
             # Note : Bien que normalizer soit dans le modèle, pour le train on doit normaliser MANUELLEMENT
             # les inputs avant de calculer la loss. On utilise model.normalizer.
-            agent_pos = model.normalizer.normalize(batch['agent_pos'].to(DEVICE, non_blocking=True))
+            agent_pos = model.normalizer.normalize(batch['obs']['agent_pos'].to(DEVICE, non_blocking=True))
             actions = model.normalizer.normalize(batch['action'].to(DEVICE, non_blocking=True))
             
             noise = torch.randn_like(actions)
@@ -507,8 +450,8 @@ def main():
         
         with torch.no_grad():
             for batch in val_loader:
-                pcd = batch['point_cloud'].to(DEVICE, non_blocking=True)
-                agent_pos = model.normalizer.normalize(batch['agent_pos'].to(DEVICE, non_blocking=True))
+                pcd = batch['obs']['point_cloud'].to(DEVICE, non_blocking=True)
+                agent_pos = model.normalizer.normalize(batch['obs']['agent_pos'].to(DEVICE, non_blocking=True))
                 actions = model.normalizer.normalize(batch['action'].to(DEVICE, non_blocking=True))
                 
                 noise = torch.randn_like(actions)
@@ -525,10 +468,10 @@ def main():
         # --- 5. SAVING (NEW FORMAT) ---
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            save_name = "test_best.ckpt"
+            save_name = "Best_Fork_256_points_Relative.ckpt"
             print("💾 Saved Best EMA Model")
         else:
-            save_name = "test_last.ckpt"
+            save_name = "Last_Fork_256_points_Relative.ckpt"
             print("💾 Saved Last EMA Model")
             
         # Payload complet comme dans le Code 2
@@ -536,7 +479,7 @@ def main():
             'state_dict': model.state_dict(), # Contient désormais les stats du Normalizer !
             'history': history,
             'config': config,
-            # 'stats': stats, # On garde aussi le JSON brut au cas où
+            'stats': STATS, # On garde aussi le JSON brut au cas où
             'epoch': epoch,
             'best_val_loss': best_val_loss,
             'model_class': 'DP3AgentRobust'

@@ -314,7 +314,7 @@ if __name__ == "__main__":
     import os
     
     grid_file = "Images_Test/sdf_field.npz"
-    mesh_file = "Images_Test/03_thick_shell.obj"
+    mesh_file = "02_surface_polished.obj"
     
     if not os.path.exists(grid_file):
         print(f"❌ Grid not found: {grid_file}")

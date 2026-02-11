@@ -3,34 +3,23 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from mpl_toolkits.mplot3d import Axes3D  # Nécessaire pour les plots 3D
-import pickle
+from mpl_toolkits.mplot3d import Axes3D
 import json
 import pandas as pd
 from tqdm import tqdm
 import rospkg
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 import time
 import seaborn as sns
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
-# # Import de tes classes locales
-# from Train_urdf import DP3AgentRobust, Normalizer
-# from Data_Loader_urdf import Robot3DDataset
-
+# Import de vos modules locaux
+# Assurez-vous que Train_Fork.py et Data_Loader_Fork.py sont dans le même dossier ou le PYTHONPATH
 from Train_Fork import DP3AgentRobust, Normalizer
-from Data_Loader_Fork import Robot3DDataset
+from Data_Loader_Fork import Robot3DDataset, seed_everything
 
 # ==============================================================================
-# 1. UTILITAIRES MATHÉMATIQUES & CONFIGURATION
+# 1. UTILITAIRES MATHÉMATIQUES
 # ==============================================================================
-
-def seed_everything(seed=42):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
 
 def ortho6d_to_rotation_matrix(d6):
     """
@@ -44,122 +33,113 @@ def ortho6d_to_rotation_matrix(d6):
     y = np.cross(z, x)
     return np.stack([x, y, z], axis=-1)
 
-def compute_angular_error(matrix1, matrix2):
-    """
-    Calcule l'erreur angulaire (en degrés) entre deux matrices de rotation.
-    """
-    # R_diff = R1 * R2^T
-    r_diff = np.matmul(matrix1, matrix2.transpose(0, 1, 3, 2))
-    trace = np.trace(r_diff, axis1=-2, axis2=-1)
-    val = (trace - 1.0) / 2.0
-    cos_theta = np.clip(val, -1.0, 1.0) # Clip numérique de sécurité
-    return np.arccos(cos_theta) * (180.0 / np.pi)
-
-# ==============================================================================
-# 2. LOGIQUE D'INFÉRENCE (Issue du Code 1)
-# ==============================================================================
-
-def infer_single(model, sample, scheduler, DEVICE):
-    """
-    Plus besoin de passer 'normalizer' en argument séparé.
-    Il est dans model.normalizer et déjà chargé avec les bons poids/stats.
-    """
-    model.eval()
-    pcd = sample['point_cloud'].unsqueeze(0).to(DEVICE)
-    raw_agent_pos = sample['agent_pos'].unsqueeze(0).to(DEVICE)
-    
-    with torch.no_grad():
-        # Utilisation directe du normalizer interne
-        norm_agent_pos = model.normalizer.normalize(raw_agent_pos, 'agent_pos')
-        
-        global_cond = torch.cat([model.point_encoder(pcd),
-                                 model.robot_mlp(norm_agent_pos.reshape(1, -1))], dim=-1)
-
-        noisy_action = torch.randn((1, 16, 9), device=DEVICE)
-
-        for t in scheduler.timesteps:
-            # Note: Si tu utilises DDIM, assure-toi que scheduler est DDIMScheduler
-            noise_pred = model.noise_pred_net(noisy_action, torch.tensor([t], device=DEVICE).long(), global_cond)
-            noisy_action = scheduler.step(noise_pred, t, noisy_action).prev_sample
-        
-        # Unnormalize avec l'interne
-        pred_action = model.normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0]
-        gt_action = sample['action'].numpy()
-
-        # Calcul Erreurs
-        final_dist = np.linalg.norm(pred_action[-1, :3] - gt_action[-1, :3])
-        
-        # 2. Erreur Angulaire Finale
-        gt_rot_6d = gt_action[-1, 3:]
-        # Expansion des dims pour matcher la fonction (B, T, 6) -> ici on traite juste le dernier pas
-        gt_rot_mat = ortho6d_to_rotation_matrix(gt_rot_6d[None, None, :])[0, 0]
-        pred_rot_mat = ortho6d_to_rotation_matrix(pred_action[-1, 3:][None, None, :])[0, 0]
-        
-        r_diff = np.dot(gt_rot_mat, pred_rot_mat.T)
-        cos_theta = np.clip((np.trace(r_diff) - 1.0) / 2.0, -1.0, 1.0)
-        final_angle = np.arccos(cos_theta) * (180 / np.pi)
-        
-    return pred_action, final_dist, final_angle
-
-# ==============================================================================
-# 3. VISUALISATIONS (Fusion Code 1 & Code 2)
-# ==============================================================================
-
 def plot_training_history(history):
-    """
-    Prend directement le dictionnaire 'history' chargé du .ckpt
-    """
-    if history is None:
-        print("⚠️ Pas d'historique trouvé dans le checkpoint.")
-        return
-
+    """ Affiche les courbes de perte si disponibles dans le checkpoint """
+    if history is None: return
     print("📊 Génération du Graphique d'Historique...")
     plt.figure(figsize=(10, 5))
-    
-    # Vérification que les clés existent
     if 'train_loss' in history:
         plt.plot(history['train_loss'], label='Train Loss', linewidth=2)
     if 'val_loss' in history:
         plt.plot(history['val_loss'], label='Validation Loss', linewidth=2)
-        
     plt.yscale('log')
     plt.title("Convergence de l'entraînement")
     plt.xlabel("Époques")
     plt.ylabel("MSE Loss (Log Scale)")
     plt.legend()
     plt.grid(True, which="both", ls="-", alpha=0.5)
-    plt.savefig('01_train_history_integrated.svg', format='svg')
+    plt.savefig('01_train_history.svg', format='svg')
     plt.close()
 
-def plot_3d_multimodality_with_orientation(model, sample, scheduler, DEVICE, idx, n_samples=20):
+# ==============================================================================
+# 2. LOGIQUE D'INFÉRENCE & TIMING
+# ==============================================================================
+
+def infer_single(model, sample, scheduler, DEVICE):
     """
-    Affiche 3D complet (Code 2) : Nuage de points + Spaghettis + Orientation.
-    Utilise infer_single pour la cohérence.
+    Exécute une inférence complète et retourne les prédictions + le temps d'exécution.
     """
-    print(f"🍝 Génération du Plot 3D Complet (Pos + Orient) pour Seq {idx}...")
+    model.eval()
+    
+    # Préparation des tenseurs (Batch size = 1)
+    pcd = sample['obs']['point_cloud'].unsqueeze(0).to(DEVICE)
+    raw_agent_pos = sample['obs']['agent_pos'].unsqueeze(0).to(DEVICE)
+    
+    # --- DÉBUT CHRONO ---
+    start_time = time.perf_counter()
+    
+    with torch.no_grad():
+        # 1. Normalisation (interne au modèle)
+        norm_agent_pos = model.normalizer.normalize(raw_agent_pos, 'agent_pos')
+        
+        # 2. Encodage Vision + Proprio
+        global_cond = torch.cat([model.point_encoder(pcd),
+                                 model.robot_mlp(norm_agent_pos.reshape(1, -1))], dim=-1)
+
+        # 3. Boucle de Diffusion Inverse
+        noisy_action = torch.randn((1, 16, 9), device=DEVICE)
+
+        for t in scheduler.timesteps:
+            # Prédiction du bruit
+            noise_pred = model.noise_pred_net(noisy_action, torch.tensor([t], device=DEVICE).long(), global_cond)
+            # Step du scheduler
+            noisy_action = scheduler.step(noise_pred, t, noisy_action).prev_sample
+        
+        # 4. Un-normalization
+        pred_action = model.normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0]
+    
+    # --- FIN CHRONO ---
+    end_time = time.perf_counter()
+    inference_time = (end_time - start_time) # en secondes
+
+    # --- Calcul des Métriques ---
+    gt_action = sample['action'].numpy()
+
+    # 1. Distance Euclidienne Finale (FDE)
+    final_dist = np.linalg.norm(pred_action[-1, :3] - gt_action[-1, :3])
+    
+    # 2. Erreur Angulaire Finale
+    gt_rot_6d = gt_action[-1, 3:]
+    gt_rot_mat = ortho6d_to_rotation_matrix(gt_rot_6d[None, None, :])[0, 0]
+    pred_rot_mat = ortho6d_to_rotation_matrix(pred_action[-1, 3:][None, None, :])[0, 0]
+    
+    r_diff = np.dot(gt_rot_mat, pred_rot_mat.T)
+    cos_theta = np.clip((np.trace(r_diff) - 1.0) / 2.0, -1.0, 1.0)
+    final_angle = np.arccos(cos_theta) * (180 / np.pi)
+        
+    return pred_action, final_dist, final_angle, inference_time
+
+# ==============================================================================
+# 3. VISUALISATIONS COMPLÈTES (Repère Local)
+# ==============================================================================
+
+def plot_3d_local_frame(model, sample, scheduler, DEVICE, idx, n_samples=10):
+    """
+    Affiche le nuage de points et les trajectoires dans le repère LOCAL.
+    """
+    print(f"🍝 Génération du Plot 3D (Repère Local) pour Seq {idx}...")
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
     
     # A. Environnement
-    pcd = sample['point_cloud'].numpy()
+    pcd = sample['obs']['point_cloud'].numpy()
     if len(pcd) > 512:
         indices = np.random.choice(len(pcd), 512, replace=False)
         pcd_vis = pcd[indices]
     else:
         pcd_vis = pcd
-    ax.scatter(pcd_vis[:,0], pcd_vis[:,1], pcd_vis[:,2], c=pcd_vis[:,2], cmap='Greys', s=5, alpha=0.2, label='Env (PCD)')
+    ax.scatter(pcd_vis[:,0], pcd_vis[:,1], pcd_vis[:,2], c=pcd_vis[:,2], cmap='Greys', s=5, alpha=0.2, label='Env (Local)')
 
     # B. Vérité Terrain
     gt = sample['action'].numpy()
-    obs = sample['agent_pos'].numpy()
+    obs = sample['obs']['agent_pos'].numpy()
     ax.plot(gt[:, 0], gt[:, 1], gt[:, 2], 'g--', linewidth=3, label='Vérité Terrain (GT)')
     ax.plot(obs[:, 0], obs[:, 1], obs[:, 2], 'b-o', linewidth=2, label='Historique')
 
     # C. Inférences Multiples
     final_preds = []
     for _ in range(n_samples):
-        # Utilisation de la fonction d'inférence modulaire
-        pred_action, _, _ = infer_single(model, sample, scheduler, DEVICE)
+        pred_action, _, _, _ = infer_single(model, sample, scheduler, DEVICE)
         final_preds.append(pred_action)
         ax.plot(pred_action[:, 0], pred_action[:, 1], pred_action[:, 2], color='red', alpha=0.15, linewidth=1)
 
@@ -167,59 +147,50 @@ def plot_3d_multimodality_with_orientation(model, sample, scheduler, DEVICE, idx
     last_pred = final_preds[0][-1] 
     gt_last = gt[-1]
 
-    # Repère GT (Vert)
+    # Repères (Quivers)
     gt_rot = ortho6d_to_rotation_matrix(gt_last[3:][None, None, :])[0, 0]
     origin = gt_last[:3]
     scale = 0.05
     ax.quiver(origin[0], origin[1], origin[2], gt_rot[0,0], gt_rot[1,0], gt_rot[2,0], color='green', lw=2, length=scale)
     
-    # Repère Pred (Rouge)
     pred_rot = ortho6d_to_rotation_matrix(last_pred[3:][None, None, :])[0, 0]
     origin_p = last_pred[:3]
     ax.quiver(origin_p[0], origin_p[1], origin_p[2], pred_rot[0,0], pred_rot[1,0], pred_rot[2,0], color='red', lw=2, length=scale, label='Orient. Pred')
 
-    ax.set_title(f"Seq {idx} : Analyse 3D (Rouge=Pred, Vert=GT)")
-    # Auto-scale centré sur le robot
-    center = np.mean(gt, axis=0)[:3]
-    radius = 0.2
+    ax.set_title(f"Seq {idx} : Vue Centrée sur la Fourchette (Local Frame)\n(0,0,0) = Position Actuelle")
+    
+    # Zoom auto
+    center = np.mean(gt[:, :3], axis=0)
+    radius = 0.15 
     ax.set_xlim(center[0]-radius, center[0]+radius)
     ax.set_ylim(center[1]-radius, center[1]+radius)
     ax.set_zlim(center[2]-radius, center[2]+radius)
     plt.legend()
-    plt.savefig(f'02_3d_spaghetti_seq{idx}.png', dpi=200)
+    plt.savefig(f'02_3d_local_seq{idx}.png', dpi=150)
     plt.close()
 
 def plot_multimodality_spaghetti_2d(model, sample, scheduler, DEVICE, idx, n_samples=50):
-    """
-    Analyse 2D (Code 1) : Utile pour voir la dispersion XY sans le bruit du PCD.
-    """
+    """ Affiche la dispersion XY """
     print(f"🍝 Génération du Spaghetti Plot 2D pour Seq {idx}...")
     plt.figure(figsize=(10, 10))
     gt = sample['action'].numpy()
-    obs = sample['agent_pos'].numpy()
-
-    final_dists = []
-    final_angles = []
+    obs = sample['obs']['agent_pos'].numpy()
 
     for i in range(n_samples):
-        pred, final_dist, final_angle = infer_single(model, sample, scheduler, DEVICE)
-        final_dists.append(final_dist)
-        final_angles.append(final_angle)
+        pred, _, _, _ = infer_single(model, sample, scheduler, DEVICE)
         plt.plot(pred[:, 0], pred[:, 1], color='red', alpha=0.1, linewidth=1.5, label='Prédictions' if i == 0 else "")
     
     plt.plot(obs[:,0], obs[:,1], 'b-o', label='Passé', linewidth=2.5)
     plt.plot(gt[:, 0], gt[:, 1], 'g--', label='Vérité Terrain', linewidth=3)
-    plt.title(f"Dispersion 2D - Seq {idx} (N={n_samples})")
+    plt.title(f"Dispersion 2D (Local Frame) - Seq {idx}")
     plt.axis('equal')
     plt.grid(True, alpha=0.2)
     plt.legend()
-    plt.savefig(f'02_spaghetti_2d_clean_seq{idx}.png', dpi=300)
+    plt.savefig(f'02_spaghetti_2d_seq{idx}.png', dpi=150)
     plt.close()
 
 def plot_rotation_error_over_time(gt_action, pred_action, idx):
-    """
-    Affiche l'écart angulaire timestep par timestep (Code 2).
-    """
+    """ Affiche l'écart angulaire timestep par timestep """
     gt_tensor = torch.from_numpy(gt_action).unsqueeze(0)
     pred_tensor = torch.from_numpy(pred_action).unsqueeze(0)
     
@@ -246,13 +217,11 @@ def plot_rotation_error_over_time(gt_action, pred_action, idx):
     plt.close()
 
 def make_diffusion_gif(model, sample, scheduler, DEVICE, idx):
-    """
-    Version fusionnée : Visuels riches du Code 2 (GT, PCD) + Pause "Clean" du Code 1.
-    """
+    """ Génère un GIF du processus de diffusion """
     print(f"🎬 Génération du GIF pour Seq {idx}...")
     model.eval()
-    pcd = sample['point_cloud'].unsqueeze(0).to(DEVICE)
-    raw_agent_pos = sample['agent_pos'].unsqueeze(0).to(DEVICE)
+    pcd = sample['obs']['point_cloud'].unsqueeze(0).to(DEVICE)
+    raw_agent_pos = sample['obs']['agent_pos'].unsqueeze(0).to(DEVICE)
     frames = []
     
     with torch.no_grad():
@@ -268,91 +237,88 @@ def make_diffusion_gif(model, sample, scheduler, DEVICE, idx):
             noisy_action = scheduler.step(noise_pred, t, noisy_action).prev_sample
             frames.append(model.normalizer.unnormalize(noisy_action, 'action').cpu().numpy()[0])
 
-    # Pause à la fin (Code 1 feature)
-    for _ in range(15): frames.append(frames[-1])
+    for _ in range(10): frames.append(frames[-1]) # Pause à la fin
 
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
     gt = sample['action'].numpy()
-    center = np.mean(gt[:, :3], axis=0)
+    center = np.mean(gt[:, :3], axis=0) # Sera proche de 0
     
     def update(f):
         ax.clear()
         path = frames[f]
-        # Robot Path
         ax.plot(path[:, 0], path[:, 1], path[:, 2], color='red', linewidth=3, label='Diffusion')
-        # GT Ghost (Code 2 feature)
         ax.plot(gt[:, 0], gt[:, 1], gt[:, 2], color='green', alpha=0.3, linewidth=1, label='Target')
-        # PCD (Code 2 feature)
-        pc_np = sample['point_cloud'].numpy()[::5]
+        
+        # PCD Subsampled
+        pc_np = sample['obs']['point_cloud'].numpy()[::5]
         ax.scatter(pc_np[:,0], pc_np[:,1], pc_np[:,2], s=1, c='gray', alpha=0.1)
 
-        step_text = f"Step: {f}/{len(frames)-15}" if f < (len(frames)-15) else "Final Prediction"
+        step_text = f"Step: {f}/{len(frames)-10}" if f < (len(frames)-10) else "Final Prediction"
         ax.set_title(f"Génération Diffusive\n{step_text}")
-        ax.set_xlim(center[0]-0.2, center[0]+0.2)
-        ax.set_ylim(center[1]-0.2, center[1]+0.2)
-        ax.set_zlim(center[2]-0.2, center[2]+0.2)
+        
+        # Limites fixes autour de 0 (Local Frame)
+        ax.set_xlim(-0.15, 0.15)
+        ax.set_ylim(-0.15, 0.15)
+        ax.set_zlim(-0.15, 0.15)
 
     ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=100)
     ani.save(f'03_diffusion_process_seq{idx}.gif', writer='pillow')
     plt.close()
 
 # ==============================================================================
-# 4. ANALYSE QUANTITATIVE (Fusion Stats Code 1 + Seuils Code 2)
+# 4. ANALYSE QUANTITATIVE & TEMPORELLE
 # ==============================================================================
 
 def run_quantitative_analysis(model, val_dataset, scheduler, DEVICE, n_samples=20):
     model.eval()
     results = []
+    times = []
     
-    # Seuils de succès (Code 2)
-    THRESHOLD_POS = 0.02 # 2 cm
-    THRESHOLD_ROT = 15.0 # 15 degrés
+    THRESHOLD_POS = 0.02 # 2cm
+    THRESHOLD_ROT = 15.0 # 15 deg
     
-    print(f"📊 Analyse quantitative ({n_samples} samples/seq)...")
-    # On limite pour ne pas surcharger en démo, sinon utiliser range(len(val_dataset))
-    num_eval_sequences = min(30, len(val_dataset)) 
-    indices = np.linspace(0, len(val_dataset)-1, num_eval_sequences, dtype=int)
+    # Nombre de séquences à évaluer (ex: 50 pour aller vite, ou len(val_dataset))
+    num_eval = min(50, len(val_dataset)) 
+    indices = np.linspace(0, len(val_dataset)-1, num_eval, dtype=int)
+    
+    print(f"📊 Analyse de {num_eval} séquences (x{n_samples} inférences chacune)...")
 
     for idx in tqdm(indices):
         sample = val_dataset[idx]
-        
-        # --- Multi-Inférence (Code 1 logic) ---
-        seq_preds = []
-        seq_final_angles = []
-        seq_final_dists = []
+        seq_dists = []
+        seq_angles = []
+        seq_preds = [] # Pour dispersion
         
         for _ in range(n_samples):
-            pred, final_dist, final_angle = infer_single(model, sample, scheduler, DEVICE)
+            pred, final_dist, final_angle, dt = infer_single(model, sample, scheduler, DEVICE)
+            seq_dists.append(final_dist)
+            seq_angles.append(final_angle)
             seq_preds.append(pred)
-            seq_final_dists.append(final_dist)
-            seq_final_angles.append(final_angle)
+            times.append(dt)
         
-        seq_preds = np.array(seq_preds) # (N, 16, 9)
+        seq_preds = np.array(seq_preds)
         
-        # --- Calcul Stats (Code 1 & 2 Fusionnés) ---
-        # Moyennes des erreurs
-        mean_fde = np.mean(seq_final_dists)
-        mean_rot = np.mean(seq_final_angles)
+        # Moyennes
+        mean_fde = np.mean(seq_dists)
+        mean_rot = np.mean(seq_angles)
         
-        # Success Rate (Code 2) : Combien d'échantillons ont réussi ?
-        success_count = sum([(d < THRESHOLD_POS and a < THRESHOLD_ROT) for d, a in zip(seq_final_dists, seq_final_angles)])
-        success_rate = (success_count / n_samples) * 100
-        
-        # ADE (Average Displacement Error)
-        gt_action = sample['action'].numpy()
-        gt_pos_all = gt_action[:, :3]
-        pred_pos_all = seq_preds[:, :, :3]
-        ade_dist = np.mean(np.linalg.norm(pred_pos_all - gt_pos_all, axis=2), axis=1) # Pour chaque sample
-        mean_ade = np.mean(ade_dist)
-
-        # Variance/Dispersion (Code 1)
+        # Dispersion
         mean_pred_path = np.mean(seq_preds[:, :, :3], axis=0)
         path_variance = np.mean(np.linalg.norm(seq_preds[:, :, :3] - mean_pred_path, axis=2))
 
+        # Succès
+        success_count = sum([(d < THRESHOLD_POS and a < THRESHOLD_ROT) for d, a in zip(seq_dists, seq_angles)])
+        success_rate = (success_count / n_samples) * 100
+        
+        # ADE
+        gt_pos = sample['action'].numpy()[:, :3]
+        pred_pos_all = seq_preds[:, :, :3]
+        ade_dist = np.mean(np.linalg.norm(pred_pos_all - gt_pos, axis=2))
+
         results.append({
             'seq_idx': idx,
-            'ADE': mean_ade * 100,      # cm
+            'ADE': ade_dist * 100,      # cm
             'FDE': mean_fde * 100,      # cm
             'RotErr': mean_rot,         # deg
             'SuccessRate': success_rate,# %
@@ -360,34 +326,46 @@ def run_quantitative_analysis(model, val_dataset, scheduler, DEVICE, n_samples=2
         })
 
     df = pd.DataFrame(results)
-    
-    print("\n" + "="*50)
-    print("RESUME DES PERFORMANCES (Validation Subset)")
-    print("="*50)
-    print(f"Success Rate Moyen : {df['SuccessRate'].mean():.2f} %")
-    print(f"Position Error (ADE): {df['ADE'].mean():.2f} cm")
-    print(f"Rotation Error (Fin): {df['RotErr'].mean():.2f} deg")
-    print(f"Dispersion Moyenne  : {df['Dispersion'].mean():.2f} cm")
-    print("="*50)
+    avg_time = np.mean(times)
+    freq = 1.0 / avg_time if avg_time > 0 else 0
+
+    print("\n" + "="*60)
+    print("🚀 RÉSULTATS DE VALIDATION & PERFORMANCE")
+    print("="*60)
+    print(f"Temps moyen d'inférence : {avg_time*1000:.2f} ms")
+    print(f"Fréquence d'inférence   : {freq:.2f} Hz")
+    print("-" * 60)
+    print(f"Success Rate Moyen      : {df['SuccessRate'].mean():.2f} %")
+    print(f"Erreur Position (ADE)   : {df['ADE'].mean():.2f} cm")
+    print(f"Erreur Position (FDE)   : {df['FDE'].mean():.2f} cm")
+    print(f"Erreur Rotation (Fin)   : {df['RotErr'].mean():.2f} deg")
+    print(f"Dispersion Moyenne      : {df['Dispersion'].mean():.2f} cm")
+    print("="*60)
+
+    # Histogramme Temps
+    plt.figure(figsize=(6, 4))
+    plt.hist(np.array(times)*1000, bins=30, color='purple', alpha=0.7)
+    plt.xlabel('Temps (ms)')
+    plt.title(f'Latence Inférence (Moy: {avg_time*1000:.1f}ms)')
+    plt.savefig('06_inference_latency.png')
+    plt.close()
 
     return df
 
 def plot_error_distributions(df):
-    """
-    Code 2 (Scatter plot) est très pertinent pour corréler Position et Rotation.
-    """
+    """ Plots Histogrammes et Scatter """
     print("📊 Génération histogrammes erreurs...")
     sns.set_theme(style="whitegrid")
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
     sns.histplot(df['SuccessRate'], bins=10, kde=False, ax=ax1, color="green")
-    ax1.set_title("Distribution du Taux de Succès par Séquence")
+    ax1.set_title("Distribution du Taux de Succès")
     ax1.set_xlabel("Succès (%)")
 
     sns.scatterplot(data=df, x='ADE', y='RotErr', ax=ax2, hue='SuccessRate', palette='viridis', alpha=0.8)
-    ax2.set_title("Corrélation Erreur Position vs Rotation")
-    ax2.set_xlabel("Erreur Position (cm)")
-    ax2.set_ylabel("Erreur Rotation (deg)")
+    ax2.set_title("Position vs Rotation Error")
+    ax2.set_xlabel("ADE (cm)")
+    ax2.set_ylabel("Rotation Error (deg)")
 
     plt.tight_layout()
     plt.savefig('04_metrics_distribution.png', dpi=300)
@@ -400,74 +378,64 @@ def plot_error_distributions(df):
 def main():
     seed_everything(42)
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🖥️ Utilisation du device : {DEVICE}")
+    print(f"🖥️ Device : {DEVICE}")
     
-    # 1. Chemins (Code 2 specifics)
+    # 1. Chemins
     rospack = rospkg.RosPack()
     pkg_path = rospack.get_path('vision_processing')
     data_path = os.path.join(pkg_path, 'datas', 'Trajectories_preprocess')
-    
-    # Chemins spécifiques demandés
-    ckpt_path = os.path.join(pkg_path, "models", "test_last.ckpt") 
+    ckpt_path = os.path.join(pkg_path, "models", "Last_Fork_256_points_Relative.ckpt") # ou Last_Fork.ckpt
 
+    if not os.path.exists(ckpt_path):
+        print(f"⚠️ Checkpoint introuvable : {ckpt_path}, essai Last_Fork...")
+        ckpt_path = os.path.join(pkg_path, "models", "Last_Fork.ckpt")
+    
+    # 2. Dataset (Pre-compute RAM)
+    print(f"📂 Chargement Dataset : {data_path}")
     val_dataset = Robot3DDataset(data_path, mode='val', val_ratio=0.2, seed=42)
     print(f"✅ Validation Set : {len(val_dataset)} séquences")
-
+    
+    # 3. Modèle
+    print(f"🧠 Chargement Modèle : {ckpt_path}")
     model = DP3AgentRobust(action_dim=9, robot_state_dim=9).to(DEVICE)
-    
-    if not os.path.exists(ckpt_path):
-        print(f"❌ ERREUR : Checkpoint introuvable : {ckpt_path}")
-        return
-
     checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-    if 'history' in checkpoint:
-        plot_training_history(checkpoint['history'])
     
-    weights = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-    model.load_state_dict(weights, strict=False) 
-    print("✅ Poids chargés.")
+    if 'history' in checkpoint: plot_training_history(checkpoint['history'])
+    
+    state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+    model.load_state_dict(state_dict, strict=False)
 
+    # 4. Scheduler (DDIM Rapide pour l'inférence)
     scheduler = DDIMScheduler(num_train_timesteps=100, 
-                                beta_schedule='squaredcos_cap_v2', 
-                                prediction_type='sample', 
-                                clip_sample=True)
-    scheduler.set_timesteps(10)
+                              beta_schedule='squaredcos_cap_v2', 
+                              prediction_type='sample', 
+                              clip_sample=True)
+    scheduler.set_timesteps(10) # 10 steps = Rapide
 
-    # 3. Visualisation sur une séquence spécifique
-    sample_idx = 25 # Comme dans Code 1
-    if len(val_dataset) > sample_idx:
-        sample = val_dataset[sample_idx]
-        
-        # B. 3D Spaghetti + Orientation (Code 2)
-        plot_3d_multimodality_with_orientation(model, sample, scheduler, DEVICE, sample_idx)
-        
-        # C. 2D Spaghetti Clean (Code 1 - Bonus)
-        plot_multimodality_spaghetti_2d(model, sample, scheduler, DEVICE, sample_idx)
+    # 5. Visualisation Test (Outliers & Random)
+    if len(val_dataset) > 0:
+        idx = 25
+        plot_3d_local_frame(model, val_dataset[idx], scheduler, DEVICE, idx)
+        make_diffusion_gif(model, val_dataset[idx], scheduler, DEVICE, idx)
+        plot_multimodality_spaghetti_2d(model, val_dataset[idx], scheduler, DEVICE, idx)
 
-        # D. GIF (Fusion)
-        make_diffusion_gif(model, sample, scheduler, DEVICE, sample_idx)
-
-    # 4. Analyse Globale
-    df = run_quantitative_analysis(model, val_dataset, scheduler, DEVICE, n_samples=20)
+    # 6. Benchmark Complet
+    df = run_quantitative_analysis(model, val_dataset, scheduler, DEVICE, n_samples=10)
     plot_error_distributions(df)
-    
-    # 5. Outlier Detection (Code 2 Logic)
+
+    # 7. Pire Séquence (Outlier)
     worst_seq = df.loc[df['SuccessRate'].idxmin()]
-    print(f"\n🚨 PIRE SEQUENCE (Idx {int(worst_seq['seq_idx'])}) :")
-    print(f"   Succès: {worst_seq['SuccessRate']:.1f}% | ADE: {worst_seq['ADE']:.2f}cm | Rot: {worst_seq['RotErr']:.1f}°")
-    
-    # Génération visuels pour la pire séquence
     idx_worst = int(worst_seq['seq_idx'])
+    print(f"\n🚨 PIRE SEQUENCE (Idx {idx_worst}) : Succès {worst_seq['SuccessRate']:.1f}%")
+    
     worst_sample = val_dataset[idx_worst]
+    plot_3d_local_frame(model, worst_sample, scheduler, DEVICE, idx_worst)
     
-    print(f"📸 Génération visuels pour l'outlier Seq {idx_worst}...")
-    plot_3d_multimodality_with_orientation(model, worst_sample, scheduler, DEVICE, idx_worst)
-    
-    # Générer une vraie prédiction pour le plot d'erreur temporelle
-    pred_worst, _, _ = infer_single(model, worst_sample, scheduler, DEVICE)
+    # Plot erreur temporelle sur un sample de la pire sequence
+    pred_worst, _, _, _ = infer_single(model, worst_sample, scheduler, DEVICE)
     plot_rotation_error_over_time(worst_sample['action'].numpy(), pred_worst, idx_worst)
     
-    print("\n✅ Analyse terminée. Vérifie les images PNG générées.")
+    print("\n✅ Analyse terminée. Images sauvegardées.")
 
 if __name__ == "__main__":
     main()

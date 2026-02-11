@@ -80,7 +80,14 @@ class GenerateSDF:
             self.surface_mesh.save(path)
             print(f"   💾 Saved: {path}")
         
-        # Step 3: Compute SDF (Virtual Thickness)
+        # Step 3: PCA Align
+        self._pca_align()
+        if save_meshes:
+            path = os.path.join(output_dir, "03_surface_aligned.obj")
+            self.surface_mesh.save(path)
+            print(f"   💾 Saved: {path}")
+        
+        # Step 4: Compute SDF (Virtual Thickness)
         # We want total thickness of X mm, so we expand X/2 mm in every direction
         radius_mm = thickness_mm / 2.0
         self._compute_sdf(resolution=sdf_resolution, virtual_radius_mm=radius_mm)
@@ -131,12 +138,11 @@ class GenerateSDF:
             search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.025, max_nn=30)
         )
         pcd.orient_normals_towards_camera_location(camera_location=np.array([0., 0., 0.]))
-
         # Poisson reconstruction
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
             pcd, depth=7, width=0, scale=1.1, linear_fit=False
         )
-        
+
         # --- FIX 1: DENSITY REMOVAL ---
         # The sides have low density because the camera missed them. 
         # By removing low density, we delete the walls.
@@ -164,7 +170,7 @@ class GenerateSDF:
             [k, idx, _] = pcd_tree.search_knn_vector_3d(vertices[i], 1)
             dist = np.linalg.norm(vertices[i] - np.asarray(pcd.points)[idx[0]])
             points_to_keep.append(dist < dist_threshold)
-        
+
         mesh.remove_vertices_by_mask(np.invert(points_to_keep))
 
         verts = np.asarray(mesh.vertices)
@@ -218,6 +224,44 @@ class GenerateSDF:
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    def _pca_align(self):
+        print("   Aligning mesh to Origin via PCA...")
+        
+        points = self.surface_mesh.points
+        
+        # 1. D'ABORD : Centrer au centre de gravité (Centroid)
+        # C'est crucial pour que la rotation PCA se fasse "sur place"
+        centroid = np.mean(points, axis=0)
+        centered_points = points - centroid
+
+        # 2. Calcul de la rotation (PCA) sur les points centrés
+        cov_matrix = np.cov(centered_points.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+
+        # Trier du plus grand axe au plus petit (X=Long, Y=Moyen, Z=Court)
+        sort_indices = np.argsort(eigenvalues)[::-1]
+        eigenvectors = eigenvectors[:, sort_indices]
+
+        # Garantir un système main-droite
+        if np.linalg.det(eigenvectors) < 0:
+            eigenvectors[:, 2] = -eigenvectors[:, 2]
+
+        R = eigenvectors
+
+        # 3. Appliquer la rotation aux points DÉJÀ centrés
+        # aligned_points sera maintenant centré en (0,0,0) et aligné
+        aligned_points = centered_points @ R
+        
+        # 4. (Optionnel) "Poser" l'objet sur le sol (Z=0)
+        # On regarde le point le plus bas en Z et on remonte tout le mesh
+        min_z = np.min(aligned_points[:, 2])
+        aligned_points[:, 2] -= min_z
+
+        # 5. Mettre à jour le mesh
+        self.surface_mesh.points = aligned_points
+        
+        print(f"   Mesh aligned and placed on floor (Z=0).")
 
     def _compute_sdf(self, resolution=150, margin=0.03, virtual_radius_mm=1.0):
         """
@@ -333,7 +377,7 @@ class GenerateSDF:
         grad = np.stack([(d_xp - d_xm), (d_yp - d_ym), (d_zp - d_zm)], axis=1) / (2 * eps * self.voxel_size)
         norms = np.linalg.norm(grad, axis=1, keepdims=True)
         return grad / np.maximum(norms, 1e-10)
-
+    
     # =========================================================
     # SAVE / LOAD
     # =========================================================
@@ -465,6 +509,7 @@ class GenerateSDF:
         p.add_axes()
         p.add_legend()
         p.show()
+        p.screenshot("sdf_3d.png")
 # ===========================================
 # MAIN EXECUTION
 # ===========================================

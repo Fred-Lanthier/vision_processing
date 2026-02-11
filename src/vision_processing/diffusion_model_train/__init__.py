@@ -1,1 +1,1 @@
-from . import flow_policy_3d
+from . import FlowPolicy_Fred

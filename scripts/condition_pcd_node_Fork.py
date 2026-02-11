@@ -39,7 +39,10 @@ class MergedCloudNode:
         self.is_grasped = False
         self.static_cube_cloud = None
         self.current_cube_cloud = None
-        self.contact_threshold = -0.02 
+        self.contact_threshold = 0.005
+        self.static_cube_cloud_subsampled = None  # For fast grasp check
+        self.fork_cloud_cache = None              # Cache fork points
+        self.last_joint_hash = None   
 
         # Offset manuel vectoriel pour la distance (Xacro)
         self.fork_tip_offset_vec = np.array([-0.0055, 0.0, 0.1296, 1.0]) 
@@ -128,8 +131,16 @@ class MergedCloudNode:
         current_robot_points = None
         if self.mesh_loader:
             try:
-                joint_map = {name: joint_msg.position[i] for i, name in enumerate(joint_msg.name) if "panda" in name}
-                current_robot_points = self.mesh_loader.create_point_cloud_fork_tip(joint_map)
+                joint_map = {name: joint_msg.position[i] 
+                            for i, name in enumerate(joint_msg.name) if "panda" in name}
+                
+                # Only recompute if joints actually changed
+                joint_hash = tuple(round(v, 4) for v in joint_map.values())
+                if joint_hash != self.last_joint_hash:
+                    self.fork_cloud_cache = self.mesh_loader.create_point_cloud_fork_tip(joint_map)
+                    self.last_joint_hash = joint_hash
+                
+                current_robot_points = self.fork_cloud_cache
             except: pass
 
         # --- 4. DÉTECTION CUBE (SAM 3) ---
@@ -158,6 +169,13 @@ class MergedCloudNode:
                             self.static_cube_cloud = points_world
                             self.cube_locked = True
                             
+                            # Pre-subsample for fast grasp checking (~200 points is enough)
+                            if points_world.shape[0] > 200:
+                                idx = np.random.choice(points_world.shape[0], 200, replace=False)
+                                self.static_cube_cloud_subsampled = points_world[idx]
+                            else:
+                                self.static_cube_cloud_subsampled = points_world
+                            
                             c = np.mean(points_world, axis=0)
                             m = Marker()
                             m.header.frame_id = "world"
@@ -179,7 +197,6 @@ class MergedCloudNode:
         if current_robot_points is not None: merged.append(current_robot_points)
         
         if self.cube_locked and self.static_cube_cloud is not None:
-             # Offset manuel TCP (Calcul vectoriel rapide)
             fork_tip_world_hom = np.dot(T_world_tcp, self.fork_tip_offset_vec)
             fork_tip_pos = fork_tip_world_hom[:3]
             
@@ -189,21 +206,32 @@ class MergedCloudNode:
             self.pub_fork_tip.publish(p_msg)
 
             if not self.is_grasped:
-                # Optimisation: Check sur échantillon réduit
-                cloud_check = self.static_cube_cloud
-                if len(cloud_check) > 500: cloud_check = cloud_check[::5]
-                
-                dists = fork_tip_pos[2] - np.max(cloud_check[:, 2])
-                if dists < self.contact_threshold:
+                # Use subsampled cloud (200 pts instead of thousands)
+                dists = np.linalg.norm(self.static_cube_cloud_subsampled - fork_tip_pos, axis=1)
+                min_dist = np.min(dists)
+                rospy.loginfo_throttle(0.5, f"Fork→food dist: {min_dist:.4f}m")
+
+                if min_dist < self.contact_threshold:
                     self.is_grasped = True
                     self.T_world_tcp_at_grasp = T_world_tcp
                     self.T_tcp_at_grasp_inv = np.linalg.inv(T_world_tcp)
+                    
+                    # Pre-subsample food for post-grasp transform (fewer points to move)
+                    if self.static_cube_cloud.shape[0] > 512:
+                        idx = fpsample.bucket_fps_kdline_sampling(
+                            self.static_cube_cloud.astype(np.float32), 512, h=7)
+                        self.static_cube_cloud = self.static_cube_cloud[idx]
+                    
+                    # Pre-compute homogeneous coords (done once, reused every frame)
+                    ones = np.ones((self.static_cube_cloud.shape[0], 1))
+                    self.food_hom = np.hstack([self.static_cube_cloud, ones])
+                    
+                    rospy.loginfo(f"🍴 GRASP! min_dist={min_dist:.4f}m")
 
             if self.is_grasped:
-                T_motion = np.dot(T_world_tcp, self.T_tcp_at_grasp_inv)
-                ones = np.ones((self.static_cube_cloud.shape[0], 1))
-                pts_hom = np.hstack([self.static_cube_cloud, ones])
-                self.current_cube_cloud = np.dot(T_motion, pts_hom.T).T[:, :3]
+                T_motion = T_world_tcp @ self.T_tcp_at_grasp_inv
+                # Reuse pre-computed homogeneous coords
+                self.current_cube_cloud = (T_motion @ self.food_hom.T).T[:, :3]
             else:
                 self.current_cube_cloud = self.static_cube_cloud
                 
@@ -211,16 +239,12 @@ class MergedCloudNode:
 
         if len(merged) > 0:
             full_cloud = np.vstack(merged)
-            if full_cloud.shape[0] > 1024:
-                # OPTIMISATION: Random Sampling (O(1)) est bien plus rapide que FPS (O(N^2))
-                # Si tu veux de la vitesse pure, décommente la ligne suivante :
-                # indices = np.random.choice(full_cloud.shape[0], 1024, replace=False)
-                
-                # FPS (Plus lent mais plus joli)
-                indices = fpsample.bucket_fps_kdline_sampling(full_cloud.astype(np.float32), 1024, h=7)
+            if full_cloud.shape[0] > 256:
+                # Random sampling is ~100x faster than FPS and fine for real-time
+                indices = np.random.choice(full_cloud.shape[0], 256, replace=False)
                 full_cloud = full_cloud[indices]
                 
-            self.publish_cloud(full_cloud, frame_id="world")
+                self.publish_cloud(full_cloud, frame_id="world")
 
     def run(self):
         rospy.spin()
