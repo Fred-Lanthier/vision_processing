@@ -127,7 +127,7 @@ class FlowMatchingInferenceNodeFork:
         # =====================================================
         # LOAD MODEL
         # =====================================================
-        model_name = rospy.get_param("~model_name", "last_fm_model_high_dim_CFM_relative.ckpt")
+        model_name = rospy.get_param("~model_name", "last_fm_model_high_dim_CFM_relative_dropout.ckpt")
         self.model_path = os.path.join(pkg_path, 'models', model_name)
         
         if not os.path.exists(self.model_path):

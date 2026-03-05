@@ -1,11 +1,21 @@
 """
-Data Loader for Flow Matching - Corrected Version
-==================================================
+Data Loader for Flow Matching — Translation-Centered Version
+=============================================================
 
-Changes from original:
-1. Returns data in dictionary format compatible with LinearNormalizer
-2. Adds get_normalizer() method for proper normalization
-3. Separates 'obs' and 'action' clearly
+Key design choice:
+  - Translation-only centering at fork tip position
+  - Positions centered at (0,0,0), world orientation PRESERVED
+  - Model sees orientation changes throughout trajectory
+
+Why this matters for tool-only point clouds (no robot links):
+  With full SE(3), after grasp the PCD is literally identical every step.
+  With translation-only, the model can see the fork rotating (lifting,
+  tilting toward user, etc.) because world orientation is kept.
+
+The policy becomes:
+  - Position-invariant (doesn't memorize table coordinates)
+  - Gravity-aware (knows which way is up, how tool is oriented)
+  - Robot-agnostic (any robot holding the same tool gets same prediction)
 """
 
 import os
@@ -27,43 +37,11 @@ def seed_everything(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# --- UTILITAIRES (Inchangés) ---
+# --- ROTATION UTILITIES ---
 def rotation_matrix_to_ortho6d(matrices):
     x_raw = matrices[..., 0]
     y_raw = matrices[..., 1]
     return np.concatenate([x_raw, y_raw], axis=-1)
-
-def rotation_6d_to_matrix(d6):
-    d6 = np.array(d6)
-    if d6.ndim == 1: d6 = d6[np.newaxis, :]
-    x_raw = d6[:, 0:3]
-    y_raw = d6[:, 3:6]
-    x = x_raw / np.linalg.norm(x_raw, axis=1, keepdims=True)
-    z = np.cross(x, y_raw)
-    z = z / np.linalg.norm(z, axis=1, keepdims=True)
-    y = np.cross(z, x)
-    matrix = np.stack((x, y, z), axis=2)
-    if matrix.shape[0] == 1: return matrix[0]
-    return matrix
-
-def transform_pose_sequence_to_local(pose_seq_9d, T_world_to_local):
-    # Version optimisée vectorisée (si possible) ou boucle standard
-    # Ici on garde la logique mais on l'appelle une seule fois par item au début
-    local_seq = []
-    R_inv = T_world_to_local[:3, :3]
-    t_inv = T_world_to_local[:3, 3]
-
-    for step in pose_seq_9d:
-        pos_world = step[:3]
-        pos_local = R_inv @ pos_world + t_inv
-        
-        rot_6d_world = step[3:]
-        R_world = rotation_6d_to_matrix(rot_6d_world)
-        R_local = R_inv @ R_world
-        rot_6d_local = rotation_matrix_to_ortho6d(R_local)
-        
-        local_seq.append(np.concatenate([pos_local, rot_6d_local]))
-    return np.array(local_seq, dtype=np.float32)
 
 
 class Robot3DDataset(Dataset):
@@ -104,11 +82,9 @@ class Robot3DDataset(Dataset):
             self.traj_folders = all_traj_folders
 
         print(f"📊 Dataset Mode: {mode.upper()} | Augment: {self.augment}")
-        print("⏳ Prétraitement et mise en cache RAM (One-time cost)...")
+        print("⏳ Preprocessing and caching to RAM (one-time cost)...")
 
-        # ON STOCKE TOUT ICI : Plus de 'trajectory_cache' complexe, juste une liste plate d'échantillons prêts
         self.processed_data = [] 
-        
         MOTION_THRESHOLD = 0.0001
 
         for folder in tqdm(self.traj_folders, desc="Processing Data"):
@@ -116,14 +92,18 @@ class Robot3DDataset(Dataset):
             traj_id = folder_name.split('_')[-1]
             
             json_path = os.path.join(folder, f'trajectory_{traj_id}.json')
-            if not os.path.exists(json_path): json_path = os.path.join(folder, f'trajectory{traj_id}.json')
-            if not os.path.exists(json_path): continue
+            if not os.path.exists(json_path):
+                json_path = os.path.join(folder, f'trajectory{traj_id}.json')
+            if not os.path.exists(json_path):
+                continue
 
-            with open(json_path, 'r') as f: data = json.load(f)
+            with open(json_path, 'r') as f:
+                data = json.load(f)
             states = data.get('states', [])
-            if len(states) == 0: continue
+            if len(states) == 0:
+                continue
 
-            # 1. Chargement brut de toute la trajectoire
+            # 1. Parse full trajectory
             full_traj_poses = []
             full_traj_pcd = []
             raw_positions = []
@@ -140,8 +120,6 @@ class Robot3DDataset(Dataset):
                 pcd_path = os.path.join(folder, f'Merged_Fork_{folder_name}', pcd_name) if pcd_name else None
                 
                 if pcd_path and os.path.exists(pcd_path):
-                    # On ne charge pas tout de suite le PCD pour économiser RAM temporaire
-                    # On le chargera juste au moment du découpage
                     pcd_data = np.load(pcd_path).astype(np.float32)
                 else:
                     pcd_data = np.zeros((self.num_points, 3), dtype=np.float32)
@@ -150,7 +128,7 @@ class Robot3DDataset(Dataset):
                 full_traj_pcd.append(pcd_data)
                 raw_positions.append(pos)
 
-            # 2. Cutoff (Statique)
+            # 2. Cutoff static tail
             raw_positions = np.array(raw_positions)
             final_pos = raw_positions[-1]
             dist_to_end = np.linalg.norm(raw_positions - final_pos, axis=1)
@@ -166,48 +144,49 @@ class Robot3DDataset(Dataset):
             if len(full_traj_poses) < (self.obs_horizon + self.pred_horizon):
                 continue
 
-            # 3. DÉCOUPAGE ET TRANSFORMATION (LE COEUR DE L'OPTIMISATION)
-            # On boucle sur la fenêtre glissante ICI, pas dans __getitem__
+            # 3. Sliding window: precompute every sample
             total_steps = len(full_traj_poses)
             
             for current_idx in range(self.obs_horizon - 1, total_steps - self.pred_horizon + 1):
                 
-                # A. Récupérer les indices
+                # A. Indices
                 obs_indices = list(range(current_idx - self.obs_horizon + 1, current_idx + 1))
                 pred_indices = list(range(current_idx, current_idx + self.pred_horizon))
 
-                # B. Récupérer PCD (Déjà Local)
-                # On fait le sampling ici pour ne stocker que 1024 points (économie RAM)
+                # B. Point cloud (already in local frame from preprocessing)
                 raw_pcd = full_traj_pcd[current_idx]
                 sampled_pcd = self._sample_point_cloud(raw_pcd)
 
-                # C. Récupérer Poses (World)
-                obs_poses_world = np.stack([full_traj_poses[i] for i in obs_indices])
-                action_seq_world = np.stack([full_traj_poses[i] for i in pred_indices])
+                # C. Poses (world frame)
+                obs_poses = np.stack([full_traj_poses[i] for i in obs_indices])
+                action_seq = np.stack([full_traj_poses[i] for i in pred_indices])
 
-                # D. CALCULER LA TRANSFORMATION (Une seule fois !)
-                current_pose_9d = obs_poses_world[-1]
-                curr_pos = current_pose_9d[:3]
-                curr_rot_6d = current_pose_9d[3:]
-                
-                R_curr = rotation_6d_to_matrix(curr_rot_6d)
-                T_world_to_curr = np.eye(4)
-                T_world_to_curr[:3, :3] = R_curr
-                T_world_to_curr[:3, 3] = curr_pos
-                T_world_to_local = np.linalg.inv(T_world_to_curr)
+                # D. TRANSLATION-ONLY CENTERING
+                # Subtract current fork-tip position from all positions.
+                # Rotations (dims 3:9) stay in WORLD frame — untouched.
+                #
+                # After this:
+                #   obs[-1, :3]     = [0, 0, 0]   (current pos is origin)
+                #   obs[-2, :3]     = relative displacement (velocity info)
+                #   action[:, :3]   = relative displacements from current pos
+                #   obs[:, 3:9]     = world-frame rotations (VARYING signal)
+                #   action[:, 3:9]  = world-frame rotations (VARYING signal)
+                curr_pos = obs_poses[-1, :3].copy()
 
-                # E. APPLIQUER LA TRANSFORMATION
-                obs_poses_local = transform_pose_sequence_to_local(obs_poses_world, T_world_to_local)
-                action_seq_local = transform_pose_sequence_to_local(action_seq_world, T_world_to_local)
+                obs_poses_centered = obs_poses.copy()
+                obs_poses_centered[:, :3] -= curr_pos
 
-                # F. STOCKER LE RÉSULTAT FINAL PRÊT À L'EMPLOI
+                action_seq_centered = action_seq.copy()
+                action_seq_centered[:, :3] -= curr_pos
+
+                # E. Store ready-to-use sample
                 self.processed_data.append({
-                    'pcd': sampled_pcd,          # (1024, 3)
-                    'obs': obs_poses_local,      # (2, 9)
-                    'act': action_seq_local      # (16, 9)
+                    'pcd': sampled_pcd,              # (num_points, 3)
+                    'obs': obs_poses_centered,       # (obs_horizon, 9)
+                    'act': action_seq_centered,      # (pred_horizon, 9)
                 })
 
-        print(f"✅ {len(self.processed_data)} échantillons pré-calculés en RAM.\n")
+        print(f"✅ {len(self.processed_data)} samples pre-computed in RAM.\n")
 
     def __len__(self):
         return len(self.processed_data)
@@ -219,18 +198,21 @@ class Robot3DDataset(Dataset):
         obs = sample['obs']
         act = sample['act']
 
-        # Seule l'augmentation reste ici (car elle doit être aléatoire à chaque époque)
         if self.augment:
-             # Copie pour ne pas modifier la donnée en cache
-             pcd = pcd.copy()
-             pcd, obs, act = self._apply_augmentation(pcd, obs, act)
+            pcd = pcd.copy()
+            obs = obs.copy()
+            act = act.copy()
+            pcd, obs, act = self._apply_augmentation(pcd, obs, act)
+            if random.random() < 0.5:
+                # On met à zéro les colonnes 3 à 9 (les rotations 6D)
+                obs[:, 3:] = 0.0
         
         data_dict = {
             'obs': {
-                'point_cloud': torch.from_numpy(pcd).float(),  # (N, 3)
-                'agent_pos': torch.from_numpy(obs).float(),      # (obs_horizon, 9)
+                'point_cloud': torch.from_numpy(pcd).float(),
+                'agent_pos': torch.from_numpy(obs).float(),
             },
-            'action': torch.from_numpy(act).float()  # (pred_horizon, 9)
+            'action': torch.from_numpy(act).float(),
         }
         
         return data_dict
@@ -246,106 +228,71 @@ class Robot3DDataset(Dataset):
                 indices = np.concatenate([indices, extra_indices])
             return pc[indices].astype(np.float32)
         
-        # Random sampling (you could use FPS for better coverage)
         indices = np.random.choice(pc.shape[0], self.num_points, replace=False)
         return pc[indices].astype(np.float32)
 
     def _apply_augmentation(self, pcd, obs_poses, action_seq):
-        """ =====================================================
-        1. Random rotation around Z-axis (±15 degrees)
-        =====================================================
-        For a tabletop task, gravity (z) is fixed, but the 
-        plate/food orientation around z can vary.
-        
-        The rotation matrix R_z(θ) is:
-          [cos θ  -sin θ  0]
-          [sin θ   cos θ  0]
-          [  0       0    1]
-        
-        We apply it to:
-          - point cloud positions (N, 3)
-          - pose positions (dims 0:3)
-          - pose 6D rotation (dims 3:9), which are the first two 
-            columns of the 3x3 rotation matrix. If original is M,
-            augmented is R @ M, so each column gets multiplied by R.
         """
-        theta = np.random.uniform(-np.pi/12, np.pi/12)  # ±15°
+        Augmentation for translation-centered data.
+        
+        Since rotations are in WORLD frame, we can only augment with
+        rotations around Z (gravity axis) — physically valid because
+        "rotating the whole scene around gravity" is a valid
+        transformation for a tabletop task.
+        """
+        # 1. Random Z-rotation (±15°)
+        theta = np.random.uniform(-np.pi/12, np.pi/12)
         c, s = np.cos(theta), np.sin(theta)
         R_z = np.array([[c, -s, 0],
                         [s,  c, 0],
                         [0,  0, 1]], dtype=np.float32)
         
-        # Rotate point cloud: (N, 3) @ R_z.T = (N, 3)
         pcd = pcd @ R_z.T
         
-        # Rotate poses (obs and actions)
         for poses in [obs_poses, action_seq]:
-            # Position: dims 0:3
-            poses[:, :3] = (poses[:, :3] @ R_z.T)
-            # 6D rotation: dims 3:6 = column 1, dims 6:9 = column 2
-            poses[:, 3:6] = (poses[:, 3:6] @ R_z.T)
-            poses[:, 6:9] = (poses[:, 6:9] @ R_z.T)
+            poses[:, :3]  = poses[:, :3]  @ R_z.T   # Positions
+            poses[:, 3:6] = poses[:, 3:6] @ R_z.T   # Rot col 1
+            poses[:, 6:9] = poses[:, 6:9] @ R_z.T   # Rot col 2
         
-        # =====================================================
-        # 2. Global translation shift (±1cm)
-        # =====================================================
-        shift = np.random.uniform(low=-0.01, high=0.01, size=(1, 3)).astype(np.float32)
-        
-        pcd = pcd + shift
+        # 2. Translation jitter (±1cm)
+        shift = np.random.uniform(-0.01, 0.01, size=(1, 3)).astype(np.float32)
+        pcd += shift
         obs_poses[:, :3] += shift
         action_seq[:, :3] += shift
 
-        # =====================================================
-        # 3. Point cloud jitter (±5mm sensor noise)
-        # =====================================================
-        noise = np.random.randn(*pcd.shape).astype(np.float32) * 0.005
-        noise = np.clip(noise, -0.01, 0.01)
-        pcd = pcd + noise
+        # 3. PCD sensor noise (±5mm)
+        noise = np.clip(np.random.randn(*pcd.shape).astype(np.float32) * 0.005, -0.01, 0.01)
+        pcd += noise
 
         return pcd, obs_poses, action_seq
 
     def get_normalizer(self):
-        """
-        Compute normalizer statistics from the dataset.
-        This is called once before training to set up normalization.
-        
-        Returns a LinearNormalizer that handles:
-        - obs['point_cloud']: normalized point clouds
-        - obs['agent_pos']: normalized robot states  
-        - action: normalized actions
-        """
         from normalizer import LinearNormalizer
         
-        # Collect all data for statistics
         all_point_clouds = []
         all_agent_pos = []
         all_actions = []
         
         print("📊 Computing normalization statistics...")
-        for idx in range(min(len(self), 5000)):  # Sample up to 5000 for efficiency
+        for idx in range(min(len(self), 5000)):
             sample = self[idx]
             all_point_clouds.append(sample['obs']['point_cloud'])
             all_agent_pos.append(sample['obs']['agent_pos'])
             all_actions.append(sample['action'])
         
-        # Stack into tensors
-        all_point_clouds = torch.stack(all_point_clouds)  # (N, num_points, 3)
-        all_agent_pos = torch.stack(all_agent_pos)        # (N, obs_horizon, 9)
-        all_actions = torch.stack(all_actions)            # (N, pred_horizon, 9)
+        all_point_clouds = torch.stack(all_point_clouds)
+        all_agent_pos = torch.stack(all_agent_pos)
+        all_actions = torch.stack(all_actions)
         
-        # Create normalizer
         normalizer = LinearNormalizer()
-        
-        # Fit on data
-        # For point clouds: normalize per-dimension (x, y, z)
         normalizer.fit(
             data={
                 'point_cloud': all_point_clouds,
                 'agent_pos': all_agent_pos,
                 'action': all_actions
             },
-            last_n_dims=1,  # Normalize last dimension (features)
-            mode='limits',  # Scale to [-1, 1]
+            last_n_dims=1,
+            mode='limits',
             output_max=1.0,
             output_min=-1.0
         )
@@ -353,37 +300,15 @@ class Robot3DDataset(Dataset):
         print("✅ Normalizer fitted!")
         return normalizer
 
-    def get_validation_dataset(self):
-        """Return validation split of the dataset."""
-        return Robot3DDataset(
-            root_dir=self.root_dir,
-            mode='val',
-            val_ratio=0.1,
-            seed=self.seed,
-            num_points=self.num_points,
-            pred_horizon=self.pred_horizon,
-            obs_horizon=self.obs_horizon,
-            action_horizon=self.action_horizon,
-            augment=False  # No augmentation for validation
-        )
-
 
 # Custom collate function for nested dictionaries
 def custom_collate_fn(batch):
-    """
-    Collate function that handles nested dictionaries.
-    """
     result = {}
-    
-    # Handle 'obs' dictionary
     obs_keys = batch[0]['obs'].keys()
     result['obs'] = {}
     for key in obs_keys:
         result['obs'][key] = torch.stack([item['obs'][key] for item in batch])
-    
-    # Handle 'action'
     result['action'] = torch.stack([item['action'] for item in batch])
-    
     return result
 
 
@@ -395,16 +320,24 @@ if __name__ == "__main__":
         pkg_path = rospack.get_path('vision_processing')
         data_path = os.path.join(pkg_path, 'datas', 'Trajectories_preprocess')
         
-        print(f"Testing dataset loading from: {data_path}")
+        print(f"Testing: {data_path}")
         dataset = Robot3DDataset(root_dir=data_path, pred_horizon=16, obs_horizon=2)
         print(f"Dataset length: {len(dataset)}")
         
         if len(dataset) > 0:
             sample = dataset[0]
-            print("\nSample structure:")
-            print(f"  obs['point_cloud'] shape: {sample['obs']['point_cloud'].shape}")
-            print(f"  obs['agent_pos'] shape: {sample['obs']['agent_pos'].shape}")
-            print(f"  action shape: {sample['action'].shape}")
+            print(f"\nSample structure:")
+            print(f"  obs['point_cloud']: {sample['obs']['point_cloud'].shape}")
+            print(f"  obs['agent_pos']:   {sample['obs']['agent_pos'].shape}")
+            print(f"  action:             {sample['action'].shape}")
+            
+            # Verify current pose is at origin
+            curr_pos = sample['obs']['agent_pos'][-1, :3]
+            print(f"\n  Current position (should be ~0): {curr_pos.numpy()}")
+            
+            # Verify rotation is NOT identity (world frame preserved)
+            curr_rot = sample['obs']['agent_pos'][-1, 3:]
+            print(f"  Current rotation 6D (should NOT be [1,0,0,0,1,0]): {curr_rot.numpy()}")
             
     except Exception as e:
-        print(f"Error during test: {e}")
+        print(f"Error: {e}")

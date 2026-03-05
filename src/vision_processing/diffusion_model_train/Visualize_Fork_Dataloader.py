@@ -243,76 +243,6 @@ def plot_3d_trajectory(traj_data, save_path=None):
         plt.show()
     plt.close()
 
-
-# ============================================================
-# PLOT 3: Animated PCD (fork local frame, as your model sees it)
-# ============================================================
-
-def animate_pcd_local_frame(traj_data, step_skip=5, save_path=None):
-    """
-    Animated GIF of the merged point clouds in fork-local frame.
-    This is what your Flow Matching model actually sees as input.
-    
-    Before grasp: food should be moving (fork approaches food)
-    After grasp:  food should be roughly static relative to fork
-    """
-    pcd_files = traj_data['pcd_files']
-    grasp_idx = traj_data['grasp_idx']
-    
-    # Subsample frames for speed
-    frame_indices = list(range(0, len(pcd_files), step_skip))
-    if not frame_indices:
-        print("  ⚠️ No PCD files found.")
-        return
-    
-    # Load first to get bounds
-    first_pcd = np.load(pcd_files[0])
-    
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    def update(frame_num):
-        ax.clear()
-        file_idx = frame_indices[frame_num]
-        pcd = np.load(pcd_files[file_idx])
-        
-        # Extract step number from filename
-        step_str = os.path.basename(pcd_files[file_idx]).split('.')[0].split('_')[-1]
-        step_idx = int(step_str) - 1
-        
-        # Color by phase
-        phase = "AFTER GRASP (food attached)" if step_idx >= grasp_idx else "BEFORE GRASP (approaching)"
-        color = 'red' if step_idx >= grasp_idx else 'blue'
-        
-        # Plot points (subsample for speed)
-        ax.scatter(pcd[::2, 0], pcd[::2, 1], pcd[::2, 2], s=1, c=color, alpha=0.5)
-        
-        # Fork origin in local frame is always (0,0,0)
-        ax.scatter(0, 0, 0, s=100, c='green', marker='o', label='Fork tip (origin)')
-        
-        # Fixed view bounds (fork-local frame is centered, so bounds are symmetric)
-        lim = 0.3
-        ax.set_xlim(-lim, lim)
-        ax.set_ylim(-lim, lim)
-        ax.set_zlim(-lim, lim)
-        
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title(f"{traj_data['folder_name']} — Step {step_idx} | {phase}")
-        ax.legend(loc='upper left', fontsize=8)
-        return []
-    
-    anim = FuncAnimation(fig, update, frames=len(frame_indices), interval=200, blit=False)
-    
-    if save_path:
-        anim.save(save_path, writer=PillowWriter(fps=5))
-        print(f"  🎬 Saved: {save_path}")
-    else:
-        plt.show()
-    plt.close()
-
-
 # ============================================================
 # MAIN
 # ============================================================
@@ -363,14 +293,6 @@ def main():
             traj_data, 
             save_path=os.path.join(output_dir, f'{folder_name}_trajectory_3d.png')
         )
-        
-        # Plot 3: Animated PCD (only if files exist)
-        if traj_data['pcd_files']:
-            animate_pcd_local_frame(
-                traj_data,
-                step_skip=10,
-                save_path=os.path.join(output_dir, f'{folder_name}_pcd_anim.gif')
-            )
     
     print(f"\n✅ All visualizations saved to: {output_dir}")
 

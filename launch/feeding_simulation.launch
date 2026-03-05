@@ -1,0 +1,136 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="arm_id" default="panda"/>
+  <arg name="paused" default="false"/>
+
+  <!-- ============================================ -->
+  <!-- GAZEBO                                        -->
+  <!-- ============================================ -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="gui" value="true"/>
+    <arg name="use_sim_time" value="true"/>
+  </include>
+
+  <!-- ============================================ -->
+  <!-- TABLE                                         -->
+  <!-- Static, spawned at floor level.               -->
+  <!-- Surface at z = 0.75m.                         -->
+  <!-- Centered at x=0.3 so robot is near back edge  -->
+  <!-- and food area is toward the front.             -->
+  <!-- ============================================ -->
+  <param name="table_description"
+         textfile="$(find vision_processing)/urdf/table.urdf"/>
+
+  <node name="spawn_table" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -model table -param table_description
+              -x 0.3 -y 0.0 -z 0.0"/>
+
+  <!-- ============================================ -->
+  <!-- ROBOT (Panda + Fork + Cameras)                -->
+  <!-- Spawned at table surface height (z=0.75)      -->
+  <!-- so that "world" frame = table surface.        -->
+  <!-- ============================================ -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro arm_id:=$(arg arm_id)"/>
+
+  <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+        args="-param robot_description
+              -urdf
+              -model panda
+              -z 0.75
+              -J panda_joint1 -0.000059
+              -J panda_joint2 -0.125928
+              -J panda_joint3  0.000117
+              -J panda_joint4 -2.193312
+              -J panda_joint5 -0.000251
+              -J panda_joint6  2.064780
+              -J panda_joint7  0.785511"/>
+
+  <!-- ============================================ -->
+  <!-- FOOD CUBE                                     -->
+  <!-- On table surface, in front of robot.          -->
+  <!-- z = 0.75 (table) + 0.025 (half cube)          -->
+  <!-- ============================================ -->
+  <param name="food_description"
+         textfile="$(find vision_processing)/urdf/food.urdf"/>
+
+  <node name="spawn_food" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -param food_description -model food_cube
+              -x 0.5 -y 0.0 -z 0.775"/>
+
+  <!-- ============================================ -->
+  <!-- PERSON (seated across the table)              -->
+  <!-- Facing the robot (rotated 180° around Z).     -->
+  <!-- mouth_link TF will be available via           -->
+  <!-- person_state_publisher below.                 -->
+  <!-- ============================================ -->
+  <param name="person_description"
+         textfile="$(find vision_processing)/urdf/person_seated.urdf"/>
+
+  <node name="spawn_person" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -model person -param person_description
+              -x 0.3 -y 0.70 -z 0.0
+              -R 0 -P 0 -Y -1.5708"/>
+
+  <!-- Publish person TF tree so mouth_link is available -->
+  <node name="person_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher">
+    <remap from="robot_description" to="person_description"/>
+    <param name="tf_prefix" value="person"/>
+  </node>
+
+  <!-- ============================================ -->
+  <!-- MOCK FACE DETECTION (for simulation)          -->
+  <!-- Reads person/mouth_link TF, publishes on      -->
+  <!-- /face_detection/mouth_position                -->
+  <!-- In real life, replace with face_detection_ros -->
+  <!-- ============================================ -->
+  <node name="mock_face_detection" pkg="vision_processing" type="mock_face_detection.py"
+        output="screen">
+    <param name="mouth_frame" value="person/mouth_link"/>
+    <param name="rate" value="10"/>
+  </node>
+
+  <!-- ============================================ -->
+  <!-- ROBOT STATE + CONTROLLERS                     -->
+  <!-- ============================================ -->
+  <node name="joint_state_publisher" pkg="joint_state_publisher" type="joint_state_publisher">
+    <param name="use_gui" value="false"/>
+    <rosparam param="source_list">[/joint_states]</rosparam>
+    <rosparam>
+      zeros:
+        panda_finger_joint1: 0.0
+        panda_finger_joint2: 0.0
+    </rosparam>
+  </node>
+
+  <rosparam file="$(find vision_processing)/config/simple_controllers.yaml" command="load"/>
+
+  <node name="controller_spawner" pkg="controller_manager" type="spawner"
+        respawn="false" output="screen"
+        args="joint_state_controller joint_group_position_controller"/>
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"
+        respawn="true" output="screen"/>
+
+  <node name="franka_state_camera_reader"
+        pkg="vision_processing" type="franka_state_camera_reader"
+        respawn="true" output="screen"/>
+
+  <node name="sam3_server" pkg="vision_processing" type="sam3_server.py"
+        respawn="true" output="screen"/>
+  <!-- ============================================ -->
+  <!-- MOVEIT                                        -->
+  <!-- ============================================ -->
+  <include file="$(find panda_moveit_config)/launch/planning_context.launch">
+    <arg name="load_robot_description" value="false"/>
+  </include>
+
+  <include file="$(find panda_moveit_config)/launch/move_group.launch">
+    <arg name="allow_trajectory_execution" value="true"/>
+    <arg name="moveit_controller_manager" value="simple"/>
+    <arg name="info" value="true"/>
+    <arg name="load_robot_description" value="false"/>
+  </include>
+
+</launch>

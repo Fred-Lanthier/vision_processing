@@ -712,10 +712,10 @@ def train_flow_matching(
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             history['best_val_loss'] = best_val_loss
-            save_name = "best_fm_model_high_dim_CFM_relative.ckpt"
+            save_name = "best_fm_model_high_dim_CFM_relative_dropout.ckpt"
             print("Saved Best EMA Model")
         else:
-            save_name = "last_fm_model_high_dim_CFM_relative.ckpt"
+            save_name = "last_fm_model_high_dim_CFM_relative_dropout.ckpt"
             print("Saved Last EMA Model")
 
         torch.save({

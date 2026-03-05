@@ -9,6 +9,10 @@ import time
 import tempfile
 import os
 import json
+import torch
+from PIL import Image
+from sam3.model_builder import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
 
 class GenerateSDF:
     """
@@ -26,13 +30,24 @@ class GenerateSDF:
         SDF > 0 : Outside (safe)
     """
     
-    def __init__(self, depth_map=None, intrinsics=None):
-        self.depth_map = depth_map
+    def __init__(self, depth_map_complete=None, image_path=None, intrinsics=None):
+        # Segmentation de la depth map
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"⏳ Chargement du modèle SAM 3 (Native) sur {self.device}...")
+        
+        self.model = build_sam3_image_model()
+        if hasattr(self.model, "to"):
+            self.model.to(self.device)
+            
+        self.processor = Sam3Processor(self.model, confidence_threshold=0.1)
+        print("✅ Modèle chargé avec succès.")
+
+        # Paramètres de la caméra
+        self.depth_map_complete = depth_map_complete
+        self.image_path = image_path
         self.intrinsics = intrinsics
         self.point_cloud_xyz = None
-        
-        if depth_map is not None:
-            self.point_cloud_xyz = self._convert_depth_to_xyz()
+        self.depth_map = None
         
         # Intermediate mesh (PyVista) - Single layer only
         self.surface_mesh = None
@@ -47,7 +62,14 @@ class GenerateSDF:
     
     @classmethod
     def from_file(cls, path):
-        instance = cls()
+        instance = cls.__new__(cls)
+        instance.sdf_grid = None
+        instance.surface_mesh = None
+        instance.bounds_min = None
+        instance.bounds_max = None
+        instance.voxel_size = None
+        instance.n_voxels = None
+        instance.virtual_radius = 0.0  # Stores the radius used for calculation
         instance.load(path)
         return instance
     
@@ -55,7 +77,7 @@ class GenerateSDF:
     # PIPELINE
     # =========================================================
     
-    def run_pipeline(self, thickness_mm=2.0, target_faces=10000, sdf_resolution=250,
+    def run_pipeline(self, object_list, thickness_mm=2.0, target_faces=10000, sdf_resolution=250,
                      save_meshes=True, output_dir="."):
         """
         Run the pipeline: Depth -> Surface -> SDF (Virtual Thickness)
@@ -66,28 +88,36 @@ class GenerateSDF:
         
         t_start = time.time()
         
-        # Step 1: Poisson reconstruction
+        # Step 1: SAM 3 Segmentation
+        self.process_object_list(object_list)
+        self.cleanup()
+        if self.depth_map is None:
+            print("❌ Erreur : La profondeur n'a pas été calculée.")
+            return
+        # Step 2: Convert depth map to point cloud
+        self._convert_depth_to_xyz()
+        # Step 3: Poisson reconstruction
         self._generate_surface_reconstruction()
         if save_meshes:
             path = os.path.join(output_dir, "01_surface_raw.obj")
             self.surface_mesh.save(path)
             print(f"   💾 Saved: {path}")
         
-        # Step 2: Polish (hole repair, smooth, decimate)
+        # Step 4: Polish (hole repair, smooth, decimate)
         self._polish_mesh(target_faces=target_faces)
         if save_meshes:
             path = os.path.join(output_dir, "02_surface_polished.obj")
             self.surface_mesh.save(path)
             print(f"   💾 Saved: {path}")
         
-        # Step 3: PCA Align
+        # Step 5: PCA Align
         self._pca_align()
         if save_meshes:
             path = os.path.join(output_dir, "03_surface_aligned.obj")
             self.surface_mesh.save(path)
             print(f"   💾 Saved: {path}")
         
-        # Step 4: Compute SDF (Virtual Thickness)
+        # Step 6: Compute SDF (Virtual Thickness)
         # We want total thickness of X mm, so we expand X/2 mm in every direction
         radius_mm = thickness_mm / 2.0
         self._compute_sdf(resolution=sdf_resolution, virtual_radius_mm=radius_mm)
@@ -99,8 +129,103 @@ class GenerateSDF:
         print(f"   SDF grid shape: {self.sdf_grid.shape}")
         print("=" * 60)
     
+    def process_object_list(self, object_list):
+
+        if not os.path.exists(self.image_path):
+            print(f"❌ Erreur : L'image {self.image_path} n'existe pas.")
+            return
+
+        print(f"📸 Chargement de l'image : {self.image_path}")
+        image_pil = Image.open(self.image_path).convert("RGB")
+        
+        # Initialisation SAM 3
+        inference_state = self.processor.set_image(image_pil)
+
+        cmap = plt.get_cmap("hsv")
+        colors = [cmap(i / (len(object_list) + 1))[:3] for i in range(len(object_list))]
+
+        print(f"🍽️  Analyse de la liste : {object_list}")
+        print("-" * 40)
+
+        best_output = None
+        best_score = -1.0
+        
+        for i, object_name in enumerate(object_list):
+            start = time.time()
+            color_rgb = tuple(int(c * 255) for c in colors[i])
+
+            print(f"   👉 Recherche de : '{object_name}' (Couleur ID: {color_rgb})")
+
+            try:
+                output = self.processor.set_text_prompt(state=inference_state, prompt=object_name)
+                top_score = output["scores"].max().item()
+                if top_score > best_score:
+                    best_output = output
+                    best_score = top_score
+                
+                print(f"      🔢 Score : {top_score:.4f}")
+
+                masks = output["masks"]
+                
+                if masks is not None:
+                    # Conversion Tensor -> Numpy
+                    if isinstance(masks, torch.Tensor):
+                        masks = masks.detach().cpu().numpy()
+                    
+                    if masks.size == 0 or not np.any(masks):
+                        print(f"      ⚠️ Aucun pixel trouvé pour '{object_name}'")
+                        continue
+
+                    # --- COMPTAGE SUPER SIMPLE ---
+                    # Si le tableau est en 3D (N, H, W), len(masks) donne N.
+                    # Si le tableau est en 2D (H, W), c'est qu'il y a 1 seul masque.
+                    if masks.ndim > 2:
+                        count = len(masks) # C'est ça que tu voulais
+                    else:
+                        count = 1
+                    
+                    print(f"      🔢 Nombre de masques (len) : {count}")
+
+                    # --- Fusion pour l'affichage ---
+                    # On doit quand même combiner les masques pour l'affichage visuel
+                    if masks.ndim > 2:
+                        # On aplatit pour l'image (N, H, W) -> (H, W)
+                        scores = output["scores"].cpu().numpy()
+                        max_score_idx = np.argmax(scores)
+                        combined_mask = masks[max_score_idx] > 0
+                    else:
+                        combined_mask = masks > 0
+                    
+                    print(f"      ✅ Masques appliqués.")
+                    print(f"      ⏱️ Temps écoulé : {time.time() - start:.2f} secondes")
+                    print("-" * 20)
+
+                else:
+                    print(f"      ⚠️ Retour vide pour '{object_name}'")
+
+            except Exception as e:
+                print(f"      ❌ Erreur critique sur '{object_name}': {e}")
+
+        # Sauvegarde
+        best_mask = self.get_best_mask(best_output)
+        self.depth_map = (self.depth_map_complete * best_mask).squeeze()
+
+    def get_best_mask(self, output):
+        masks = output["masks"].cpu().numpy()
+        if masks.ndim > 2:
+            scores = output["scores"].cpu().numpy()
+            return masks[np.argmax(scores)]
+        return masks
+    
     def cleanup(self):
+        import gc
         self.surface_mesh = None
+        if hasattr(self, 'model'):
+            del self.model
+        if hasattr(self, 'processor'):
+            del self.processor
+        gc.collect()                  # force Python to actually free the objects
+        torch.cuda.empty_cache()
     
     def _convert_depth_to_xyz(self):
         rows, cols = self.depth_map.shape
@@ -123,7 +248,7 @@ class GenerateSDF:
         z = z_valid
 
         xyz = np.vstack((x, y, z)).transpose()
-        return xyz.astype(np.float64)
+        self.point_cloud_xyz = xyz.astype(np.float64)
 
     def _generate_surface_reconstruction(self):
         print("\n[1/3] Surface Reconstruction (Poisson)")
@@ -144,25 +269,13 @@ class GenerateSDF:
         )
 
         # --- FIX 1: DENSITY REMOVAL ---
-        # The sides have low density because the camera missed them. 
-        # By removing low density, we delete the walls.
-        # We lower the threshold drastically (or comment it out entirely).
-        
-        # OLD: vertices_to_remove = densities < np.quantile(densities, 0.02)
-        # NEW: Lower threshold to keep more "interpolated" areas
         vertices_to_remove = densities < np.quantile(densities, 0.005) 
         mesh.remove_vertices_by_mask(vertices_to_remove)
         
         # --- FIX 2: DISTANCE THRESHOLD ---
-        # This deletes mesh parts that are too far from original depth points.
-        # Since the camera missed the sides, the "reconstructed" side is far from any point.
-        # We increase this tolerance so the sides are not deleted.
-        
         pcd_tree = o3d.geometry.KDTreeFlann(pcd)
         vertices = np.asarray(mesh.vertices)
         
-        # OLD: dist_threshold = 0.006 (6mm) -> Too strict for missing sides
-        # NEW: dist_threshold = 0.02 (20mm) -> Allows interpolation up to 2cm
         dist_threshold = 0.02 
         
         points_to_keep = []
@@ -398,140 +511,26 @@ class GenerateSDF:
         self.n_voxels = data['n_voxels']
         self.virtual_radius = float(data['virtual_radius']) if 'virtual_radius' in data else 0.0
 
-    # =========================================================
-    # VISUALIZATION (Corrected for Virtual Thickness)
-    # =========================================================
-    
-    def visualize_slice(self, slice_axis='z', slice_value=None, resolution=100, 
-                        extent=0.0, save_path='sdf_slice.png'):
-        """
-        Visualize SDF slice.
-        - Black Line: The collision boundary (SDF=0)
-        - Dashed Line: The original surface (SDF = -radius)
-        """
-        if self.sdf_grid is None: raise RuntimeError("SDF not computed.")
-        
-        center = (self.bounds_min + self.bounds_max) / 2
-        if slice_value is None:
-            slice_value = center[{'x':0,'y':1,'z':2}[slice_axis]]
-            
-        # Generate grid for slice
-        if slice_axis == 'z':
-            a1 = np.linspace(self.bounds_min[0]-extent, self.bounds_max[0]+extent, resolution)
-            a2 = np.linspace(self.bounds_min[1]-extent, self.bounds_max[1]+extent, resolution)
-            A1, A2 = np.meshgrid(a1, a2)
-            pts = np.stack([A1.ravel(), A2.ravel(), np.full_like(A1.ravel(), slice_value)], axis=1)
-            xlabel, ylabel = 'X', 'Y'
-        elif slice_axis == 'y':
-            a1 = np.linspace(self.bounds_min[0]-extent, self.bounds_max[0]+extent, resolution)
-            a2 = np.linspace(self.bounds_min[2]-extent, self.bounds_max[2]+extent, resolution)
-            A1, A2 = np.meshgrid(a1, a2)
-            pts = np.stack([A1.ravel(), np.full_like(A1.ravel(), slice_value), A2.ravel()], axis=1)
-            xlabel, ylabel = 'X', 'Z'
-        else:
-            a1 = np.linspace(self.bounds_min[1]-extent, self.bounds_max[1]+extent, resolution)
-            a2 = np.linspace(self.bounds_min[2]-extent, self.bounds_max[2]+extent, resolution)
-            A1, A2 = np.meshgrid(a1, a2)
-            pts = np.stack([np.full_like(A1.ravel(), slice_value), A1.ravel(), A2.ravel()], axis=1)
-            xlabel, ylabel = 'Y', 'Z'
-            
-        d, _ = self.query(pts)
-        D = d.reshape(resolution, resolution)
-        
-        plt.figure(figsize=(10, 8))
-        
-        # Color Map
-        # Red = Inside (Collision), Blue = Outside (Safe)
-        max_val = np.max(np.abs(D))
-        plt.contourf(A1, A2, D, levels=50, cmap='RdBu', vmin=-max_val, vmax=max_val)
-        plt.colorbar(label='Signed Distance (m)')
-        
-        # SOLID LINE: The Effective Collision Boundary (SDF = 0)
-        # Anything crossing this line is a collision.
-        plt.contour(A1, A2, D, levels=[0], colors='black', linewidths=2.5)
-        
-        # DASHED LINE: The Real Object Surface (SDF = -radius)
-        # This shows where the actual mesh is deep inside the safety bubble.
-        if self.virtual_radius > 0:
-            plt.contour(A1, A2, D, levels=[-self.virtual_radius], 
-                       colors='black', linestyles='dashed', linewidths=1)
-            
-        plt.title(f"SDF Slice ({slice_axis}={slice_value:.3f})\nThick Line=Safety Boundary | Dashed=Actual Surface")
-        plt.xlabel(f"{xlabel} (m)")
-        plt.ylabel(f"{ylabel} (m)")
-        plt.axis('equal')
-        plt.savefig(save_path)
-        print(f"Saved visualization: {save_path}")
-        plt.show()
-
-    def visualize_zone_3d(self):
-        """
-        Visualizes the 3D 'No-Go Zone' (SDF <= 0) as a red translucent shell.
-        """
-        if self.sdf_grid is None: 
-            raise RuntimeError("SDF not computed.")
-        
-        print("\nVisualizing 3D No-Go Zone...")
-        
-        # 1. Create a PyVista Grid matching our data
-        grid = pv.ImageData()
-        grid.dimensions = self.n_voxels
-        grid.origin = self.bounds_min
-        grid.spacing = (self.voxel_size, self.voxel_size, self.voxel_size)
-        
-        # 2. Fill it with our SDF data
-        # 'F' order flattening matches the (nx, ny, nz) structure of our numpy array
-        grid.point_data["SDF"] = self.sdf_grid.flatten(order="F") 
-        
-        p = pv.Plotter()
-        
-        # 3. Extract and Plot the "No Go Boundary" (SDF = 0)
-        try:
-            # Generate the 3D surface where SDF is exactly 0
-            collision_shell = grid.contour(isosurfaces=[0.0])
-            
-            # Plot as a Red, translucent shell
-            p.add_mesh(collision_shell, color="red", opacity=0.4, 
-                       label="No-Go Zone (Virtual Wall)")
-        except Exception as e:
-            print(f"Could not generate No-Go shell: {e}")
-
-        # 4. (Optional) Show the "Real" thin surface inside for comparison
-        # The real surface is located at SDF = -radius
-        if self.virtual_radius > 0:
-            try:
-                real_surface = grid.contour(isosurfaces=[-self.virtual_radius])
-                p.add_mesh(real_surface, color="white", style='wireframe', 
-                           label="Actual Object Surface")
-            except:
-                pass
-
-        p.add_axes()
-        p.add_legend()
-        p.show()
-        p.screenshot("sdf_3d.png")
 # ===========================================
 # MAIN EXECUTION
 # ===========================================
 if __name__ == "__main__":
-    depth_path = "Images_Test/resultat_depth_mask.npy"
+    depth_path = "Images_Test/depth_map.npy"
+    image_path = "Images_Test/image_rgb.png"
     intrinsics_path = "Images_Test/intrinsics.json"
-    
-    if os.path.exists(depth_path):
+    LIST_OBJECTS = ["Bowl", "Plate", "Shallow bowl", "Shallow plate"]
+
+    if not os.path.exists("Images_Test/sdf_field.npz"):
         depth_map = np.load(depth_path)
         with open(intrinsics_path, 'r') as f:
             intrinsics = json.load(f)
-        
-        sdf = GenerateSDF(depth_map, intrinsics)
+        sdf = GenerateSDF(depth_map, image_path, intrinsics)
         
         # NOTE: thickness_mm is now the TOTAL virtual thickness
-        sdf.run_pipeline(thickness_mm=2.0, target_faces=10000, sdf_resolution=200)
+        sdf.run_pipeline(thickness_mm=2.0, object_list=LIST_OBJECTS, target_faces=10000, sdf_resolution=400)
         
         sdf.save("Images_Test/sdf_field.npz")
-        sdf.visualize_zone_3d()
-        sdf.visualize_slice(slice_axis='y', resolution=500)
         sdf.cleanup()
         
     elif os.path.exists("Images_Test/sdf_field.npz"):
         sdf = GenerateSDF.from_file("Images_Test/sdf_field.npz")
-        sdf.visualize_slice(slice_axis='y', resolution=100)

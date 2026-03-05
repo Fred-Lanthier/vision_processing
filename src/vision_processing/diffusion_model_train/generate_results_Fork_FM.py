@@ -8,12 +8,72 @@ import json
 import pandas as pd
 from tqdm import tqdm
 import rospkg
-import seaborn as sns
 import time
 
 # Import Flow Matching model and data loader
 from Train_Fork_FM import FlowMatchingAgent, Normalizer, compute_dataset_stats, custom_collate_fn
 from Data_Loader_Fork_FM import Robot3DDataset
+
+# ==============================================================================
+# 0. UNIFIED STYLE CONFIG
+# ==============================================================================
+
+STYLE = {
+    # Colors
+    'gt_color':       '#2ecc71',   # Green for ground truth
+    'pred_color':     '#e74c3c',   # Red for predictions
+    'hist_color':     '#3498db',   # Blue for history/past
+    'env_color':      '#95a5a6',   # Gray for point cloud
+    'accent_color':   '#f39c12',   # Orange for thresholds/highlights
+    'bg_color':       '#ffffff',   # White background
+
+    # Fonts
+    'title_size':     16,
+    'label_size':     13,
+    'tick_size':      11,
+    'legend_size':    11,
+    'font_family':    'sans-serif',
+
+    # Lines
+    'gt_lw':          2.5,
+    'pred_lw':        1.5,
+    'hist_lw':        2.0,
+    'grid_alpha':     0.3,
+    'pred_alpha':     0.15,
+
+    # Output
+    'dpi':            200,
+}
+
+def apply_global_style():
+    """
+    Sets matplotlib rcParams once so every plot inherits the same base look.
+    No need to repeat fontsize/grid/background in each function.
+    """
+    plt.rcParams.update({
+        'font.family':          STYLE['font_family'],
+        'font.size':            STYLE['tick_size'],
+        'axes.titlesize':       STYLE['title_size'],
+        'axes.labelsize':       STYLE['label_size'],
+        'axes.titleweight':     'bold',
+        'axes.edgecolor':       '#333333',
+        'axes.linewidth':       0.8,
+        'xtick.labelsize':      STYLE['tick_size'],
+        'ytick.labelsize':      STYLE['tick_size'],
+        'legend.fontsize':      STYLE['legend_size'],
+        'legend.framealpha':    0.9,
+        'legend.edgecolor':     '#cccccc',
+        'figure.facecolor':     STYLE['bg_color'],
+        'axes.facecolor':       STYLE['bg_color'],
+        'savefig.facecolor':    STYLE['bg_color'],
+        'savefig.dpi':          STYLE['dpi'],
+        'savefig.bbox':         'tight',
+        'grid.alpha':           STYLE['grid_alpha'],
+        'grid.linestyle':       '--',
+    })
+
+apply_global_style()
+
 
 # ==============================================================================
 # 1. UTILITIES
@@ -28,7 +88,10 @@ def seed_everything(seed=42):
     torch.backends.cudnn.deterministic = True
 
 def ortho6d_to_rotation_matrix(d6):
-    """Convert 6D representation (B, T, 6) to rotation matrix (B, T, 3, 3)"""
+    """
+    Convert 6D rotation representation -> rotation matrix via Gram-Schmidt.
+    Works on arbitrary batch shapes: (..., 6) -> (..., 3, 3).
+    """
     x_raw = d6[..., 0:3]
     y_raw = d6[..., 3:6]
     x = x_raw / (np.linalg.norm(x_raw, axis=-1, keepdims=True) + 1e-8)
@@ -37,374 +100,492 @@ def ortho6d_to_rotation_matrix(d6):
     y = np.cross(z, x)
     return np.stack([x, y, z], axis=-1)
 
+
 # ==============================================================================
 # 2. INFERENCE
 # ==============================================================================
 
 def infer_single(model, sample, DEVICE, num_steps=10, method='euler'):
     """
-    Run a single FM inference using ODE integration.
-    
-    Unlike diffusion which uses a scheduler (DDIM/DDPM),
-    flow matching integrates the velocity field from t=0 to t=1.
+    Single FM inference via ODE integration from t=0 to t=1.
+    Returns: predicted action, final position error, final angle error, wall time (s).
     """
     model.eval()
-    
-    # FM data loader returns nested dict: sample['obs']['point_cloud'], etc.
+
     obs_dict = {
         'point_cloud': sample['obs']['point_cloud'].unsqueeze(0).to(DEVICE),
-        'agent_pos': sample['obs']['agent_pos'].unsqueeze(0).to(DEVICE)
+        'agent_pos':   sample['obs']['agent_pos'].unsqueeze(0).to(DEVICE),
     }
+
+    start_time = time.perf_counter()
+
     with torch.no_grad():
         result = model.predict_action(obs_dict, num_steps=num_steps, method=method)
-        pred_action = result['action_pred'].cpu().numpy()[0]  # (pred_horizon, 9)
-    
-    gt_action = sample['action'].numpy()  # (pred_horizon, 9)
-    
-    # Final position error
+        pred_action = result['action_pred'].cpu().numpy()[0]
+
+    inference_time = time.perf_counter() - start_time
+
+    gt_action = sample['action'].numpy()
+
+    # Final Distance Error
     final_dist = np.linalg.norm(pred_action[-1, :3] - gt_action[-1, :3])
-    
-    # Final rotation error
-    gt_rot_mat = ortho6d_to_rotation_matrix(gt_action[-1, 3:][None, None, :])[0, 0]
+
+    # Final Rotation Error (geodesic on SO(3))
+    gt_rot_mat  = ortho6d_to_rotation_matrix(gt_action[-1, 3:][None, None, :])[0, 0]
     pred_rot_mat = ortho6d_to_rotation_matrix(pred_action[-1, 3:][None, None, :])[0, 0]
     r_diff = np.dot(gt_rot_mat, pred_rot_mat.T)
     cos_theta = np.clip((np.trace(r_diff) - 1.0) / 2.0, -1.0, 1.0)
     final_angle = np.arccos(cos_theta) * (180 / np.pi)
-    
-    return pred_action, final_dist, final_angle
+
+    return pred_action, final_dist, final_angle, inference_time
 
 
 def infer_with_intermediate_steps(model, sample, DEVICE, num_steps=10):
     """
-    Run FM inference and capture intermediate ODE states for visualization.
-    Returns list of trajectories at each integration step.
+    ODE integration capturing every intermediate state — used for the GIF.
+    Each frame is one Euler step along the learned velocity field.
     """
     model.eval()
-    device = DEVICE
-    
-    pcd = sample['obs']['point_cloud'].unsqueeze(0).to(device)
-    agent_pos = sample['obs']['agent_pos'].unsqueeze(0).to(device)
-    
+
+    pcd = sample['obs']['point_cloud'].unsqueeze(0).to(DEVICE)
+    agent_pos = sample['obs']['agent_pos'].unsqueeze(0).to(DEVICE)
+
     with torch.no_grad():
-        # Normalize obs
         obs = {
             'point_cloud': pcd,
-            'agent_pos': model.normalizer.normalize(agent_pos)
+            'agent_pos':   model.normalizer.normalize(agent_pos),
         }
-        
+
         B = 1
-        x = torch.randn(B, model.pred_horizon, model.action_dim, device=device)
+        x = torch.randn(B, model.pred_horizon, model.action_dim, device=DEVICE)
         dt = 1.0 / num_steps
-        
-        frames = []
-        # Save initial noise state
-        frames.append(model.normalizer.unnormalize(x).cpu().numpy()[0])
-        
+
+        frames = [model.normalizer.unnormalize(x).cpu().numpy()[0]]
+
         for i in range(num_steps):
             t_val = i / num_steps
-            t = torch.ones(B, device=device) * t_val
-            
+            t = torch.ones(B, device=DEVICE) * t_val
             v = model.forward(obs, x, t)
             x = x + v * dt
-            
-            # Save intermediate state (unnormalized)
             frames.append(model.normalizer.unnormalize(x).cpu().numpy()[0])
-    
+
     return frames
 
+
 # ==============================================================================
-# 3. VISUALIZATIONS
+# 3. PLOT: TRAINING HISTORY
 # ==============================================================================
 
 def plot_training_history(history):
     if history is None:
         print("⚠️ No history found in checkpoint.")
         return
-    
+
     print("📊 Generating training history plot...")
-    plt.figure(figsize=(10, 5))
-    
+    fig, ax = plt.subplots(figsize=(10, 5))
+
     if 'train_loss' in history:
-        plt.plot(history['train_loss'], label='Train Loss', linewidth=2)
+        ax.plot(history['train_loss'],
+                color=STYLE['pred_color'], linewidth=2, label='Train Loss')
     if 'val_loss' in history:
-        plt.plot(history['val_loss'], label='Validation Loss', linewidth=2)
-    
-    plt.yscale('log')
-    plt.title("Flow Matching Training Convergence")
-    plt.xlabel("Epochs")
-    plt.ylabel("MSE Loss (Log Scale)")
-    plt.legend()
-    plt.grid(True, which="both", ls="-", alpha=0.5)
-    plt.savefig('01_fm_train_history.svg', format='svg')
-    plt.close()
+        ax.plot(history['val_loss'],
+                color=STYLE['hist_color'], linewidth=2, label='Validation Loss')
+
+    ax.set_yscale('log')
+    ax.set_title('Flow Matching — Training Convergence')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('MSE Loss (log scale)')
+    ax.legend()
+    ax.grid(True, which='both')
+
+    fig.savefig('01_fm_train_history.png')
+    plt.close(fig)
 
 
-def plot_3d_multimodality_with_orientation(model, sample, DEVICE, idx, n_samples=20, num_steps=10):
-    print(f"🍝 Generating 3D spaghetti plot for Seq {idx}...")
-    fig = plt.figure(figsize=(12, 10))
+# ==============================================================================
+# 4. PLOT: 3D TRAJECTORIES (LOCAL FRAME)
+# ==============================================================================
+
+def plot_3d_multimodality_with_orientation(model, sample, DEVICE, idx,
+                                           n_samples=20, num_steps=10):
+    print(f"🍝 Generating 3D plot for seq {idx}...")
+    fig = plt.figure(figsize=(11, 9))
     ax = fig.add_subplot(111, projection='3d')
-    
-    # Point cloud
+
+    # A. Point cloud
     pcd = sample['obs']['point_cloud'].numpy()
     if len(pcd) > 512:
-        indices = np.random.choice(len(pcd), 512, replace=False)
-        pcd_vis = pcd[indices]
+        pcd_vis = pcd[np.random.choice(len(pcd), 512, replace=False)]
     else:
         pcd_vis = pcd
-    ax.scatter(pcd_vis[:,0], pcd_vis[:,1], pcd_vis[:,2], 
-               c=pcd_vis[:,2], cmap='Greys', s=5, alpha=0.2, label='Env (PCD)')
-    
-    # Ground truth
-    gt = sample['action'].numpy()
+    ax.scatter(pcd_vis[:, 0], pcd_vis[:, 1], pcd_vis[:, 2],
+               c=STYLE['env_color'], s=4, alpha=0.15, label='Point Cloud')
+
+    # B. GT + history
+    gt  = sample['action'].numpy()
     obs = sample['obs']['agent_pos'].numpy()
-    ax.plot(gt[:, 0], gt[:, 1], gt[:, 2], 'g--', linewidth=3, label='Ground Truth')
-    ax.plot(obs[:, 0], obs[:, 1], obs[:, 2], 'b-o', linewidth=2, label='History')
-    
-    # Multiple inferences
+    ax.plot(gt[:, 0], gt[:, 1], gt[:, 2],
+            color=STYLE['gt_color'], linestyle='--', linewidth=STYLE['gt_lw'],
+            label='Ground Truth')
+    ax.plot(obs[:, 0], obs[:, 1], obs[:, 2],
+            color=STYLE['hist_color'], marker='o', markersize=4,
+            linewidth=STYLE['hist_lw'], label='History')
+
+    # C. Stochastic predictions
     final_preds = []
     for _ in range(n_samples):
-        pred_action, _, _ = infer_single(model, sample, DEVICE, num_steps=num_steps)
+        pred_action, _, _, _ = infer_single(model, sample, DEVICE, num_steps=num_steps)
         final_preds.append(pred_action)
-        ax.plot(pred_action[:, 0], pred_action[:, 1], pred_action[:, 2], 
-                color='red', alpha=0.15, linewidth=1)
-    
-    # Orientation at final point
-    last_pred = final_preds[0][-1]
-    gt_last = gt[-1]
+        ax.plot(pred_action[:, 0], pred_action[:, 1], pred_action[:, 2],
+                color=STYLE['pred_color'], alpha=STYLE['pred_alpha'], linewidth=1)
+
+    # D. Orientation quivers at final timestep
     scale = 0.05
-    
+    gt_last = gt[-1]
     gt_rot = ortho6d_to_rotation_matrix(gt_last[3:][None, None, :])[0, 0]
-    origin = gt_last[:3]
-    ax.quiver(origin[0], origin[1], origin[2], 
-              gt_rot[0,0], gt_rot[1,0], gt_rot[2,0], color='green', lw=2, length=scale)
-    
-    pred_rot = ortho6d_to_rotation_matrix(last_pred[3:][None, None, :])[0, 0]
-    origin_p = last_pred[:3]
-    ax.quiver(origin_p[0], origin_p[1], origin_p[2], 
-              pred_rot[0,0], pred_rot[1,0], pred_rot[2,0], 
-              color='red', lw=2, length=scale, label='Orient. Pred')
-    
-    ax.set_title(f"Seq {idx} : 3D Analysis (Red=Pred, Green=GT)")
-    center = np.mean(gt, axis=0)[:3]
-    radius = 0.2
-    ax.set_xlim(center[0]-radius, center[0]+radius)
-    ax.set_ylim(center[1]-radius, center[1]+radius)
-    ax.set_zlim(center[2]-radius, center[2]+radius)
-    plt.legend()
-    plt.savefig(f'02_fm_3d_spaghetti_seq{idx}.png', dpi=200)
-    plt.close()
+    ax.quiver(gt_last[0], gt_last[1], gt_last[2],
+              gt_rot[0, 0], gt_rot[1, 0], gt_rot[2, 0],
+              color=STYLE['gt_color'], linewidth=2, length=scale)
+
+    pred_last = final_preds[0][-1]
+    pred_rot = ortho6d_to_rotation_matrix(pred_last[3:][None, None, :])[0, 0]
+    ax.quiver(pred_last[0], pred_last[1], pred_last[2],
+              pred_rot[0, 0], pred_rot[1, 0], pred_rot[2, 0],
+              color=STYLE['pred_color'], linewidth=2, length=scale, label='Pred Orientation')
+
+    # Auto-zoom
+    center = np.mean(gt[:, :3], axis=0)
+    r = 0.2
+    ax.set_xlim(center[0] - r, center[0] + r)
+    ax.set_ylim(center[1] - r, center[1] + r)
+    ax.set_zlim(center[2] - r, center[2] + r)
+
+    ax.set_title(f'Seq {idx} — 3D Trajectories (Local Frame)')
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.legend(loc='upper left', fontsize=STYLE['legend_size'] - 1)
+
+    fig.savefig(f'02_fm_3d_spaghetti_seq{idx}.png')
+    plt.close(fig)
 
 
-def plot_multimodality_spaghetti_2d(model, sample, DEVICE, idx, n_samples=50, num_steps=10):
-    print(f"🍝 Generating 2D spaghetti plot for Seq {idx}...")
-    plt.figure(figsize=(10, 10))
-    gt = sample['action'].numpy()
+# ==============================================================================
+# 5. PLOT: 2D SPAGHETTI (XY DISPERSION)
+# ==============================================================================
+
+def plot_multimodality_spaghetti_2d(model, sample, DEVICE, idx,
+                                    n_samples=50, num_steps=10):
+    print(f"🍝 Generating 2D spaghetti plot for seq {idx}...")
+    fig, ax = plt.subplots(figsize=(9, 9))
+
+    gt  = sample['action'].numpy()
     obs = sample['obs']['agent_pos'].numpy()
-    
-    for i in range(n_samples):
-        pred, _, _ = infer_single(model, sample, DEVICE, num_steps=num_steps)
-        plt.plot(pred[:, 0], pred[:, 1], color='red', alpha=0.1, linewidth=1.5, 
-                 label='Predictions' if i == 0 else "")
-    
-    plt.plot(obs[:,0], obs[:,1], 'b-o', label='History', linewidth=2.5)
-    plt.plot(gt[:, 0], gt[:, 1], 'g--', label='Ground Truth', linewidth=3)
-    plt.title(f"2D Dispersion - Seq {idx} (N={n_samples})")
-    plt.axis('equal')
-    plt.grid(True, alpha=0.2)
-    plt.legend()
-    plt.savefig(f'02_fm_spaghetti_2d_seq{idx}.png', dpi=300)
-    plt.close()
 
+    for i in range(n_samples):
+        pred, _, _, _ = infer_single(model, sample, DEVICE, num_steps=num_steps)
+        ax.plot(pred[:, 0], pred[:, 1],
+                color=STYLE['pred_color'], alpha=0.1, linewidth=STYLE['pred_lw'],
+                label='Predictions' if i == 0 else '')
+
+    ax.plot(obs[:, 0], obs[:, 1],
+            color=STYLE['hist_color'], marker='o', markersize=4,
+            linewidth=STYLE['hist_lw'], label='History')
+    ax.plot(gt[:, 0], gt[:, 1],
+            color=STYLE['gt_color'], linestyle='--', linewidth=STYLE['gt_lw'],
+            label='Ground Truth')
+
+    ax.set_title(f'Seq {idx} — 2D Dispersion (Local Frame)')
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_aspect('equal')
+    ax.grid(True)
+    ax.legend()
+
+    fig.savefig(f'02_fm_spaghetti_2d_seq{idx}.png')
+    plt.close(fig)
+
+
+# ==============================================================================
+# 6. PLOT: ROTATION ERROR OVER TIME
+# ==============================================================================
 
 def plot_rotation_error_over_time(gt_action, pred_action, idx):
-    gt_rot = ortho6d_to_rotation_matrix(gt_action[None, :, 3:])[0]
+    """Geodesic angular error at each timestep along the trajectory."""
+    gt_rot  = ortho6d_to_rotation_matrix(gt_action[None, :, 3:])[0]
     pred_rot = ortho6d_to_rotation_matrix(pred_action[None, :, 3:])[0]
-    
+
     errors = []
     for t in range(len(gt_action)):
         r_diff = np.dot(gt_rot[t], pred_rot[t].T)
-        val = (np.trace(r_diff) - 1.0) / 2.0
-        cos_theta = np.clip(val, -1.0, 1.0)
-        err_deg = np.arccos(cos_theta) * (180.0 / np.pi)
-        errors.append(err_deg)
-    
-    plt.figure(figsize=(8, 4))
-    plt.plot(errors, 'r-o', label='Angular Error')
-    plt.axhline(y=15, color='orange', linestyle='--', label='Threshold (15°)')
-    plt.xlabel("Timestep")
-    plt.ylabel("Error (°)")
-    plt.title(f"Angular Drift - Seq {idx}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(f'05_fm_rotation_error_seq{idx}.png')
-    plt.close()
+        cos_theta = np.clip((np.trace(r_diff) - 1.0) / 2.0, -1.0, 1.0)
+        errors.append(np.arccos(cos_theta) * (180.0 / np.pi))
 
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(errors, color=STYLE['pred_color'], marker='o', markersize=5,
+            linewidth=STYLE['pred_lw'], label='Angular Error')
+    ax.axhline(y=15, color=STYLE['accent_color'], linestyle='--',
+               linewidth=1.5, label='Threshold (15°)')
+
+    ax.set_title(f'Seq {idx} — Rotation Error Over Time')
+    ax.set_xlabel('Timestep')
+    ax.set_ylabel('Error (°)')
+    ax.legend()
+    ax.grid(True)
+
+    fig.savefig(f'05_fm_rotation_error_seq{idx}.png')
+    plt.close(fig)
+
+
+# ==============================================================================
+# 7. GIF: FLOW MATCHING ODE INTEGRATION
+# ==============================================================================
 
 def make_flow_matching_gif(model, sample, DEVICE, idx, num_steps=10):
     """
-    Visualize the ODE integration process.
-    Unlike diffusion (which denoises from noise), flow matching
-    integrates a velocity field: each frame is one Euler step.
+    Animated GIF of the ODE integration: from random noise to final trajectory.
+    Each frame = one Euler step along the learned velocity field.
     """
-    print(f"🎬 Generating FM integration GIF for Seq {idx}...")
-    
+    print(f"🎬 Generating FM integration GIF for seq {idx}...")
+
     frames = infer_with_intermediate_steps(model, sample, DEVICE, num_steps=num_steps)
-    
-    # Add pause at the end
+
+    # Hold final frame
     for _ in range(15):
         frames.append(frames[-1])
-    
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
+
     gt = sample['action'].numpy()
     center = np.mean(gt[:, :3], axis=0)
-    
+    pc_np = sample['obs']['point_cloud'].numpy()[::5]
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
     def update(f):
         ax.clear()
         path = frames[f]
-        ax.plot(path[:, 0], path[:, 1], path[:, 2], color='red', linewidth=3, label='Flow Matching')
-        ax.plot(gt[:, 0], gt[:, 1], gt[:, 2], color='green', alpha=0.3, linewidth=1, label='Target')
-        
-        pc_np = sample['obs']['point_cloud'].numpy()[::5]
-        ax.scatter(pc_np[:,0], pc_np[:,1], pc_np[:,2], s=1, c='gray', alpha=0.1)
-        
-        if f < (len(frames) - 15):
-            step_text = f"ODE Step: {f}/{num_steps}"
-        else:
-            step_text = "Final Prediction"
-        ax.set_title(f"Flow Matching Integration\n{step_text}")
-        ax.set_xlim(center[0]-0.2, center[0]+0.2)
-        ax.set_ylim(center[1]-0.2, center[1]+0.2)
-        ax.set_zlim(center[2]-0.2, center[2]+0.2)
-    
+        ax.plot(path[:, 0], path[:, 1], path[:, 2],
+                color=STYLE['pred_color'], linewidth=2.5, label='Flow Matching')
+        ax.plot(gt[:, 0], gt[:, 1], gt[:, 2],
+                color=STYLE['gt_color'], alpha=0.35, linewidth=1.5, label='Ground Truth')
+        ax.scatter(pc_np[:, 0], pc_np[:, 1], pc_np[:, 2],
+                   s=1, c=STYLE['env_color'], alpha=0.1)
+
+        n_real = len(frames) - 15
+        step_text = f'ODE Step {f}/{num_steps}' if f < n_real else 'Final Prediction'
+        ax.set_title(f'Flow Matching Integration\n{step_text}',
+                     fontsize=STYLE['title_size'], fontweight='bold')
+        ax.set_xlim(center[0] - 0.2, center[0] + 0.2)
+        ax.set_ylim(center[1] - 0.2, center[1] + 0.2)
+        ax.set_zlim(center[2] - 0.2, center[2] + 0.2)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+
     ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=200)
     ani.save(f'03_fm_integration_seq{idx}.gif', writer='pillow')
-    plt.close()
+    plt.close(fig)
+
 
 # ==============================================================================
-# 4. QUANTITATIVE ANALYSIS
+# 8. QUANTITATIVE ANALYSIS
 # ==============================================================================
 
-def run_quantitative_analysis(model, val_dataset, DEVICE, n_samples=20, num_steps=10):
+def run_quantitative_analysis(model, val_dataset, DEVICE,
+                              n_samples=20, num_steps=10):
     model.eval()
     results = []
-    
-    THRESHOLD_POS = 0.02   # 2 cm
-    THRESHOLD_ROT = 15.0   # 15 degrees
-    
-    print(f"📊 Quantitative analysis ({n_samples} samples/seq)...")
-    num_eval_sequences = min(30, len(val_dataset))
-    indices = np.linspace(0, len(val_dataset)-1, num_eval_sequences, dtype=int)
-    
-    infer_times = []
+
+    THRESHOLD_POS = 0.02   # 2 cm (applied to ADE)
+    THRESHOLD_ROT = 15.0   # 15 deg
+
+    num_eval = min(30, len(val_dataset))
+    indices = np.linspace(0, len(val_dataset) - 1, num_eval, dtype=int)
+
+    print(f"📊 Evaluating {num_eval} sequences (success = ADE < 2 cm)...")
+
     for idx in tqdm(indices):
         sample = val_dataset[idx]
-        
-        seq_preds = []
-        seq_final_angles = []
-        seq_final_dists = []
-        
+        gt_pos = sample['action'].numpy()[:, :3]
+
+        seq_ades, seq_angles, seq_preds = [], [], []
+
         for _ in range(n_samples):
-            start = time.time()
-            pred, final_dist, final_angle = infer_single(
-                model, sample, DEVICE, num_steps=num_steps
-            )
-            infer_times.append(time.time() - start)
+            pred, _, final_angle, _ = infer_single(
+                model, sample, DEVICE, num_steps=num_steps)
+
+            pred_pos = pred[:, :3]
+            current_ade = np.mean(np.linalg.norm(pred_pos - gt_pos, axis=1))
+
+            seq_ades.append(current_ade)
+            seq_angles.append(final_angle)
             seq_preds.append(pred)
-            seq_final_dists.append(final_dist)
-            seq_final_angles.append(final_angle)
-        
-        seq_preds = np.array(seq_preds)  # (N, 16, 9)
-        
-        mean_fde = np.mean(seq_final_dists)
-        mean_rot = np.mean(seq_final_angles)
-        
-        success_count = sum([
-            (d < THRESHOLD_POS and a < THRESHOLD_ROT) 
-            for d, a in zip(seq_final_dists, seq_final_angles)
-        ])
-        success_rate = (success_count / n_samples) * 100
-        
-        gt_action = sample['action'].numpy()
-        gt_pos_all = gt_action[:, :3]
-        pred_pos_all = seq_preds[:, :, :3]
-        ade_dist = np.mean(np.linalg.norm(pred_pos_all - gt_pos_all, axis=2), axis=1)
-        mean_ade = np.mean(ade_dist)
-        
+
+        seq_preds = np.array(seq_preds)
+
+        # Dispersion
         mean_pred_path = np.mean(seq_preds[:, :, :3], axis=0)
-        path_variance = np.mean(np.linalg.norm(seq_preds[:, :, :3] - mean_pred_path, axis=2))
-        
+        path_variance = np.mean(
+            np.linalg.norm(seq_preds[:, :, :3] - mean_pred_path, axis=2))
+
+        # Success based on ADE
+        success_count = sum(
+            ade < THRESHOLD_POS and rot < THRESHOLD_ROT
+            for ade, rot in zip(seq_ades, seq_angles))
+        success_rate = (success_count / n_samples) * 100
+
         results.append({
-            'seq_idx': idx,
-            'ADE': mean_ade * 100,
-            'FDE': mean_fde * 100,
-            'RotErr': mean_rot,
-            'SuccessRate': success_rate,
-            'Dispersion': path_variance * 100,
-            'InferTime': np.mean(infer_times),
-            'InferTimeStd': np.std(infer_times)
+            'seq_idx':     idx,
+            'ADE':         np.mean(seq_ades) * 100,     # cm
+            'RotErr':      np.mean(seq_angles),          # deg
+            'SuccessRate': success_rate,                  # %
+            'Dispersion':  path_variance * 100,           # cm
         })
-    
+
     df = pd.DataFrame(results)
-    
-    print("\n" + "="*50)
-    print("PERFORMANCE SUMMARY (Validation Subset)")
-    print("="*50)
-    print(f"Success Rate      : {df['SuccessRate'].mean():.2f} %")
-    print(f"Position Error ADE: {df['ADE'].mean():.2f} cm")
-    print(f"Position Error FDE: {df['FDE'].mean():.2f} cm")
-    print(f"Rotation Error    : {df['RotErr'].mean():.2f} deg")
-    print(f"Dispersion        : {df['Dispersion'].mean():.2f} cm")
-    print(f"Infer Time        : {df['InferTime'].mean():.4f} +- {df['InferTimeStd'].mean():.4f} s")
-    print("="*50)
-    
+
+    print("\n" + "=" * 60)
+    print("🚀 RESULTS (Success = ADE < 2 cm)")
+    print("=" * 60)
+    print(f"  Mean Success Rate    : {df['SuccessRate'].mean():.2f} %")
+    print(f"  Mean Position (ADE)  : {df['ADE'].mean():.2f} cm")
+    print(f"  Mean Rotation (FDE)  : {df['RotErr'].mean():.2f} deg")
+    print(f"  Mean Dispersion      : {df['Dispersion'].mean():.2f} cm")
+    print("=" * 60)
+
     return df
 
 
+# ==============================================================================
+# 9. PLOT: ERROR DISTRIBUTIONS
+# ==============================================================================
+
 def plot_error_distributions(df):
     print("📊 Generating error distribution plots...")
-    sns.set_theme(style="whitegrid")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    sns.histplot(df['SuccessRate'], bins=10, kde=False, ax=ax1, color="green")
-    ax1.set_title("Success Rate Distribution per Sequence")
-    ax1.set_xlabel("Success (%)")
-    
-    sns.scatterplot(data=df, x='ADE', y='RotErr', ax=ax2, 
-                    hue='SuccessRate', palette='viridis', alpha=0.8)
-    ax2.set_title("Position Error vs Rotation Error")
-    ax2.set_xlabel("Position Error (cm)")
-    ax2.set_ylabel("Rotation Error (deg)")
-    
-    plt.tight_layout()
-    plt.savefig('04_fm_metrics_distribution.png', dpi=300)
-    plt.close()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+
+    # Left: success rate histogram
+    ax1.hist(df['SuccessRate'], bins=10, color=STYLE['gt_color'],
+             edgecolor='white', linewidth=0.8, alpha=0.85)
+    ax1.set_title('Success Rate Distribution')
+    ax1.set_xlabel('Success Rate (%)')
+    ax1.set_ylabel('Count')
+    ax1.grid(True, axis='y')
+
+    # Right: ADE vs RotErr scatter
+    sc = ax2.scatter(df['ADE'], df['RotErr'],
+                     c=df['SuccessRate'], cmap='RdYlGn',
+                     edgecolors='#333333', linewidths=0.4,
+                     s=60, alpha=0.85)
+    cbar = fig.colorbar(sc, ax=ax2)
+    cbar.set_label('Success Rate (%)', fontsize=STYLE['label_size'])
+    ax2.set_title('Position vs Rotation Error')
+    ax2.set_xlabel('ADE (cm)')
+    ax2.set_ylabel('Rotation Error (°)')
+    ax2.grid(True)
+
+    fig.tight_layout()
+    fig.savefig('04_fm_metrics_distribution.png')
+    plt.close(fig)
+
 
 # ==============================================================================
-# 5. MAIN
+# 10. INFERENCE SPEED BENCHMARK
+# ==============================================================================
+
+def run_inference_speed_benchmark(model, val_dataset, DEVICE,
+                                  num_steps=10, n_warmup=5, n_runs=100):
+    """
+    Measures inference latency over many runs on random samples.
+
+    Warmup: the first few CUDA calls are slow (lazy kernel compilation
+    and memory allocation). We discard them so the histogram reflects
+    the steady-state latency your robot actually sees.
+    """
+    model.eval()
+    print(f"⏱️  Inference speed benchmark  (warmup={n_warmup}, runs={n_runs})")
+
+    indices = np.random.choice(len(val_dataset), size=n_runs + n_warmup, replace=True)
+    all_times_ms = []
+
+    for i, idx in enumerate(tqdm(indices, desc="Benchmarking")):
+        sample = val_dataset[idx]
+        _, _, _, dt = infer_single(model, sample, DEVICE, num_steps=num_steps)
+
+        if i >= n_warmup:
+            all_times_ms.append(dt * 1000.0)
+
+    times = np.array(all_times_ms)
+
+    mean_ms = np.mean(times)
+    std_ms  = np.std(times)
+    med_ms  = np.median(times)
+    p95_ms  = np.percentile(times, 95)
+    p99_ms  = np.percentile(times, 99)
+    min_ms  = np.min(times)
+    max_ms  = np.max(times)
+    freq_hz = 1000.0 / mean_ms
+
+    print("\n" + "=" * 60)
+    print("⏱️  INFERENCE SPEED RESULTS")
+    print("=" * 60)
+    print(f"  Mean latency     : {mean_ms:.2f} ± {std_ms:.2f} ms")
+    print(f"  Median latency   : {med_ms:.2f} ms")
+    print(f"  Min / Max        : {min_ms:.2f} / {max_ms:.2f} ms")
+    print(f"  95th percentile  : {p95_ms:.2f} ms")
+    print(f"  99th percentile  : {p99_ms:.2f} ms")
+    print(f"  Throughput       : {freq_hz:.1f} Hz")
+    print("=" * 60)
+
+    # --- Plot ---
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    ax.hist(times, bins=30, color=STYLE['hist_color'],
+            edgecolor='white', linewidth=0.8, alpha=0.85)
+    ax.axvline(mean_ms, color=STYLE['pred_color'], linestyle='-',
+               linewidth=1.8, label=f'Mean  {mean_ms:.1f} ms')
+    ax.axvline(med_ms, color=STYLE['gt_color'], linestyle='--',
+               linewidth=1.8, label=f'Median  {med_ms:.1f} ms')
+    ax.axvline(p95_ms, color=STYLE['accent_color'], linestyle=':',
+               linewidth=1.8, label=f'P95  {p95_ms:.1f} ms')
+    ax.set_title('Inference Latency Distribution')
+    ax.set_xlabel('Latency (ms)')
+    ax.set_ylabel('Count')
+    ax.legend()
+    ax.grid(True, axis='y')
+
+    fig.tight_layout()
+    fig.savefig('06_fm_inference_speed.png')
+    plt.close(fig)
+
+    return times
+
+
+# ==============================================================================
+# 11. MAIN
 # ==============================================================================
 
 def main():
     seed_everything(42)
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🖥️ Device: {DEVICE}")
-    
-    NUM_STEPS = 10  # ODE integration steps
-    
-    # Paths
+
+    NUM_STEPS = 5  # ODE integration steps
+
+    # 1. Paths
     rospack = rospkg.RosPack()
     pkg_path = rospack.get_path('vision_processing')
     data_path = os.path.join(pkg_path, 'datas', 'Trajectories_preprocess')
-    ckpt_path = os.path.join(pkg_path, "models", "last_fm_model_high_dim_CFM_relative.ckpt")
-    
-    # Dataset (uses nested dict format)
+    ckpt_path = os.path.join(pkg_path, 'models', 'last_fm_model_high_dim_CFM_relative_dropout.ckpt')
+
+    # 2. Dataset
     val_dataset = Robot3DDataset(
         data_path, mode='val', val_ratio=0.2, seed=42,
-        num_points=256, obs_horizon=2, pred_horizon=16
-    )
-    print(f"✅ Validation Set: {len(val_dataset)} sequences")
-    
-    # Build model with same architecture as training
+        num_points=256, obs_horizon=2, pred_horizon=16)
+    print(f"✅ Validation set: {len(val_dataset)} sequences")
+
+    # 3. Model
     model = FlowMatchingAgent(
         action_dim=9,
         obs_horizon=2,
@@ -413,62 +594,60 @@ def main():
         diffusion_step_embed_dim=256,
         down_dims=[256, 512, 1024],
         kernel_size=5,
-        n_groups=8
-    ).to(DEVICE)
-    
-    # Load checkpoint
+        n_groups=8).to(DEVICE)
+
     if not os.path.exists(ckpt_path):
         print(f"❌ Checkpoint not found: {ckpt_path}")
         return
-    
+
     checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-    
+
     if 'history' in checkpoint:
         plot_training_history(checkpoint['history'])
-    
-    weights = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
+
+    weights = checkpoint.get('model_state_dict',
+                             checkpoint.get('state_dict', checkpoint))
     model.load_state_dict(weights, strict=False)
     model.eval()
     print("✅ Weights loaded.")
-    
-    # Visualizations on a specific sequence
+
+    # 4. Visual inspection on one sequence
     sample_idx = 25
     if len(val_dataset) > sample_idx:
         sample = val_dataset[sample_idx]
-        
         plot_3d_multimodality_with_orientation(
-            model, sample, DEVICE, sample_idx, num_steps=NUM_STEPS
-        )
+            model, sample, DEVICE, sample_idx, num_steps=NUM_STEPS)
         plot_multimodality_spaghetti_2d(
-            model, sample, DEVICE, sample_idx, num_steps=NUM_STEPS
-        )
+            model, sample, DEVICE, sample_idx, num_steps=NUM_STEPS)
         make_flow_matching_gif(
-            model, sample, DEVICE, sample_idx, num_steps=NUM_STEPS
-        )
-    
-    # Global quantitative analysis
+            model, sample, DEVICE, sample_idx, num_steps=NUM_STEPS)
+
+    # 5. Full benchmark
     df = run_quantitative_analysis(
-        model, val_dataset, DEVICE, n_samples=20, num_steps=NUM_STEPS
-    )
+        model, val_dataset, DEVICE, n_samples=20, num_steps=NUM_STEPS)
     plot_error_distributions(df)
-    
-    # Worst sequence analysis
+
+    # 6. Inference speed benchmark
+    run_inference_speed_benchmark(
+        model, val_dataset, DEVICE, num_steps=NUM_STEPS,
+        n_warmup=5, n_runs=100)
+
+    # 7. Worst-case analysis
     worst_seq = df.loc[df['SuccessRate'].idxmin()]
-    print(f"\n🚨 WORST SEQUENCE (Idx {int(worst_seq['seq_idx'])}):")
-    print(f"   Success: {worst_seq['SuccessRate']:.1f}% | ADE: {worst_seq['ADE']:.2f}cm | Rot: {worst_seq['RotErr']:.1f}°")
-    
     idx_worst = int(worst_seq['seq_idx'])
+    print(f"\n🚨 Worst sequence (idx {idx_worst}): "
+          f"Success {worst_seq['SuccessRate']:.1f}%")
+
     worst_sample = val_dataset[idx_worst]
-    
-    print(f"📸 Generating visuals for outlier Seq {idx_worst}...")
     plot_3d_multimodality_with_orientation(
-        model, worst_sample, DEVICE, idx_worst, num_steps=NUM_STEPS
-    )
-    
-    pred_worst, _, _ = infer_single(model, worst_sample, DEVICE, num_steps=NUM_STEPS)
+        model, worst_sample, DEVICE, idx_worst, num_steps=NUM_STEPS)
+
+    pred_worst, _, _, _ = infer_single(
+        model, worst_sample, DEVICE, num_steps=NUM_STEPS)
     plot_rotation_error_over_time(worst_sample['action'].numpy(), pred_worst, idx_worst)
-    
-    print("\n✅ Analysis complete. Check generated PNG/SVG/GIF files.")
+
+    print("\n✅ Analysis complete. All figures saved.")
+
 
 if __name__ == "__main__":
     main()

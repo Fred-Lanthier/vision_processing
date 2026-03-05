@@ -5,3 +5,9 @@ venv_sam3/
 datas/
 resources/
 *.ckpt
+*.mp4
+*.obj
+*.gbl
+*.npz
+*.zip
+

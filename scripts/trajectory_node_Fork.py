@@ -68,7 +68,7 @@ class TrajectoryFollowerContinuous:
         
         # Safety
         self.max_joint_jump = 0.5
-        self.z_min_safety = 0.002
+        self.z_min_safety = 0.000
         
         # State
         self.current_joints = None

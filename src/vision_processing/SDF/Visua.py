@@ -54,7 +54,7 @@ def visualize_comparison(original_file, repaired_file):
 
 if __name__ == "__main__":
     # Vos noms de fichiers
-    file_before = "Images_Test/01_surface_raw.obj"          # Sortie du script BPA (avec trous)
-    file_after = "Images_Test/01_surface_raw.obj"  # Sortie du script MeshLab (réparé)
+    file_before = "01_surface_raw.obj"          # Sortie du script BPA (avec trous)
+    file_after = "03_surface_aligned.obj"  # Sortie du script MeshLab (réparé)
     
     visualize_comparison(file_before, file_after)

@@ -1,0 +1,80 @@
+<?xml version="1.0"?>
+<robot name="table">
+  <!-- 
+    Simple table: 80cm x 120cm surface, 75cm tall.
+    The base_link is at the BOTTOM of the table (floor level).
+    The surface is at z = 0.75m.
+  -->
+
+  <link name="base_link">
+    <!-- Table top -->
+    <visual>
+      <origin xyz="0 0 0.735" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.80 1.20 0.03"/>
+      </geometry>
+      <material name="wood">
+        <color rgba="0.76 0.60 0.42 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.735" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.80 1.20 0.03"/>
+      </geometry>
+    </collision>
+
+    <!-- 4 Legs — each has visual + collision -->
+    <!-- Front-left -->
+    <visual>
+      <origin xyz="-0.35 -0.55 0.36" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.72"/></geometry>
+      <material name="wood"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.35 -0.55 0.36" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.72"/></geometry>
+    </collision>
+    <!-- Front-right -->
+    <visual>
+      <origin xyz="0.35 -0.55 0.36" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.72"/></geometry>
+      <material name="wood"/>
+    </visual>
+    <collision>
+      <origin xyz="0.35 -0.55 0.36" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.72"/></geometry>
+    </collision>
+    <!-- Back-left -->
+    <visual>
+      <origin xyz="-0.35 0.55 0.36" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.72"/></geometry>
+      <material name="wood"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.35 0.55 0.36" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.72"/></geometry>
+    </collision>
+    <!-- Back-right -->
+    <visual>
+      <origin xyz="0.35 0.55 0.36" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.72"/></geometry>
+      <material name="wood"/>
+    </visual>
+    <collision>
+      <origin xyz="0.35 0.55 0.36" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.72"/></geometry>
+    </collision>
+
+    <inertial>
+      <mass value="20.0"/>
+      <origin xyz="0 0 0.375"/>
+      <inertia ixx="1.0" ixy="0" ixz="0" iyy="1.0" iyz="0" izz="1.0"/>
+    </inertial>
+  </link>
+
+  <gazebo reference="base_link">
+    <material>Gazebo/Wood</material>
+    <static>true</static>
+  </gazebo>
+</robot>

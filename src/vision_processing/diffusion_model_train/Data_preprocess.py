@@ -126,7 +126,7 @@ def load_depth_datas_static():
     for i, trajectory_path in enumerate(Trajectories_path):
         static_depth.append(glob.glob(os.path.join(trajectory_path, f'images_Trajectory_{i+1}', 'static_depth_step_*.npy')))
     
-    return ee_depth, static_depth
+    return static_depth
 
 def png_to_jpg_static(png_path: str, jpg_path: str):
     """
@@ -265,7 +265,7 @@ def process_depth_to_food_cloud(depth_file, mask_2d, save_path):
                              interpolation=cv2.INTER_NEAREST).astype(bool)
 
     # --- PARAMÈTRES INTRINSÈQUES ---
-    # ⚠️ ATTENTION : Sont-ce les mêmes pour la caméra 'ee' (bras) et 'static' ?
+    # ⚠️ ATTENTION : Sont-ce les mêmes pour la caméra 'ee' (bras) et 'static'
     # Si non, remplace ces valeurs par celles de ta caméra au poignet.
     fx = 607.18261719  # Focal length x
     fy = 606.91986084  # Focal length y
@@ -1059,342 +1059,6 @@ def merge_pcd_trajectory_fork():
 
     print("\n✅ Step 7 done.")
 
-# def merge_pcd_trajectory():
-#     # --- CONFIGURATION ---
-#     rospack = rospkg.RosPack()
-#     package_path = rospack.get_path('vision_processing')
-#     base_path = os.path.join(package_path, 'datas', 'Trajectories_preprocess')
-    
-#     traj_folders = sorted(glob.glob(os.path.join(base_path, 'Trajectory*')), 
-#                           key=lambda x: int(x.split('_')[-1]))
-
-#     print(f"🔄 Début de la fusion (Segmented Robot) pour {len(traj_folders)} trajectoires...")
-
-#     for traj_folder in traj_folders:
-#         folder_name = os.path.basename(traj_folder)
-#         traj_id = folder_name.split('_')[-1]
-        
-#         json_path = os.path.join(traj_folder, f'trajectory_{traj_id}.json')
-#         if not os.path.exists(json_path): json_path = os.path.join(traj_folder, f'trajectory{traj_id}.json')
-        
-#         food_pcd_path = os.path.join(traj_folder, f'filtered_pcd_{folder_name}', 'food_filtered.npy')
-#         robot_pcd_folder = os.path.join(traj_folder, f'filtered_pcd_{folder_name}')
-#         output_dir = os.path.join(traj_folder, f'Merged_pcd_{folder_name}')
-#         os.makedirs(output_dir, exist_ok=True)
-
-#         print(f"\n📂 Traitement : {folder_name}")
-
-#         if not os.path.exists(json_path): continue
-#         with open(json_path, 'r') as f: json_data = json.load(f)
-
-#         food_centroid = food_points_world_init.mean(axis=0)  # (3,)
-
-#         distances = []
-#         for i, state in enumerate(json_data['states']):
-#             T_world_ee = pose_to_matrix(
-#                 state['end_effector_position'],
-#                 state['end_effector_orientation']
-#             )
-#             T_world_fork = T_world_ee @ T_ee_fork
-#             fork_tip_world = T_world_fork[:3, 3]  # origin of fork frame in world
-#             dist = np.linalg.norm(fork_tip_world - food_centroid)
-#             distances.append(dist)
-
-#         distances = np.array(distances)
-#         distances_smooth = gaussian_filter1d(distances, sigma=2)
-#         grasp_idx = np.argmin(distances_smooth)
-        
-
-#         # 3. ROBOT Loop
-#         robot_files = sorted(glob.glob(os.path.join(robot_pcd_folder, 'robot_cloud_*.npy')))
-#         if not robot_files: continue
-
-#         for robot_file in tqdm(robot_files, desc=f"  ↳ Fusion {folder_name}", unit="step"):
-#             filename = os.path.basename(robot_file)
-#             step_str = os.path.splitext(filename)[0].split('_')[-1] 
-#             try: step_idx = int(step_str) - 1
-#             except: continue
-
-#             try:
-#                 robot_points_cam = np.load(robot_file)
-#                 if robot_points_cam.size == 0: continue
-                    
-#                 T_static_s = load_matrix_from_json(json_data, "T_static_s", step_index=step_idx)
-#                 robot_points_world = apply_transform(robot_points_cam, T_static_s)
-
-#                 # --- GESTION FOOD DYNAMIQUE (Option B) ---
-#                 current_food = food_points_world_init.copy()
-                
-#                 ### --- DEBUT BLOC OPTION B ---
-#                 # Si on commente ce bloc, la nourriture reste statique (Option A)
-#                 if step_idx >= grasp_idx and current_food.size > 0:
-#                     # Pose actuelle du robot
-#                     curr_state = json_data['states'][step_idx]
-#                     T_world_curr = pose_to_matrix(
-#                         curr_state['end_effector_position'], 
-#                         curr_state['end_effector_orientation']
-#                     )
-#                     # Transformation composée : World -> Grasp (Local) -> World (Nouveau)
-#                     # Le mouvement relatif du robot est appliqué à la nourriture
-#                     T_motion = T_world_curr @ T_grasp_world
-#                     current_food = apply_transform(food_points_world_init, T_motion)
-#                 ### --- FIN BLOC OPTION B ---
-
-#                 # 4. MERGE
-#                 if current_food.shape[0] > 0:
-#                     merged_points = np.vstack((robot_points_world, current_food))
-#                 else:
-#                     merged_points = robot_points_world
-
-#                 # --- AJOUT FPS ICI ---
-#                 num_target_points = 1024 
-#                 if merged_points.shape[0] > num_target_points:
-#                     # Utilisation de fpsample pour réduire à 1024 points immédiatement
-#                     indices = fpsample.bucket_fps_kdline_sampling(merged_points.astype(np.float32), num_target_points, h=5)
-#                     merged_points = merged_points[indices]
-#                 # ----------------------
-
-#                 # 5. SAVE
-#                 save_name = f"Merged_{step_str}.npy"
-#                 save_path = os.path.join(output_dir, save_name)
-#                 np.save(save_path, merged_points)
-                
-#             except Exception as e:
-#                 print(f"  ❌ Erreur sur {filename}: {e}")
-#                 continue
-
-#     print("\n✅ Fusion terminée.")
-
-# def merge_pcd_trajectory_urdf():
-#     # --- CONFIGURATION ---
-#     rospack = rospkg.RosPack()
-#     package_path = rospack.get_path('vision_processing')
-#     base_path_preprocess = os.path.join(package_path, 'datas', 'Trajectories_preprocess')
-#     base_path_record = os.path.join(package_path, 'datas', 'Trajectories_record')
-    
-#     traj_folders_preprocess = sorted(glob.glob(os.path.join(base_path_preprocess, 'Trajectory*')), 
-#                                      key=lambda x: int(x.split('_')[-1]))
-
-#     print(f"🔄 Début de la fusion URDF pour {len(traj_folders_preprocess)} trajectoires...")
-
-#     for traj_folder_proc in traj_folders_preprocess:
-#         folder_name = os.path.basename(traj_folder_proc)
-#         traj_id = folder_name.split('_')[-1]
-        
-#         json_path = os.path.join(traj_folder_proc, f'trajectory_{traj_id}.json')
-#         if not os.path.exists(json_path): json_path = os.path.join(traj_folder_proc, f'trajectory{traj_id}.json')
-        
-#         food_pcd_path = os.path.join(traj_folder_proc, f'filtered_pcd_{folder_name}', 'food_filtered.npy')
-        
-#         traj_folder_rec = os.path.join(base_path_record, folder_name)
-#         robot_urdf_folder = os.path.join(traj_folder_rec, f'images_{folder_name}')
-        
-#         output_dir = os.path.join(traj_folder_proc, f'Merged_urdf_fork_{folder_name}')
-#         os.makedirs(output_dir, exist_ok=True)
-
-#         print(f"\n📂 Traitement URDF avec fork: {folder_name}")
-
-#         if not os.path.exists(json_path): continue
-#         with open(json_path, 'r') as f: json_data = json.load(f)
-
-#         # --- OPTION B PREPARATION : Trouver le Grasp ---
-#         positions = [s['end_effector_position'] for s in json_data['states']]
-#         zs = [p[2] for p in positions]
-#         grasp_idx = np.argmin(zs)
-        
-#         grasp_state = json_data['states'][grasp_idx]
-#         T_world_grasp = pose_to_matrix(
-#             grasp_state['end_effector_position'], 
-#             grasp_state['end_effector_orientation']
-#         )
-#         T_grasp_world = np.linalg.inv(T_world_grasp)
-#         # -----------------------------------------------
-
-#         # 2. FOOD (Initial Statique)
-#         food_points_world_init = np.empty((0, 3))
-#         if os.path.exists(food_pcd_path):
-#             try:
-#                 food_points_cam = np.load(food_pcd_path)
-#                 if food_points_cam.size > 0:
-#                     T_ee_s_step0 = load_matrix_from_json(json_data, "T_ee_s", step_index=0)
-#                     food_points_world_init = apply_transform(food_points_cam, T_ee_s_step0)
-#             except Exception as e:
-#                 print(f"  ⚠️ Erreur Food: {e}")
-
-#         # 3. ROBOT URDF Loop
-#         urdf_files = sorted(glob.glob(os.path.join(robot_urdf_folder, 'Robot_point_cloud_*.npy')))
-#         if not urdf_files: continue
-
-#         for urdf_file in tqdm(urdf_files, desc=f"  ↳ Fusion URDF {folder_name}", unit="step"):
-#             filename = os.path.basename(urdf_file)
-#             try: 
-#                 step_str = filename.split('.')[0].split('_')[-1]
-#                 step_idx = int(step_str) - 1 # Attention à l'indexation (si fichiers commencent à 1)
-#             except: continue
-
-#             try:
-#                 robot_points_world = np.load(urdf_file)
-#                 if robot_points_world.ndim == 1: robot_points_world = robot_points_world.reshape(1, -1)
-#                 if robot_points_world.shape[1] != 3 and robot_points_world.shape[0] == 3: robot_points_world = robot_points_world.T
-                
-#                 # --- GESTION FOOD DYNAMIQUE (Option B) ---
-#                 current_food = food_points_world_init.copy()
-                
-#                 ### --- DEBUT BLOC OPTION B ---
-#                 # Si on commente ce bloc, la nourriture reste statique
-#                 if step_idx >= grasp_idx and current_food.size > 0:
-#                     curr_state = json_data['states'][step_idx]
-#                     T_world_curr = pose_to_matrix(
-#                         curr_state['end_effector_position'], 
-#                         curr_state['end_effector_orientation']
-#                     )
-#                     T_motion = T_world_curr @ T_grasp_world
-#                     current_food = apply_transform(food_points_world_init, T_motion)
-#                 ### --- FIN BLOC OPTION B ---
-                
-#                 if current_food.shape[0] > 0:
-#                     merged_points = np.vstack((robot_points_world, current_food))
-#                 else:
-#                     merged_points = robot_points_world
-
-#                 # --- AJOUT FPS ICI ---
-#                 num_target_points = 1024 
-#                 if merged_points.shape[0] > num_target_points:
-#                     # Utilisation de fpsample pour réduire à 1024 points immédiatement
-#                     indices = fpsample.bucket_fps_kdline_sampling(merged_points.astype(np.float32), num_target_points, h=5)
-#                     merged_points = merged_points[indices]
-#                 # ----------------------
-
-#                 save_name = f"Merged_urdf_fork_{step_str}.npy"
-#                 save_path = os.path.join(output_dir, save_name)
-#                 np.save(save_path, merged_points)
-
-#             except Exception as e:
-#                 print(f"  ❌ Erreur {filename}: {e}")
-
-#     print("\n✅ Fusion URDF terminée.")
-
-# def merge_pcd_trajectory_fork():
-#     # --- CONFIGURATION ---
-#     rospack = rospkg.RosPack()
-#     package_path = rospack.get_path('vision_processing')
-#     base_path_preprocess = os.path.join(package_path, 'datas', 'Trajectories_preprocess')
-#     base_path_record = os.path.join(package_path, 'datas', 'Trajectories_record')
-    
-#     traj_folders_preprocess = sorted(glob.glob(os.path.join(base_path_preprocess, 'Trajectory*')), 
-#                                      key=lambda x: int(x.split('_')[-1]))
-
-#     print(f"🔄 Début de la fusion Fork pour {len(traj_folders_preprocess)} trajectoires...")
-
-#     for traj_folder_proc in traj_folders_preprocess:
-#         folder_name = os.path.basename(traj_folder_proc)
-#         traj_id = folder_name.split('_')[-1]
-        
-#         json_path = os.path.join(traj_folder_proc, f'trajectory_{traj_id}.json')
-#         if not os.path.exists(json_path): json_path = os.path.join(traj_folder_proc, f'trajectory{traj_id}.json')
-        
-#         food_pcd_path = os.path.join(traj_folder_proc, f'filtered_pcd_{folder_name}', 'food_filtered.npy')
-        
-#         traj_folder_rec = os.path.join(base_path_record, folder_name)
-#         robot_urdf_folder = os.path.join(traj_folder_rec, f'images_{folder_name}')
-        
-#         output_dir = os.path.join(traj_folder_proc, f'Merged_Fork_{folder_name}')
-#         os.makedirs(output_dir, exist_ok=True)
-
-#         print(f"\n📂 Traitement avec Fork: {folder_name}")
-
-#         if not os.path.exists(json_path): continue
-#         with open(json_path, 'r') as f: json_data = json.load(f)
-
-#         # --- OPTION B PREPARATION : Trouver le Grasp ---
-#         positions = [s['end_effector_position'] for s in json_data['states']]
-#         zs = [p[2] for p in positions]
-#         grasp_idx = np.argmin(zs)
-        
-#         grasp_state = json_data['states'][grasp_idx]
-#         T_world_grasp = pose_to_matrix(
-#             grasp_state['end_effector_position'], 
-#             grasp_state['end_effector_orientation']
-#         )
-#         T_grasp_world = np.linalg.inv(T_world_grasp)
-#         # -----------------------------------------------
-
-#         # 2. FOOD (Initial Statique)
-#         food_points_world_init = np.empty((0, 3))
-#         if os.path.exists(food_pcd_path):
-#             try:
-#                 food_points_cam = np.load(food_pcd_path)
-#                 if food_points_cam.size > 0:
-#                     T_ee_s_step0 = load_matrix_from_json(json_data, "T_ee_s", step_index=0)
-#                     food_points_world_init = apply_transform(food_points_cam, T_ee_s_step0)
-#             except Exception as e:
-#                 print(f"  ⚠️ Erreur Food: {e}")
-
-#         # 3. ROBOT URDF Loop
-#         fork_files = sorted(glob.glob(os.path.join(robot_urdf_folder, 'Fork_point_cloud_*.npy')))
-#         if not fork_files: continue
-        
-#         T_ee_fork = get_t_ee_fork()
-
-#         for fork_file in tqdm(fork_files, desc=f"  ↳ Fusion Fork {folder_name}", unit="step"):
-#             filename = os.path.basename(fork_file)
-#             try: 
-#                 step_str = filename.split('.')[0].split('_')[-1]
-#                 step_idx = int(step_str) - 1 # Attention à l'indexation (si fichiers commencent à 1)
-#             except: continue
-
-#             try:
-#                 fork_points_world = np.load(fork_file)
-#                 if fork_points_world.ndim == 1: fork_points_world = fork_points_world.reshape(1, -1)
-#                 if fork_points_world.shape[1] != 3 and fork_points_world.shape[0] == 3: fork_points_world = fork_points_world.T
-                
-#                 # --- GESTION FOOD DYNAMIQUE (Option B) ---
-#                 current_food = food_points_world_init.copy()
-                
-#                 ### --- DEBUT BLOC OPTION B ---
-#                 # Si on commente ce bloc, la nourriture reste statique
-#                 if step_idx >= grasp_idx and current_food.size > 0:
-#                     curr_state = json_data['states'][step_idx]
-#                     T_world_curr = pose_to_matrix(
-#                         curr_state['end_effector_position'], 
-#                         curr_state['end_effector_orientation']
-#                     )
-#                     T_motion = T_world_curr @ T_grasp_world
-#                     current_food = apply_transform(food_points_world_init, T_motion)
-#                 ### --- FIN BLOC OPTION B ---
-                
-#                 if current_food.shape[0] > 0:
-#                     merged_points = np.vstack((fork_points_world, current_food))
-#                 else:
-#                     merged_points = fork_points_world
-
-#                 # --- AJOUT FPS ICI ---
-#                 num_target_points = 1024 
-#                 if merged_points.shape[0] > num_target_points:
-#                     # Utilisation de fpsample pour réduire à 1024 points immédiatement
-#                     indices = fpsample.bucket_fps_kdline_sampling(merged_points.astype(np.float32), num_target_points, h=5)
-#                     merged_points = merged_points[indices]
-#                 # ----------------------
-                
-#                 # Transform in fork world
-#                 curr_state = json_data['states'][step_idx]
-#                 T_world_ee = pose_to_matrix(
-#                     curr_state['end_effector_position'], 
-#                     curr_state['end_effector_orientation']
-#                 )   
-#                 T_world_fork = T_world_ee @ T_ee_fork
-#                 T_world_to_local = np.linalg.inv(T_world_fork)
-#                 merged_points_local = apply_transform(merged_points, T_world_to_local)
-                
-#                 save_name = f"Merged_Fork_{step_str}.npy"
-#                 save_path = os.path.join(output_dir, save_name)
-#                 np.save(save_path, merged_points_local)
-
-#             except Exception as e:
-#                 print(f"  ❌ Erreur {filename}: {e}")
-
-#     print("\n✅ Fusion avec fourchette terminée.")
-
 def update_json_merged_pcd():
     """
     Étape 8 : Met à jour le JSON avec :
@@ -1460,101 +1124,101 @@ def update_json_merged_pcd():
 
 def main():
 
-    # print("="*80)
-    # print("Step 1 : Convertir les PNG static en JPG pour faire la segmentation et le tracking avec SAM 2")
-    # print("="*80)
-    # start_time = time.time()
-    # png_datas = load_png_datas_static()
-    # print(png_datas)
-    # for png_path in png_datas:
-    #     directory_path = os.path.dirname(png_path)
-    #     filename = os.path.basename(png_path)
-    #     name_no_ext = os.path.splitext(filename)[0]
+    print("="*80)
+    print("Step 1 : Convertir les PNG static en JPG pour faire la segmentation et le tracking avec SAM 2")
+    print("="*80)
+    start_time = time.time()
+    png_datas = load_png_datas_static()
+    print(png_datas)
+    for png_path in png_datas:
+        directory_path = os.path.dirname(png_path)
+        filename = os.path.basename(png_path)
+        name_no_ext = os.path.splitext(filename)[0]
         
-    #     directory_path = directory_path.replace("Trajectories_record", "Trajectories_preprocess")
+        directory_path = directory_path.replace("Trajectories_record", "Trajectories_preprocess")
         
-    #     try:
-    #         # On extrait le numéro "11" depuis "static_rgb_step_11"
-    #         step_number = int(name_no_ext.split('_')[-1])
+        try:
+            # On extrait le numéro "11" depuis "static_rgb_step_11"
+            step_number = int(name_no_ext.split('_')[-1])
             
-    #         # On définit le nom CIBLE qu'on veut obtenir : "0011.jpg"
-    #         target_name = f"{step_number:04d}.jpg"
-    #         target_path = os.path.join(directory_path, target_name)
+            # On définit le nom CIBLE qu'on veut obtenir : "0011.jpg"
+            target_name = f"{step_number:04d}.jpg"
+            target_path = os.path.join(directory_path, target_name)
             
-    #         # LE TEST ULTIME : Si le résultat existe déjà, on passe !
-    #         if os.path.exists(target_path):
-    #             print(f"Le fichier {target_name} existe déjà. Skip.")
-    #             continue
+            # LE TEST ULTIME : Si le résultat existe déjà, on passe !
+            if os.path.exists(target_path):
+                print(f"Le fichier {target_name} existe déjà. Skip.")
+                continue
 
-    #         # Sinon, on lance la conversion
-    #         print(f"Création de {target_name} à partir de {filename}...")
-    #         jpg_path = os.path.join(directory_path, target_name)
-    #         print(jpg_path)
-    #         png_to_jpg_static(png_path, jpg_path)
-    #     except Exception as e:
-    #         print(f"Erreur sur {png_path}: {e}")
-    # end_time = time.time()
-    # print(f"Temps total pour transformer les PNG static en JPG : {end_time - start_time}")
+            # Sinon, on lance la conversion
+            print(f"Création de {target_name} à partir de {filename}...")
+            jpg_path = os.path.join(directory_path, target_name)
+            print(jpg_path)
+            png_to_jpg_static(png_path, jpg_path)
+        except Exception as e:
+            print(f"Erreur sur {png_path}: {e}")
+    end_time = time.time()
+    print(f"Temps total pour transformer les PNG static en JPG : {end_time - start_time}")
     
     
-    # print("="*80)
-    # print("Step 2 : Ajouter les fichiers json dans les nouveaux dossiers")
-    # print("="*80)
-    # start_time = time.time()
-    # mappings = get_json_paths_map()
-    # for src, dest in mappings:
-    #     print(f"Source: {os.path.basename(src)} -> Dest: {dest}")
-    #     with open(src, 'r') as f:
-    #         data = json.load(f)
-    #     with open(dest, 'w') as f:
-    #         json.dump(data, f)
+    print("="*80)
+    print("Step 2 : Ajouter les fichiers json dans les nouveaux dossiers")
+    print("="*80)
+    start_time = time.time()
+    mappings = get_json_paths_map()
+    for src, dest in mappings:
+        print(f"Source: {os.path.basename(src)} -> Dest: {dest}")
+        with open(src, 'r') as f:
+            data = json.load(f)
+        with open(dest, 'w') as f:
+            json.dump(data, f)
         
-    # end_time = time.time()
-    # print(f"Temps total pour ajouter les fichiers json dans les nouveaux dossiers : {end_time - start_time}")
+    end_time = time.time()
+    print(f"Temps total pour ajouter les fichiers json dans les nouveaux dossiers : {end_time - start_time}")
     
-    # print("="*80)
-    # print("Step 3 : Segmenter les images avec SAM 2 et creer les nuages de points du robot segmenté et de la nourriture segmentée")
-    # print("="*80)
-    # start_time = time.time()
+    print("="*80)
+    print("Step 3 : Segmenter les images avec SAM 2 et creer les nuages de points du robot segmenté et de la nourriture segmentée")
+    print("="*80)
+    start_time = time.time()
     
-    # try:
-    #     # Lancement de la fonction principale
-    #     segment_robot_and_create_pcd()
+    try:
+        # Lancement de la fonction principale
+        segment_robot_and_create_pcd()
         
-    # except KeyboardInterrupt:
-    #     print("\n🛑 Interruption par l'utilisateur.")
+    except KeyboardInterrupt:
+        print("\n🛑 Interruption par l'utilisateur.")
         
-    # end_time = time.time()
-    # print(f"Temps total pour segmenter les nuages de points : {end_time - start_time}")
+    end_time = time.time()
+    print(f"Temps total pour segmenter les nuages de points : {end_time - start_time}")
     
 
-    # print("="*80)
-    # print("Step 4 : Segmenter la nourriture dans l'assiette et créer le nuage de point correspondant.")
-    # print("="*80)
-    # force_gpu_clear()
-    # start_time = time.time()
-    # segment_food_init_step()
-    # end_time = time.time()
-    # print(f"Temps total pour segmenter la nourriture dans l'assiette et créer le nuage de point correspondant : {end_time - start_time}")
+    print("="*80)
+    print("Step 4 : Segmenter la nourriture dans l'assiette et créer le nuage de point correspondant.")
+    print("="*80)
+    force_gpu_clear()
+    start_time = time.time()
+    segment_food_init_step()
+    end_time = time.time()
+    print(f"Temps total pour segmenter la nourriture dans l'assiette et créer le nuage de point correspondant : {end_time - start_time}")
     
-    # print("="*80)
-    # print("Step 5 : Créer les nuages de points merge du robot segmenter et de la nourriture segmentée.")
-    # print("="*80)
-    # start_time = time.time()
-    # merge_pcd_trajectory()
-    # end_time = time.time()
-    # print(f"Temps total pour créer les nuages de points merge : {end_time - start_time}")
+    print("="*80)
+    print("Step 5 : Créer les nuages de points merge du robot segmenter et de la nourriture segmentée.")
+    print("="*80)
+    start_time = time.time()
+    merge_pcd_trajectory()
+    end_time = time.time()
+    print(f"Temps total pour créer les nuages de points merge : {end_time - start_time}")
     
-    # force_gpu_clear()
-    # print("="*80)
-    # print("Step 6 : Créer les nuages de points merge du robot urdf avec fourchette et de la nourriture segmentée.")
-    # print("="*80)
-    # start_time = time.time()
-    # merge_pcd_trajectory_urdf()
-    # end_time = time.time()
-    # print(f"Temps total pour créer les nuages de points urdf merge : {end_time - start_time}")
+    force_gpu_clear()
+    print("="*80)
+    print("Step 6 : Créer les nuages de points merge du robot urdf avec fourchette et de la nourriture segmentée.")
+    print("="*80)
+    start_time = time.time()
+    merge_pcd_trajectory_urdf()
+    end_time = time.time()
+    print(f"Temps total pour créer les nuages de points urdf merge : {end_time - start_time}")
     
-    # force_gpu_clear()
+    force_gpu_clear()
 
     print("="*80)
     print("Step 7 : Créer les nuages de points merge de la fourchette et de la nourriture segmentée.")
