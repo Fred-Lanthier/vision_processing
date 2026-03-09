@@ -11,10 +11,16 @@ from mani_skill.agents.robots.panda import Panda
 from mani_skill.agents.registration import register_agent
 from mani_skill.sensors.camera import CameraConfig
 
+import mediapipe as mp
+import math
+
 # =================================================================
 # 1. CUSTOM PANDA FORK AGENT (same as before)
 # =================================================================
-
+COLOR_CLOSED = (50, 255, 150)
+COLOR_OPEN = (50, 150, 255)
+COLOR_TARGET = (0, 255, 255)
+COLOR_HUD_BG = (30, 30, 30)
 @register_agent()
 class PandaFork(Panda):
     uid = "panda_fork"
@@ -198,7 +204,6 @@ class FoodSpikingEnv(PickCubeEnv):
         builder.add_visual_from_file(
             filename=mesh_path, 
             scale=scale, 
-            material=mat,
             pose=local_pose
         )
         # self.food_target = builder.build(name="food_target")
@@ -211,6 +216,43 @@ class FoodSpikingEnv(PickCubeEnv):
             half_size=[0.05, 0.05, self.pedestal_half_z]
         )
         self.pedestal = ped_builder.build_kinematic(name="pedestal")
+
+        # --- AJOUT DU MANNEQUIN TEXTURÉ (TRELLIS.2) ---
+        mannequin_builder = self.scene.create_actor_builder()
+        
+        # Le chemin de ton fichier haute résolution
+        mannequin_mesh_path = "object/handicap_high_res_2.glb"
+        
+        # 1. Échelle (Scale)
+        mannequin_scale = [1, 1, 1] 
+
+        # 2. Position et Rotation par rapport au robot (qui est généralement à l'origine 0,0,0)
+        pos_y_gauche = 0.1 
+        pos_z_table = -0.22 # Remplace par la hauteur de la table si elle n'est pas à 0
+        pos_x = -0.25
+        mannequin_p = [pos_x, pos_y_gauche, pos_z_table]
+
+        mannequin_q_xyzw = R.from_euler('xyz', [90, 0, 0], degrees=True).as_quat()
+        mannequin_q_wxyz = [mannequin_q_xyzw[3], mannequin_q_xyzw[0], mannequin_q_xyzw[1], mannequin_q_xyzw[2]]
+        
+        mannequin_pose = sapien.Pose(p=mannequin_p, q=mannequin_q_wxyz)
+
+        # 3. Chargement SANS MATÉRIAU PERSONNALISÉ pour conserver les textures
+        mannequin_builder.add_visual_from_file(
+            filename=mannequin_mesh_path, 
+            scale=mannequin_scale, 
+            # material=mat, <-- TRÈS IMPORTANT : On ne met pas cette ligne !
+            pose=mannequin_pose
+        )
+        
+        # Optionnel : Ajouter une collision simple (Boîte) pour que le robot ne passe pas au travers
+        # mannequin_builder.add_box_collision(
+        #     half_size=[0.25, 0.25, 0.25], 
+        #     pose=mannequin_pose
+        # )
+
+        # On le construit en tant qu'objet cinématique (fixe) pour qu'il ne tombe pas
+        self.mannequin = mannequin_builder.build_kinematic(name="mannequin_patient")
 
     # ---------------------------------------------------------
     # EPISODE INIT (called on every reset)
@@ -287,6 +329,95 @@ class FoodSpikingEnv(PickCubeEnv):
             np.arctan2(self.principal_axis_world[1], self.principal_axis_world[0])
         )
 
+# =================================================================
+# 4. MEDIAPIPE MOUTH DETECTION
+# =================================================================
+
+class CameraGeometry:
+    def __init__(self, width, height):
+        # Paramètres intrinsèques (Matrice K)
+        # cx, cy : Centre optique de l'image
+        self.cx = width / 2
+        self.cy = height / 2
+        
+        # --- ESTIMATION DES FOCALES (fx, fy) ---
+        # Sans calibration (checkerboard), on estime fx et fy.
+        # Pour une webcam standard (FOV ~60°), fx est souvent proche de la largeur.
+        # NOTE : Sur les capteurs modernes, les pixels sont carrés, donc souvent fx ~= fy.
+        # Mais nous les séparons ici pour respecter la formule mathématique.
+        
+        self.fx = width  # Approximation standard
+        self.fy = width  # On assume des pixels carrés. Si non, fy serait différent.
+        
+        # Constante physique : Ecart moyen entre les coins des yeux (en cm)
+        self.REAL_EYE_DIST_CM = 6.4 
+
+    def get_metric_coordinates(self, pixel_point, eye_distance_pixels):
+        """
+        Convertit un point (u, v) en (X, Y, Z) métrique (cm) en utilisant fx et fy séparément.
+        """
+        if eye_distance_pixels == 0: return (0, 0, 0)
+
+        # 1. Calcul de Z (Profondeur)
+        # On utilise fx car les yeux sont alignés horizontalement
+        Z_cm = (self.fx * self.REAL_EYE_DIST_CM) / eye_distance_pixels
+
+        # 2. Récupération des coordonnées pixels (u, v)
+        u, v = pixel_point
+
+        # 3. Calcul de X (Horizontal) avec fx
+        # Formule : X = (Pixel - CentreX) * Z / fx
+        X_cm = (u - self.cx) * Z_cm / self.fx
+
+        # 4. Calcul de Y (Vertical) avec fy
+        # Formule : Y = (Pixel - CentreY) * Z / fy
+        Y_cm = (v - self.cy) * Z_cm / self.fy
+
+        return (X_cm, Y_cm, Z_cm)
+
+
+def draw_complete_interface(image, distance, status, face_landmarks, center_point, metric_coords):
+    h, w, _ = image.shape
+    overlay = image.copy()
+    main_color = COLOR_CLOSED if status == "Fermee" else COLOR_OPEN
+
+    if face_landmarks:
+        # A. Moulage
+        for connection in mp_face_mesh.FACEMESH_LIPS:
+            pt1 = face_landmarks.landmark[connection[0]]
+            pt2 = face_landmarks.landmark[connection[1]]
+            cv2.line(image, (int(pt1.x*w), int(pt1.y*h)), (int(pt2.x*w), int(pt2.y*h)), main_color, 1, cv2.LINE_AA)
+
+        # B. Viseur
+        if center_point:
+            cx, cy = center_point
+            cv2.line(image, (cx-10, cy), (cx+10, cy), COLOR_TARGET, 1)
+            cv2.line(image, (cx, cy-10), (cx, cy+10), COLOR_TARGET, 1)
+
+    # --- HUD LATÉRAL ---
+    cv2.rectangle(overlay, (20, 20), (280, 280), COLOR_HUD_BG, -1)
+    
+    cv2.putText(image, "COORD PIXELS (u, v)", (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+    if center_point:
+        cv2.putText(image, f"u: {center_point[0]}  v: {center_point[1]}", (40, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TARGET, 1)
+
+    # --- AFFICHAGE MÉTRIQUE ---
+    cv2.putText(image, "COORD REELLES (X, Y)", (40, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+    
+    X, Y, Z = metric_coords
+    
+    # Affichage clair X et Y
+    cv2.putText(image, f"X: {X:.1f} cm", (40, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 255, 100), 2)
+    cv2.putText(image, f"Y: {Y:.1f} cm", (40, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 255, 100), 2)
+    
+    # Affichage Profondeur
+    cv2.putText(image, f"Dist (Z): {Z:.1f} cm", (40, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 255), 1)
+
+    # Statut
+    cv2.putText(image, status.upper(), (40, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, main_color, 2)
+
+    cv2.addWeighted(overlay, 0.6, image, 0.4, 0, image)
+    return image
 
 # =================================================================
 # 4. DATA COLLECTION
@@ -302,6 +433,26 @@ if __name__ == "__main__":
         control_mode="pd_ee_delta_pose",
         render_mode="human",
     )
+
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+    
+    # --- COULEURS HUD ---
+    COLOR_CLOSED = (50, 255, 150)
+    COLOR_OPEN = (50, 150, 255)
+    COLOR_TARGET = (0, 255, 255)
+    
+    # --- INITIALISATION DE LA GÉOMÉTRIE (Basée sur la caméra de ManiSkill) ---
+    # Récupérer la résolution de la caméra (par défaut souvent 128x128 ou 256x256 dans ManiSkill)
+    # Tu pourras ajuster les focales (fx, fy) si tu connais le FOV de la caméra simulée
+    cam_width, cam_height = 256, 256 # Valeurs par défaut typiques, à ajuster si besoin
+    geom = CameraGeometry(cam_width, cam_height)
+
 
     NUM_EPISODES = 50
     all_trajectories = []
@@ -331,9 +482,8 @@ if __name__ == "__main__":
         locked_fork_pos = None
         delivery_target_yaw = None
 
-        USER_MOUTH_POS = np.array(
-            [-0.2 + np.random.normal(0, 0.05), 0.3 + np.random.normal(0, 0.05), 0.16 + np.random.normal(0, 0.05)], dtype=np.float32
-        )
+        DYNAMIC_MOUTH_POS = None
+
         if uw.target_shape_type == "broccoli" or uw.target_shape_type == "chicken":
             base_yaw = uw.get_desired_fork_yaw() + 90
             if base_yaw > 180: base_yaw -= 360
@@ -562,47 +712,62 @@ if __name__ == "__main__":
             
             # ---- PHASE 3: DELIVER ----
             elif current_phase == 3:
-                # 1. Cible d'orientation absolue : 90° = Gauche du robot
-                absolute_target_yaw = 90.0 
                 
-                dir_to_user = USER_MOUTH_POS - fork_pos.cpu().numpy()
+                # 1. Mise à jour de la mémoire dynamique SI on voit la bouche
+                if mouth_detected_this_frame:
+                    if DYNAMIC_MOUTH_POS is None:
+                        DYNAMIC_MOUTH_POS = current_mouth_world.copy()
+                        print("    Bouche acquise par la caméra ! Passage en asservissement visuel.")
+                    else:
+                        # Lissage pour éviter les tremblements
+                        DYNAMIC_MOUTH_POS = 0.8 * DYNAMIC_MOUTH_POS + 0.2 * current_mouth_world
+
+                # 2. SÉLECTION DE LA CIBLE (Le cœur de la logique hybride)
+                if DYNAMIC_MOUTH_POS is not None:
+                    # MODE TRACKING : Objectif = Z de la bouche, X de la bouche, Y - 5cm
+                    target_fork_pos = DYNAMIC_MOUTH_POS + np.array([0.0, -0.05, 0.0])
+                else:
+                    # MODE AVEUGLE : On s'approche de la zone de recherche probable
+                    # (On conserve x=-0.2 basé sur ton ancien code pour rester cohérent avec le robot)
+                    target_fork_pos = np.array([-0.20, 0.30, 0.20])
+                
+                # 3. Calcul de l'erreur spatiale (Translation)
+                dir_to_user = target_fork_pos - fork_pos.cpu().numpy() 
                 dist = np.linalg.norm(dir_to_user)
 
+                # 4. Calcul de l'erreur angulaire (Rotation Yaw vers 90°)
+                absolute_target_yaw = 90.0 
                 yaw_err = absolute_target_yaw - yaw
                 if yaw_err > 180: yaw_err -= 360
                 if yaw_err < -180: yaw_err += 360
 
                 # =========================================================
-                # COUPLAGE VITESSE-ORIENTATION (SPEED FACTOR)
+                # EXÉCUTION DU CONTRÔLE (Couplage Vitesse / Orientation)
                 # =========================================================
-                # Si l'erreur approche ou dépasse 60°, le facteur descend à 0.1 (10% de vitesse).
-                # Si l'erreur est de 0°, le facteur est de 1.0 (100% de vitesse).
                 speed_factor = np.clip(1.0 - (abs(yaw_err) / 60.0), 0.1, 1.0)
-                
-                # On ajuste la vitesse maximale de translation (ton 0.075 initial)
                 max_trans_speed = 0.075 * speed_factor
-                # =========================================================
 
-                # 2. Asservissement avec "Zone Morte" (Deadband) pour stopper net
-                # --- Translation (Maintenant couplée !) ---
-                if dist > 0.01: # Tolérance de 1 cm
-                    # On multiplie aussi le gain par le speed_factor pour une décélération douce
+                # --- Asservissement en position ---
+                if dist > 0.01:
                     action[:3] = np.clip(dir_to_user * 3.0 * speed_factor, -max_trans_speed, max_trans_speed)
                 else:
-                    action[:3] = 0.0 # Frein absolu !
+                    action[:3] = 0.0 # Frein absolu
 
-                # --- Rotation (Reste prioritaire et à pleine vitesse) ---
-                if abs(yaw_err) > 1.5: # Tolérance de 1.5 degrés
+                # --- Asservissement en orientation ---
+                if abs(yaw_err) > 1.5:
                     action[5] = -np.clip(np.deg2rad(yaw_err) * 0.7, -0.5, 0.5)
                 else:
-                    action[5] = 0.0 # Frein absolu !
+                    action[5] = 0.0 # Frein absolu
 
-                # 3. Phase de Stabilisation (Hold)
+                # 5. Phase de Stabilisation (Hold)
                 if dist <= 0.01 and abs(yaw_err) <= 1.5:
                     hold_steps += 1
                     
                     if hold_steps == 1:
-                        print("    Target reached! Stabilizing...")
+                        if DYNAMIC_MOUTH_POS is None:
+                            print("    Target atteinte en mode aveugle (Bouche non trouvée).")
+                        else:
+                            print("    Target visuelle atteinte ! Stabilisation...")
                         
                     if hold_steps > 15: 
                         print("    Delivered successfully!")
@@ -622,10 +787,81 @@ if __name__ == "__main__":
                 uw.food_target.set_pose(new_food_pose)
             obs, reward, terminated, truncated, info = env.step(action)
             env.render()
+            
+            # --- 1. RÉCUPÉRATION DE L'IMAGE ---
             sensors = obs["sensor_data"]
             rgb_ee_array = sensors["ee"]["rgb"][0].cpu().numpy()
+            
+            # --- 2. TRAITEMENT MEDIAPIPE (Sur l'image RGB native) ---
+            results = face_mesh.process(rgb_ee_array)
+            
+            # Conversion en BGR pour l'affichage avec OpenCV
             img_bgr = cv2.cvtColor(rgb_ee_array, cv2.COLOR_RGB2BGR)
-            cv2.imshow("Live Feed - Camera EE", img_bgr)
+            h, w, _ = img_bgr.shape
+            
+            # Si c'est la première frame, on met à jour la géométrie avec la vraie taille
+            if geom.cx != w/2:
+                geom = CameraGeometry(w, h)
+
+            status = "Recherche..."
+            center_px = None
+            metric_coords = (0, 0, 0)
+            
+            # --- 3. ANALYSE DES RÉSULTATS MEDIAPIPE ET ASSERVISSEMENT ---
+            mouth_detected_this_frame = False
+            current_mouth_world = None
+
+            if results.multi_face_landmarks:
+                lm = results.multi_face_landmarks[0]
+                
+                # Coordonnées pixel
+                top, bottom = lm.landmark[13], lm.landmark[14]
+                cx, cy = int((top.x + bottom.x)/2 * w), int((top.y + bottom.y)/2 * h)
+                center_px = (cx, cy)
+                
+                # Distance des yeux
+                eye_left, eye_right = lm.landmark[33], lm.landmark[263]
+                eye_dist_px = math.sqrt((eye_left.x*w - eye_right.x*w)**2 + (eye_left.y*h - eye_right.y*h)**2)
+                
+                # Résultats
+                metric_coords = geom.get_metric_coordinates(center_px, eye_dist_px)
+                mouth_dist = math.sqrt((top.x - bottom.x)**2 + (top.y - bottom.y)**2)
+                status = "Ouverte" if mouth_dist > 0.04 else "Fermee"
+                
+                # =========================================================
+                # MAGIE : PROJECTION DANS LE MONDE RÉEL (PBVS)
+                # =========================================================
+                try:
+                    # 1. On récupère la matrice World -> Camera de ManiSkill3 (3x4)
+                    extrinsic_3x4 = obs["sensor_param"]["ee"]["extrinsic_cv"][0].cpu().numpy()
+                    
+                    # 2. On la convertit en matrice homogène carrée (4x4)
+                    world2cam = np.eye(4)
+                    world2cam[:3, :4] = extrinsic_3x4
+                    
+                    # 3. Maintenant on peut l'inverser pour faire Camera -> World !
+                    cam2world = np.linalg.inv(world2cam) 
+                    
+                    # 4. On crée le point homogène OpenCV (en mètres !)
+                    p_cam = np.array([metric_coords[0]/100.0, metric_coords[1]/100.0, metric_coords[2]/100.0, 1.0])
+                    
+                    # 5. On multiplie pour obtenir le (X, Y, Z) global du robot
+                    p_world = cam2world @ p_cam
+                    current_mouth_world = p_world[:3] / p_world[3]
+                    
+                    mouth_detected_this_frame = True
+                except KeyError:
+                    # Sécurité si la structure du dictionnaire ManiSkill change
+                    print("Attention: Matrice de caméra non trouvée.")
+            
+            # --- 4. AFFICHAGE DE L'INTERFACE ---
+            img_bgr = draw_complete_interface(
+                img_bgr, 0, status, 
+                results.multi_face_landmarks[0] if results.multi_face_landmarks else None, 
+                center_px, metric_coords
+            )
+            
+            cv2.imshow("Live Feed - Camera EE avec Tracking", img_bgr)
             cv2.waitKey(1)
             step_count += 1
 

@@ -8,6 +8,7 @@ resources/
 *.mp4
 *.obj
 *.gbl
+*.glb
 *.npz
 *.zip
 
