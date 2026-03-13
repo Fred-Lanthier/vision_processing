@@ -8,4 +8,5 @@ from . import test_requests
 from . import gazebo_simulation
 from . import SDF
 from . import Maniskill
+from . import SafeFlow_Hybrid
 

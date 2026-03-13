@@ -33,6 +33,7 @@ Frame Chain:
 import rospy
 import numpy as np
 import torch
+import torch.nn.functional as F
 import collections
 import os
 import sys
@@ -42,7 +43,8 @@ import tf.transformations as tft
 import trimesh
 from scipy.spatial import ConvexHull
 from sensor_msgs.msg import PointCloud2
-from geometry_msgs.msg import PoseArray, Pose
+from geometry_msgs.msg import PoseArray, Pose, PoseStamped
+from nav_msgs.msg import Path
 
 from utils import compute_T_child_parent_xacro
 
@@ -122,89 +124,57 @@ def farthest_point_sampling(points, n_samples):
 # SDF LOADER (lightweight — only needs query + load from .npz)
 # ==============================================================
 
-class SDFField:
-    """Loads a precomputed SDF from .npz and provides fast queries.
-    The SDF is a 3D voxel grid with trilinear interpolation.
-
-    Convention:
-        SDF > 0 → safe (outside forbidden zone)
-        SDF < 0 → forbidden (collision zone)
-        SDF = 0 → on the boundary
-    """
-
-    def __init__(self, npz_path):
+class SDFTensorField(torch.nn.Module):
+    def __init__(self, npz_path, device):
+        super().__init__()
         data = np.load(npz_path)
-        self.sdf_grid = data['sdf_grid']               # (Nx, Ny, Nz)
-        self.bounds_min = data['bounds_min']             # (3,) world origin of grid
-        self.bounds_max = data['bounds_max']             # (3,)
-        self.voxel_size = float(data['voxel_size'])      # meters per voxel
-        self.n_voxels = data['n_voxels']                 # (3,) grid dimensions
-        self.inner_radius = float(data.get('inner_radius', 0.00))
-        self.outer_radius = float(data.get('outer_radius', 0.0))
+        
+        # Le SDF doit être de forme (1, 1, D, H, W) pour grid_sample.
+        sdf_grid = torch.from_numpy(data['sdf_grid'].astype(np.float32)).to(device)
+        self.sdf_tensor = sdf_grid.unsqueeze(0).unsqueeze(0) 
+        
+        self.bounds_min = torch.from_numpy(data['bounds_min']).float().to(device)
+        self.bounds_max = torch.from_numpy(data['bounds_max']).float().to(device)
+        self.voxel_size = float(data['voxel_size'])
+        
+        # FIX : Extraction de l'attribut manquant pour l'affichage
+        if 'n_voxels' in data:
+            self.n_voxels = data['n_voxels']
+        else:
+            # Fallback automatique si le fichier npz est plus ancien
+            self.n_voxels = sdf_grid.shape 
 
-        rospy.loginfo(f"[SDF] Loaded: grid {self.n_voxels}, "
-                      f"voxel={self.voxel_size*1000:.1f}mm, "
-                      f"inner={self.inner_radius*1000:.1f}mm, "
-                      f"outer={self.outer_radius*1000:.1f}mm")
-
-    def query(self, points):
-        """Query SDF at given points (in container frame).
-
-        Args:
-            points: (N, 3) array in container frame coordinates
-        Returns:
-            distances: (N,) SDF values. Negative = inside forbidden zone.
-            gradients: (N, 3) normalized SDF gradients pointing toward safe region.
+    def forward(self, points_container):
         """
-        points = np.atleast_2d(points).astype(np.float64)
-
-        # Convert world coordinates → grid coordinates (continuous)
-        grid_coords = (points - self.bounds_min) / self.voxel_size - 0.5
-
-        distances = self._trilinear_interpolate(grid_coords)
-        gradients = self._compute_gradient(grid_coords)
-        return distances, gradients
-
-    def _trilinear_interpolate(self, grid_coords):
-        """Trilinear interpolation on the voxel grid."""
-        gc = np.clip(grid_coords, 0, np.array(self.n_voxels) - 1.001)
-        i0 = np.floor(gc).astype(int)
-        i1 = np.minimum(i0 + 1, np.array(self.n_voxels) - 1)
-        t = gc - i0
-
-        # 8 corner values
-        d000 = self.sdf_grid[i0[:, 0], i0[:, 1], i0[:, 2]]
-        d001 = self.sdf_grid[i0[:, 0], i0[:, 1], i1[:, 2]]
-        d010 = self.sdf_grid[i0[:, 0], i1[:, 1], i0[:, 2]]
-        d011 = self.sdf_grid[i0[:, 0], i1[:, 1], i1[:, 2]]
-        d100 = self.sdf_grid[i1[:, 0], i0[:, 1], i0[:, 2]]
-        d101 = self.sdf_grid[i1[:, 0], i0[:, 1], i1[:, 2]]
-        d110 = self.sdf_grid[i1[:, 0], i1[:, 1], i0[:, 2]]
-        d111 = self.sdf_grid[i1[:, 0], i1[:, 1], i1[:, 2]]
-
-        # Interpolate along x, then y, then z
-        c00 = d000 * (1 - t[:, 0]) + d100 * t[:, 0]
-        c01 = d001 * (1 - t[:, 0]) + d101 * t[:, 0]
-        c10 = d010 * (1 - t[:, 0]) + d110 * t[:, 0]
-        c11 = d011 * (1 - t[:, 0]) + d111 * t[:, 0]
-        c0 = c00 * (1 - t[:, 1]) + c10 * t[:, 1]
-        c1 = c01 * (1 - t[:, 1]) + c11 * t[:, 1]
-        return c0 * (1 - t[:, 2]) + c1 * t[:, 2]
-
-    def _compute_gradient(self, grid_coords):
-        """Central difference gradient, normalized to unit length."""
-        eps = 0.5  # half-voxel offset for central differences
-        d_xp = self._trilinear_interpolate(grid_coords + [eps, 0, 0])
-        d_xm = self._trilinear_interpolate(grid_coords - [eps, 0, 0])
-        d_yp = self._trilinear_interpolate(grid_coords + [0, eps, 0])
-        d_ym = self._trilinear_interpolate(grid_coords - [0, eps, 0])
-        d_zp = self._trilinear_interpolate(grid_coords + [0, 0, eps])
-        d_zm = self._trilinear_interpolate(grid_coords - [0, 0, eps])
-
-        grad = np.stack([(d_xp - d_xm), (d_yp - d_ym), (d_zp - d_zm)], axis=1)
-        grad /= (2 * eps * self.voxel_size)
-        norms = np.linalg.norm(grad, axis=1, keepdims=True)
-        return grad / np.maximum(norms, 1e-10)
+        points_container: (Batch, N_points, 3)
+        Retourne les valeurs SDF: (Batch, N_points)
+        """
+        center = (self.bounds_max + self.bounds_min) / 2.0
+        half_extent = (self.bounds_max - self.bounds_min) / 2.0
+        
+        # Normalisation [-1, 1]
+        grid_coords = (points_container - center) / half_extent
+        
+        # FIX MAJEUR : Inversion des axes pour grid_sample (X, Y, Z) -> (Z, Y, X)
+        # grid_sample map le 1er élément à W (nz), le 2ème à H (ny), et le 3ème à D (nx)
+        grid_coords = torch.stack([
+            grid_coords[..., 2],  # Le Z physique indexera la profondeur (nz)
+            grid_coords[..., 1],  # Le Y physique indexera la hauteur (ny)
+            grid_coords[..., 0]   # Le X physique indexera la largeur (nx)
+        ], dim=-1)
+        
+        # Reshape pour grid_sample: (Batch, 1, 1, N_points, 3)
+        grid_coords = grid_coords.unsqueeze(1).unsqueeze(1)
+        
+        # grid_sample (trilinéaire, rapide, différentiable)
+        sampled = F.grid_sample(
+            self.sdf_tensor.expand(points_container.shape[0], -1, -1, -1, -1),
+            grid_coords,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=False
+        )
+        return sampled.squeeze(1).squeeze(1).squeeze(1) # (Batch, N_points)
 
 
 # ==============================================================
@@ -270,205 +240,155 @@ def precompute_fork_safety_points(stl_path, scale, visual_origin_transform,
 # FMBF SAFETY FILTER
 # ==============================================================
 
-class FMBFSafetyFilter:
-    """Flow Matching Barrier Function safety filter.
-
-    Implements SafeFlow's closed-form QP correction (eq.16) using SDF:
-      h(s) = SDF(s)                          (barrier function)
-      b = ∇SDF(s)                            (gradient)
-      a = dot(b, v) + φ(t, h) * h           (constraint value)
-      u = -b * a / ||b||²  if a < 0         (minimal correction)
-
-    The blow-up function φ ensures convergence to safe set:
-      φ(t, h) = φ₀           if h >= 0  (already safe)
-      φ(t, h) = 1/(1-t)      if h < 0   (unsafe → force out before t=1)
-
-    Args:
-        sdf:                SDFField instance (in container frame)
-        T_container_world:  4x4 transform FROM world TO container frame
-                            i.e. p_container = T_container_world @ [p_world; 1]
-        fork_points_fast:   (M, 3) representative points in fork_tip frame
-        fork_points_full:   (N, 3) dense points in fork_tip frame
-        phi_0:              CBF gain for safe states (default 1.0)
-        t_star:             ODE time to start FMBF (default 0.5)
-    """
-
-    def __init__(self, sdf, T_container_world,
-                 fork_points_fast, fork_points_full,
-                 phi_0=1.0, t_star=0.5,
-                 max_terminal_shift=0.005):
-        self.sdf = sdf
-        self.fork_points_fast = fork_points_fast    # (M, 3) in fork_tip frame
-        self.fork_points_full = fork_points_full    # (N, 3) in fork_tip frame
-        self.phi_0 = phi_0
+class FMBFSafetyFilterPyTorch:
+    def __init__(self, sdf_tensor_field, T_container_world, fork_points_fast, fork_points_full, action_mean, action_std, phi_0, t_star, max_terminal_shift, device):
+        self.sdf = sdf_tensor_field
+        self.device = device
         self.t_star = t_star
+        self.phi_0 = phi_0
         self.max_terminal_shift = max_terminal_shift
-
-        # Precompute frame transforms
-        self.T_container_world = T_container_world
-        self.R_container_world = T_container_world[:3, :3]
-        self.R_world_container = self.R_container_world.T
-        self.t_container = T_container_world[:3, 3]
-
-    def phi(self, t, h):
-        """Bounded gain function.
         
-        Why NOT 1/(1-t):
-        ─────────────────
-        The 1/(1-t) blow-up from the SafeFlow paper gives theoretical convergence
-        guarantees, but in practice it creates corrections that are 10-100x the 
-        learned velocity. After dividing by std to go back to normalized space, 
-        these corrections overwhelm the velocity_net output and destabilize the ODE.
+        # Paramètres de normalisation
+        self.mean = torch.tensor(action_mean, device=device).float()
+        self.std = torch.tensor(action_std, device=device).float()
         
-        The terminal projection catches whatever the soft phi misses.
+        # Points locaux (Fast pour l'ODE, Full pour la projection terminale)
+        self.fork_points_local = torch.tensor(fork_points_fast, device=device).float()
+        self.fork_points_full_local = torch.tensor(fork_points_full, device=device).float()
         
-        Ramp: φ₀ at t=0  →  3·φ₀ at t=1
+        # Matrice de passage World -> Container
+        self.T_cw = torch.tensor(T_container_world, device=device).float()
+        self.R_cw = self.T_cw[:3, :3]
+        self.t_cw = self.T_cw[:3, 3]
+
+    def ortho6d_to_rot_batch(self, d6):
+        x_raw = d6[..., 0:3]
+        y_raw = d6[..., 3:6]
+        x = F.normalize(x_raw, dim=-1)
+        z = F.normalize(torch.cross(x, y_raw, dim=-1), dim=-1)
+        y = torch.cross(z, x, dim=-1)
+        return torch.stack([x, y, z], dim=-1)
+
+    def compute_correction(self, x_norm, v_norm, t_ode, fork_pos_world):
         """
-        return 1/(1-t) if h < 0 else self.phi_0
-
-    def _points_to_container_frame(self, points_world):
-        """Transform points from world frame to container (SDF) frame.
-
-        Math: p_container = R_container_world @ p_world + t_container
-              which is the same as T_world_container @ [p_world; 1]
-
-        Args:
-            points_world: (N, 3)
-        Returns:
-            points_container: (N, 3)
+        Calcule la correction FMBF exacte dans l'espace Euclidien (Physique),
+        puis la ramène dans l'espace normalisé pour le solveur ODE.
         """
-        return (self.R_container_world @ points_world.T).T + self.t_container
+        # CRITIQUE : L'inférence principale tourne dans un bloc "with torch.no_grad():".
+        # Il faut explicitement réactiver les gradients ici pour construire le graphe SDF.
+        with torch.enable_grad():
+            # 1. Obtenir l'état physique avec suivi des gradients
+            x_state = (x_norm * self.std + self.mean).clone().detach().requires_grad_(True)
+            
+            pos_centered = x_state[0, :, :3]
+            rot_6d = x_state[0, :, 3:9]
+            
+            # 2. Cinématique
+            pos_world = pos_centered + torch.tensor(fork_pos_world, device=self.device).float()
+            R_world = self.ortho6d_to_rot_batch(rot_6d) # (H, 3, 3)
+            
+            # (H, 3, 3) @ (3, N) -> (H, 3, N). Transpose -> (H, N, 3)
+            rotated_pts = torch.matmul(R_world, self.fork_points_local.T).transpose(1, 2)
+            fork_world = pos_world.unsqueeze(1) + rotated_pts
+            
+            # 3. Passage au repère conteneur
+            fork_container = torch.matmul(fork_world, self.R_cw.T) + self.t_cw
+            
+            # 4. Évaluation du SDF
+            h_values = self.sdf(fork_container) # (H, N_points)
+            
+            # Vitesse projetée dans l'espace physique
+            v_state = v_norm * self.std
+            corrections_state = torch.zeros_like(x_state)
+            
+            # Saturation du blow-up pour l'intégrateur Euler
+            phi_val = min(1.0 / (1.0 - t_ode + 1e-3), 50.0)
+            
+            for k in range(h_values.shape[0]): # Pour chaque waypoint de l'horizon
+                min_h_val, worst_idx = torch.min(h_values[k], dim=0)
+                
+                if min_h_val < 0.01: # Seuil d'activation de la barrière
+                    # PyTorch calcule le gradient Euclidien EXACT
+                    grad_g = torch.autograd.grad(min_h_val, x_state, retain_graph=True)[0]
+                    g_k = grad_g[0, k, :] # Vecteur 9D 
+                    
+                    g_norm_sq = torch.dot(g_k, g_k)
+                    if g_norm_sq > 1e-8:
+                        a_k = torch.dot(g_k, v_state[0, k, :]) + phi_val * min_h_val
+                        
+                        if a_k < 0:
+                            # Projection orthogonale (Correction QP)
+                            corrections_state[0, k, :] = -g_k * (a_k / g_norm_sq)
 
-    def _grad_to_world_frame(self, grad_container):
-        """Rotate SDF gradient from container frame to world frame.
+            # 5. Retour vers l'espace normalisé 
+            corrections_norm = corrections_state / self.std
+            corrections_norm = torch.clamp(corrections_norm, -3.0, 3.0) 
+            
+            # On détache le tenseur avant de le retourner à l'environnement "no_grad"
+            return corrections_norm.detach()
 
-        Since gradient is a direction (not a position), only rotation applies.
-        grad_world = R_world_container @ grad_container
-
-        Args:
-            grad_container: (3,) or (N, 3)
-        Returns:
-            grad_world: same shape
+    def get_debug_violations(self, fork_pos_world, rot_matrix_world):
+        """Utilitaire pour RViz : Calcule les violations SDF sur le GPU et renvoie à NumPy."""
+        with torch.no_grad():
+            pos = torch.tensor(fork_pos_world, device=self.device).float()
+            R = torch.tensor(rot_matrix_world, device=self.device).float()
+            
+            # Utilisation de l'ensemble complet des points pour le debug
+            fork_world = pos + torch.matmul(self.fork_points_full_local, R.T)
+            fork_container = torch.matmul(fork_world, self.R_cw.T) + self.t_cw
+            
+            h_values = self.sdf(fork_container.unsqueeze(0)).squeeze(0)
+            
+        return fork_world.cpu().numpy(), h_values.cpu().numpy()
+    
+    def terminal_projection(self, traj_np, max_iters=10, lr=0.005):
         """
-        if grad_container.ndim == 1:
-            return self.R_world_container @ grad_container
-        return (self.R_world_container @ grad_container.T).T
-
-    def compute_fork_world_points(self, pos_world, R_world):
-        """Compute world positions of representative fork points.
-
-        Each representative point offset_j is in the fork_tip local frame.
-        Its world position is:  p_j = pos_world + R_world @ offset_j
-
-        Args:
-            pos_world:    (3,) fork tip position in world frame
-            R_world:      (3, 3) fork tip rotation in world frame
-            use_full:     if True, use 50-point set; else use 5-point set
-        Returns:
-            points_world: (M, 3)
+        Filtre de sécurité terminal: Repousse physiquement les waypoints lissés hors du SDF.
+        traj_np: numpy array (Horizon, 9) contenant [pos_x, pos_y, pos_z, rot_6d]
         """
-        # Vectorized: (M, 3) = (3,) + (M, 3) @ (3, 3).T
-        # But we want R @ offset for each offset, so: (M, 3) = offsets @ R.T
-        return pos_world + self.fork_points_fast @ R_world.T
-
-    def compute_fork_world_points_full(self, pos_world, R_world):
-        """Same as above but with the 50-point set for terminal check."""
-        return pos_world + self.fork_points_full @ R_world.T
-
-    def compute_correction(self, waypoint_pos_world, waypoint_rot_world,
-                           velocity_pos_state, t_ode):
-        """Compute FMBF correction for one waypoint (closed-form QP).
-
-        Steps:
-            1. Transform 5 fork representative points to container frame
-            2. Query SDF → get h and ∇h for each point
-            3. Find worst violation (min h)
-            4. Compute a = dot(∇h, v_pos) + φ(t, h) * h
-            5. If a < 0: u = -∇h * a / ||∇h||²  (minimal correction)
-
-        Args:
-            waypoint_pos_world:   (3,) position in world frame
-            waypoint_rot_world:   (3, 3) rotation in world frame
-            velocity_pos_state:   (3,) position velocity in centered frame
-            t_ode:                current ODE time in [0, 1)
-
-        Returns:
-            correction:  (3,) velocity correction in centered frame (world orientation)
-                         Zero if no correction needed.
-        """
-        # Step 1: Fork points in world frame
-        fork_world = self.compute_fork_world_points(waypoint_pos_world,
-                                                     waypoint_rot_world)
-
-        # Step 2: Transform to container frame and query SDF
-        fork_container = self._points_to_container_frame(fork_world)
-        h_values, grad_container = self.sdf.query(fork_container)
-
-        # Step 3: Worst violation
-        worst_idx = np.argmin(h_values)
-        h_worst = h_values[worst_idx]
-        grad_worst_container = grad_container[worst_idx]  # (3,) in container frame
-
-        # Step 4: Transform gradient to world frame
-        # Since we use translation-only centering, world and centered frame
-        # share the same orientation → gradient in world = gradient in centered
-        grad_world = self._grad_to_world_frame(grad_worst_container)
-
-        # Step 5: Compute a_k = dot(b_k, v_k) + φ(t, h_k) * h_k
-        a_k = np.dot(grad_world, velocity_pos_state) + self.phi(t_ode, h_worst) * h_worst
-
-        # Step 6: Closed-form QP solution (SafeFlow eq.16)
-        if a_k >= 0:
-            return np.zeros(3)  # constraint satisfied, no correction
-        else:
-            grad_norm_sq = np.dot(grad_world, grad_world)
-            if grad_norm_sq < 1e-12:
-                return np.zeros(3)  # degenerate gradient, skip
-            return -grad_world * a_k / grad_norm_sq
-
-    def terminal_projection(self, trajectory_world, max_iters=3):
-        """Terminal safety: iterative projection — NO shift clamp.
-
-        This runs AFTER the ODE and AFTER the ensembler. No risk of
-        destabilizing the ODE integration, so we apply the FULL correction
-        needed to reach h=0 in each pass.
-
-        Multiple passes handle rigid-body coupling (fixing one fork point
-        can push another into violation).
-        """
-        trajectory_safe = trajectory_world.copy()
-        total_corrections = 0
-
-        for iteration in range(max_iters):
-            n_corrections = 0
-            for k in range(trajectory_safe.shape[0]):
-                pos_world = trajectory_safe[k, :3]
-                rot_6d = trajectory_safe[k, 3:9]
-                R_world = ortho6d_to_rotation_matrix(rot_6d[None, None, :])[0, 0]
-
-                fork_world = self.compute_fork_world_points_full(pos_world, R_world)
-                fork_container = self._points_to_container_frame(fork_world)
-                h_values, grad_container = self.sdf.query(fork_container)
-
-                worst_idx = np.argmin(h_values)
-                h_worst = h_values[worst_idx]
-
-                if h_worst < 0:
-                    grad_world = self._grad_to_world_frame(grad_container[worst_idx])
-                    grad_norm = np.linalg.norm(grad_world)
-                    if grad_norm > 1e-8:
-                        # Full correction: push to h=0 plus 1mm margin
-                        shift_mag = (-h_worst + 0.001) / grad_norm
-                        trajectory_safe[k, :3] += (grad_world / grad_norm) * shift_mag
-                        n_corrections += 1
-
-            total_corrections += n_corrections
-            if n_corrections == 0:
-                break
-
-        return trajectory_safe, total_corrections
-
-
+        traj = torch.tensor(traj_np, device=self.device, dtype=torch.float32)
+        n_fixes = 0
+        
+        # On projette chaque waypoint de la trajectoire finale
+        for k in range(traj.shape[0]):
+            pos_world = traj[k, :3].clone().requires_grad_(True)
+            rot_6d = traj[k, 3:9].clone() 
+            
+            R_world = self.ortho6d_to_rot_batch(rot_6d.unsqueeze(0))[0]
+            
+            for i in range(max_iters):
+                # Évaluation cinématique avec TOUS les points de sécurité (fork_points_full_local)
+                fork_world = pos_world + torch.matmul(self.fork_points_full_local, R_world.T)
+                fork_container = torch.matmul(fork_world, self.R_cw.T) + self.t_cw
+                
+                h_vals = self.sdf(fork_container.unsqueeze(0)).squeeze(0)
+                min_h, _ = torch.min(h_vals, dim=0)
+                
+                # Si le point le plus profond est sûr (marge de 2mm), on arrête
+                if min_h >= 0.002: 
+                    break
+                    
+                # Violation détectée : on calcule le gradient pour repousser la position
+                loss = -min_h 
+                grad_pos = torch.autograd.grad(loss, pos_world)[0]
+                
+                with torch.no_grad():
+                    # On déplace la position dans le sens opposé au gradient de pénétration
+                    pos_world -= lr * grad_pos
+                    
+                    # On limite le déplacement total pour éviter les sauts brutaux
+                    shift_norm = torch.norm(pos_world - traj[k, :3])
+                    if shift_norm > self.max_terminal_shift:
+                        direction = (pos_world - traj[k, :3]) / shift_norm
+                        pos_world = traj[k, :3] + direction * self.max_terminal_shift
+                        break # Décalage maximal atteint
+                        
+                    pos_world.requires_grad_(True)
+                n_fixes += 1
+                
+            traj[k, :3] = pos_world.detach()
+            
+        return traj.cpu().numpy(), n_fixes
 # ==============================================================
 # TEMPORAL ENSEMBLER (unchanged)
 # ==============================================================
@@ -529,7 +449,7 @@ class FlowMatchingInferenceNodeFork:
         # =====================================================
         # LOAD MODEL
         # =====================================================
-        model_name = rospy.get_param("~model_name", "last_fm_model_high_dim_CFM_relative_dropout.ckpt")
+        model_name = rospy.get_param("~model_name", "last_fm_model_high_dim_CFM_relative.ckpt")
         self.model_path = os.path.join(pkg_path, 'models', model_name)
 
         if not os.path.exists(self.model_path):
@@ -626,6 +546,10 @@ class FlowMatchingInferenceNodeFork:
             "/diffusion/target_trajectory", PoseArray, queue_size=1
         )
 
+        self.pub_path = rospy.Publisher(
+            "/diffusion/target_path", Path, queue_size=1
+        )
+
         # Debug visualization publishers
         self.pub_safety_points = rospy.Publisher(
             "/safety/fork_points", PointCloud2, queue_size=1
@@ -654,9 +578,22 @@ class FlowMatchingInferenceNodeFork:
             buffer_size=3
         )
 
-        self.control_rate = rospy.get_param("~control_rate", 10.0)
-        rospy.Timer(rospy.Duration(1.0 / self.control_rate), self.control_loop)
-        rospy.loginfo("Node Ready (Flow Matching — SafeFlow Edition)")
+        # =====================================================
+        # TIMERS (Séparation de la physique et de l'inférence)
+        # =====================================================
+        self.latest_fork_pos = None
+        self.latest_fork_rot = None
+        
+        # 1. Timer d'Observation (RAPIDE) : Doit correspondre EXACTEMENT 
+        # à la fréquence de tes données d'entraînement (ex: 10 Hz)
+        self.state_rate = 10.0
+        rospy.Timer(rospy.Duration(1.0 / self.state_rate), self.update_state_history)
+        
+        # 2. Timer d'Inférence (LENT) : Tourne aussi vite que le GPU le permet
+        self.inference_rate = 10.0 
+        rospy.Timer(rospy.Duration(1.0 / self.inference_rate), self.control_loop)
+        
+        rospy.loginfo("Node Ready (Flow Matching — Asynchronous State Tracking)")
 
     # =====================================================
     # SAFETY INITIALIZATION
@@ -693,7 +630,7 @@ class FlowMatchingInferenceNodeFork:
         sdf_path = rospy.get_param("~sdf_path", "")
         if not sdf_path:
             print("[Safety] No ~sdf_path provided, using default from package")
-            sdf_path = os.path.join(package_path, 'models', 'sdf_field_No_outter.npz')
+            sdf_path = os.path.join(package_path, 'models', 'sdf_field_No_outter_tiny.npz')
             print(f"[Safety] Default SDF path: {sdf_path}")
         if not os.path.exists(sdf_path):
             rospy.logerr(f"[Safety] SDF not found: {sdf_path}")
@@ -701,7 +638,8 @@ class FlowMatchingInferenceNodeFork:
             return
 
         print(f"[Safety] Loading SDF from: {sdf_path}")
-        sdf = SDFField(sdf_path)
+        # FIX : Utilisation du device global du noeud ROS pour éviter les crashs de type
+        sdf = SDFTensorField(sdf_path, self.device)
         print(f"[Safety] SDF loaded: grid {sdf.n_voxels}, "
               f"voxel={sdf.voxel_size*1000:.1f}mm")
 
@@ -757,14 +695,17 @@ class FlowMatchingInferenceNodeFork:
         t_star = rospy.get_param("~safety_t_star", 0.5)
         max_terminal_shift = rospy.get_param("~safety_max_terminal_shift", 0.005)
 
-        self.safety_filter = FMBFSafetyFilter(
-            sdf=sdf,
+        self.safety_filter = FMBFSafetyFilterPyTorch(
+            sdf_tensor_field=sdf,
             T_container_world=T_container_world,
             fork_points_fast=fork_fast,
             fork_points_full=fork_full,
+            action_mean=self.action_mean,       # Requis pour la Jacobienne Euclidienne
+            action_std=self.action_std,         # Requis pour la Jacobienne Euclidienne
             phi_0=phi_0,
             t_star=t_star,
             max_terminal_shift=max_terminal_shift,
+            device=self.device                  # Requis pour placer les tenseurs sur GPU
         )
         if self.safety_filter is not None:
             rospy.loginfo("[Safety] FMBF Safety Filter initialized successfully.")
@@ -822,32 +763,37 @@ class FlowMatchingInferenceNodeFork:
     # MAIN CONTROL LOOP
     # =====================================================
 
-    def control_loop(self, event):
-        if self.latest_cloud is None:
+    def update_state_history(self, event):
+        """Thread rapide (10Hz) pour maintenir l'historique de vitesse intact."""
+        pos, rot = self.get_current_fork_pose()
+        if pos is None:
             return
-
-        self.fork_pos, self.fork_rot = self.get_current_fork_pose()
-        if self.fork_pos is None:
+            
+        self.latest_fork_pos = pos
+        self.latest_fork_rot = rot
+        
+        rot_6d = rotation_matrix_to_ortho6d(rot)
+        curr_pose_9d = np.concatenate([pos, rot_6d.flatten()])
+        self.obs_queue.append(curr_pose_9d)
+        
+    def control_loop(self, event):
+        if len(self.obs_queue) < self.obs_horizon or self.latest_cloud is None or self.latest_fork_pos is None:
             return
 
         # ── Debug: publish fork safety points at CURRENT pose ──
         if self.safety_filter is not None:
-            self._publish_safety_debug(self.fork_pos, self.fork_rot)
+            self._publish_safety_debug(self.latest_fork_pos, self.latest_fork_rot)
 
-        rot_6d = rotation_matrix_to_ortho6d(self.fork_rot)
-        curr_pose_9d = np.concatenate([self.fork_pos, rot_6d.flatten()])
-
-        self.obs_queue.append(curr_pose_9d)
-        if len(self.obs_queue) < self.obs_horizon:
-            return
+        # On "gèle" l'état au moment où l'inférence commence
+        snapshot_fork_pos = self.latest_fork_pos.copy()
+        obs_seq_world = np.stack(self.obs_queue)
 
         # =====================================================
         # TRANSLATION-ONLY CENTERING
         # =====================================================
-        pcd_centered = self.latest_cloud - self.fork_pos
-        obs_seq_world = np.stack(self.obs_queue)
+        pcd_centered = self.latest_cloud - snapshot_fork_pos
         obs_seq_centered = obs_seq_world.copy()
-        obs_seq_centered[:, :3] -= self.fork_pos
+        obs_seq_centered[:, :3] -= snapshot_fork_pos
 
         # =====================================================
         # FLOW MATCHING INFERENCE WITH FMBF
@@ -857,20 +803,16 @@ class FlowMatchingInferenceNodeFork:
         t_obs_norm = self.model.normalizer.normalize(t_obs)
 
         with torch.no_grad():
-            # Encode observation ONCE
             obs_for_encoding = {'point_cloud': t_pcd, 'agent_pos': t_obs_norm}
             global_cond = self.model.encode_obs(obs_for_encoding)
 
-            # ODE integration with FMBF correction
-            x = torch.randn(1, self.pred_horizon, self.action_dim,
-                             device=self.device)
+            x = torch.randn(1, self.pred_horizon, self.action_dim, device=self.device)
             dt = 1.0 / self.num_ode_steps
 
             for i in range(self.num_ode_steps):
                 t_val = i * dt
                 t_tensor = torch.tensor([t_val], device=self.device)
 
-                # --- Compute learned velocity ---
                 if self.ode_method == 'euler':
                     v = self.model.velocity_net(x, t_tensor, global_cond)
                 elif self.ode_method == 'midpoint':
@@ -879,125 +821,81 @@ class FlowMatchingInferenceNodeFork:
                     x_mid = x + v1 * (dt / 2)
                     v = self.model.velocity_net(x_mid, t_mid, global_cond)
 
-                # --- FMBF safety correction (only for t >= t_star) ---
-                if (self.safety_filter is not None
-                        and t_val >= self.safety_filter.t_star):
-                    v = self._apply_fmbf_correction(x, v, t_val)
+                if (self.safety_filter is not None and t_val >= self.safety_filter.t_star):
+                    v = self._apply_fmbf_correction(x, v, t_val, snapshot_fork_pos)
 
-                # --- Step ---
                 x = x + v * dt
 
-            # Unnormalize back to physical units
             action_centered = self.model.normalizer.unnormalize(x)
             action_centered_np = action_centered[0].cpu().numpy()
 
-        # =====================================================
-        # GRAM-SCHMIDT ORTHONORMALIZATION ON ROTATIONS
-        # =====================================================
         for t in range(action_centered_np.shape[0]):
-            col1, col2 = gram_schmidt_6d(
-                action_centered_np[t, 3:6],
-                action_centered_np[t, 6:9]
-            )
+            col1, col2 = gram_schmidt_6d(action_centered_np[t, 3:6], action_centered_np[t, 6:9])
             action_centered_np[t, 3:6] = col1
             action_centered_np[t, 6:9] = col2
 
-        # =====================================================
-        # BACK TO WORLD FRAME
-        # =====================================================
         action_world_np = action_centered_np.copy()
-        action_world_np[:, :3] += self.fork_pos
+        action_world_np[:, :3] += snapshot_fork_pos
 
-        # ── DIAGNOSTICS ──
-        span = action_centered_np[-1, :3] - action_centered_np[0, :3]
-        rospy.loginfo(f"[FM] Centered span: [{span[0]:.4f}, {span[1]:.4f}, "
-                      f"{span[2]:.4f}] = {np.linalg.norm(span)*100:.1f}cm")
-        rospy.loginfo(f"[FM] World pos[0]: {action_world_np[0,:3]}")
-        rospy.loginfo(f"[FM] World pos[-1]: {action_world_np[-1,:3]}")
+        # =====================================================
+        # FIX: LATENCY TRIMMING (CROPPING THE PAST)
+        # =====================================================
+        # L'inférence a pris du temps. Où est le robot *exactement maintenant* ?
+        actual_pos, _ = self.get_current_fork_pose()
+        if actual_pos is not None:
+            distances = np.linalg.norm(action_world_np[:, :3] - actual_pos, axis=1)
+            closest_idx = np.argmin(distances)
+            
+            # Si le robot est déjà rendu au waypoint 4, on supprime les waypoints 0, 1, 2, 3 !
+            # RViz n'affichera que le futur et le follower ne regardera plus en arrière.
+            start_idx = max(0, closest_idx)
+            action_world_np = action_world_np[start_idx:]
 
-        self.ensembler.add_prediction(action_world_np)
-        smooth_traj = self.ensembler.get_ensembled_trajectory(num_steps=8)
+        if action_world_np.shape[0] < 2:
+            return # La trajectoire entière est déjà dans le passé, on annule.
 
-        if smooth_traj is not None:
-            # Terminal projection AFTER ensembling — the ensembler can blend
-            # safe trajectories into unsafe ones, so we must re-check here.
-            if self.safety_filter is not None:
-                smooth_traj, n_fixes = self.safety_filter.terminal_projection(
-                    smooth_traj)
-                if n_fixes > 0:
-                    rospy.loginfo(f"[Safety] Terminal: corrected {n_fixes} waypoints")
+        raw_traj = action_world_np.copy()
 
-            self.publish_trajectory(smooth_traj)
+        if self.safety_filter is not None:
+            smooth_traj, n_fixes = self.safety_filter.terminal_projection(raw_traj)
+            if n_fixes > 0:
+                rospy.loginfo(f"[Safety] Terminal: corrected {n_fixes} waypoints")
+        else:
+            smooth_traj = raw_traj
+
+        self.publish_trajectory(smooth_traj)
 
     # =====================================================
     # FMBF CORRECTION (called inside ODE loop)
     # =====================================================
 
-    def _apply_fmbf_correction(self, x_norm, v_norm, t_ode):
-        """Apply FMBF corrections
-        """
-        x_np = x_norm[0].cpu().numpy()       # (H, 9) normalized
-        v_np = v_norm[0].cpu().numpy()        # (H, 9) normalized
-
-        # Denormalize to state space
-        x_state = x_np * self.action_std + self.action_mean
-        v_state = v_np * self.action_std
-
-        corrections = np.zeros((self.pred_horizon, 3))
-
-        for k in range(self.pred_horizon):
-            pos_centered = x_state[k, :3]
-            pos_world = pos_centered + self.fork_pos
-
-            rot_6d = x_state[k, 3:9]
-            R_world = ortho6d_to_rotation_matrix(rot_6d[None, None, :])[0, 0]
-
-            v_pos_state = v_state[k, :3]
-
-            u_state = self.safety_filter.compute_correction(
-                pos_world, R_world, v_pos_state, t_ode
-            )
-            corrections[k] = u_state
-
-        # ── Convert to normalized space ──
-        corrections_norm = corrections / (self.action_std[:3] + 1e-10)
-
-        # Build full 9D correction (only position dims)
-        correction_full = np.zeros_like(v_np)
-        correction_full[:, :3] = corrections_norm
-
-        correction_tensor = torch.from_numpy(correction_full).unsqueeze(0).float().to(self.device)
+    def _apply_fmbf_correction(self, x_norm, v_norm, t_ode, fork_pos_world):
+        """Apply FMBF corrections fully on GPU using the frozen snapshot position"""
+        correction_tensor = self.safety_filter.compute_correction(
+            x_norm, v_norm, t_ode, fork_pos_world
+        )
         return v_norm + correction_tensor
-
+    
     # =====================================================
     # SAFETY DEBUG VISUALIZATION
     # =====================================================
 
     def _publish_safety_debug(self, fork_pos, fork_rot):
-        """Publish fork safety points for RViz visualization.
-
-        Publishes two PointCloud2 topics:
-          /safety/fork_points   — ALL 50 safety points (solid green)
-          /safety/violations    — only points with h < 0 (solid red)
-        """
+        """Publish fork safety points for RViz visualization."""
         import sensor_msgs.point_cloud2 as pc2
         from std_msgs.msg import Header
         import struct
 
-        sf = self.safety_filter
+        if self.safety_filter is None:
+            return
 
-        # Transform FULL set (50 points) to world frame using CURRENT fork pose
-        fork_world = sf.compute_fork_world_points_full(fork_pos, fork_rot)
-
-        # Query SDF to find violations
-        fork_container = sf._points_to_container_frame(fork_world)
-        h_values, _ = sf.sdf.query(fork_container)
+        # 1. Obtenir les points et valeurs h via PyTorch
+        fork_world, h_values = self.safety_filter.get_debug_violations(fork_pos, fork_rot)
 
         header = Header()
         header.frame_id = "world"
         header.stamp = rospy.Time.now()
 
-        # Helper to pack RGB colors into a float32 for PointCloud2
         def pack_rgb(r, g, b):
             a = 255
             packed = (a << 24) | (r << 16) | (g << 8) | b
@@ -1006,7 +904,6 @@ class FlowMatchingInferenceNodeFork:
         color_green = pack_rgb(0, 255, 0)
         color_red = pack_rgb(255, 0, 0)
 
-        # Fields definition for X, Y, Z and RGB
         fields_rgb = [
             pc2.PointField('x', 0, pc2.PointField.FLOAT32, 1),
             pc2.PointField('y', 4, pc2.PointField.FLOAT32, 1),
@@ -1014,37 +911,20 @@ class FlowMatchingInferenceNodeFork:
             pc2.PointField('rgb', 12, pc2.PointField.FLOAT32, 1),
         ]
 
-        # 1. Publish ALL safety points (Green)
-        points_green = []
-        for i in range(fork_world.shape[0]):
-            points_green.append([
-                float(fork_world[i, 0]),
-                float(fork_world[i, 1]),
-                float(fork_world[i, 2]),
-                color_green
-            ])
-        cloud_msg_green = pc2.create_cloud(header, fields_rgb, points_green)
-        self.pub_safety_points.publish(cloud_msg_green)
+        # 2. Points verts (Tous les points de la fourchette)
+        points_green = [[float(p[0]), float(p[1]), float(p[2]), color_green] for p in fork_world]
+        self.pub_safety_points.publish(pc2.create_cloud(header, fields_rgb, points_green))
 
-        # 2. Publish only VIOLATION points (Red)
+        # 3. Points rouges (Violations uniquement : h < 0)
         violations = fork_world[h_values < 0]
         if violations.shape[0] > 0:
-            points_red = []
-            for v in violations:
-                points_red.append([
-                    float(v[0]),
-                    float(v[1]),
-                    float(v[2]),
-                    color_red
-                ])
-            viol_msg = pc2.create_cloud(header, fields_rgb, points_red)
-            self.pub_safety_violations.publish(viol_msg)
+            points_red = [[float(v[0]), float(v[1]), float(v[2]), color_red] for v in violations]
+            self.pub_safety_violations.publish(pc2.create_cloud(header, fields_rgb, points_red))
 
-            # Log the worst violation for diagnosis
             worst_h = np.min(h_values)
             n_viol = np.sum(h_values < 0)
-            rospy.loginfo(f"[Safety VIZ] {n_viol}/{len(h_values)} points in violation, "
-                          f"worst h={worst_h:.4f} ({worst_h*1000:.1f}mm)")
+            # Limiter l'affichage des logs pour ne pas spammer la console à 10 Hz
+            rospy.loginfo_throttle(1.0, f"[Safety VIZ] {n_viol}/{len(h_values)} points en collision, pire h={worst_h*1000:.1f}mm")
 
     def _publish_sdf_visualization(self):
         """Extracts and publishes ONLY the SDF 'no-go zone' boundary for RViz."""
@@ -1056,9 +936,14 @@ class FlowMatchingInferenceNodeFork:
             return
 
         sdf = self.safety_filter.sdf
-        nx, ny, nz = sdf.n_voxels
+        
+        # Extraction dynamique depuis la forme du Tenseur PyTorch: (1, 1, nx, ny, nz)
+        shape = sdf.sdf_tensor.shape
+        nx, ny, nz = shape[2], shape[3], shape[4]
         voxel_size = sdf.voxel_size
-        bounds_min = sdf.bounds_min
+        
+        # Copie CPU pour le traitement NumPy
+        bounds_min = sdf.bounds_min.cpu().numpy()
 
         # Générer les coordonnées de la grille 3D
         ix, iy, iz = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
@@ -1068,13 +953,11 @@ class FlowMatchingInferenceNodeFork:
         points_z = bounds_min[2] + (iz + 0.5) * voxel_size
 
         points_container = np.stack([points_x, points_y, points_z], axis=-1).reshape(-1, 3)
-        sdf_values = sdf.sdf_grid.reshape(-1)
+        
+        # CORRECTION DU CRASH: Extraction des valeurs depuis le tenseur PyTorch
+        sdf_values = sdf.sdf_tensor.cpu().numpy().reshape(-1)
 
         # ── SÉLECTION DE LA "NO-GO ZONE" ──
-        # SDF <= 0.0 : On est à l'intérieur du conteneur (collision).
-        # SDF >= -0.010 : On limite à une coquille de 1 cm d'épaisseur.
-        # Pourquoi une coquille ? Si on publiait le volume plein, les points 
-        # transparents s'empileraient visuellement et le résultat serait opaque.
         mask = (sdf_values <= 0.0) & (sdf_values >= -0.12)
         
         boundary_points = points_container[mask]
@@ -1095,7 +978,6 @@ class FlowMatchingInferenceNodeFork:
             pc2.PointField('rgb', 12, pc2.PointField.FLOAT32, 1),
         ]
 
-        # On colore tout en rouge uni
         color_red = pack_rgb(255, 0, 0)
         points_list = []
         
@@ -1116,9 +998,13 @@ class FlowMatchingInferenceNodeFork:
     # =====================================================
 
     def publish_trajectory(self, trajectory):
-        msg = PoseArray()
-        msg.header.frame_id = "world"
-        msg.header.stamp = rospy.Time.now()
+        msg_pose_array = PoseArray()
+        msg_pose_array.header.frame_id = "world"
+        msg_pose_array.header.stamp = rospy.Time.now()
+
+        # Initialisation du message Path
+        msg_path = Path()
+        msg_path.header = msg_pose_array.header
 
         for pose_9d in trajectory:
             pos = pose_9d[:3]
@@ -1128,13 +1014,23 @@ class FlowMatchingInferenceNodeFork:
             M[:3, :3] = rot_mat
             quat = tft.quaternion_from_matrix(M)
 
+            # Création de la Pose basique
             p = Pose()
             p.position.x, p.position.y, p.position.z = pos
             p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = quat
-            msg.poses.append(p)
+            msg_pose_array.poses.append(p)
 
-        rospy.loginfo(f"Fork tip: {np.linalg.norm(self.fork_pos):.4f}")
-        self.pub_trajectory.publish(msg)
+            # Création de la PoseStamped pour le Path
+            ps = PoseStamped()
+            ps.header = msg_path.header
+            ps.pose = p
+            msg_path.poses.append(ps)
+
+        rospy.loginfo(f"Fork tip: {np.linalg.norm(self.latest_fork_pos):.4f}")
+        
+        # Publication simultanée
+        self.pub_trajectory.publish(msg_pose_array)
+        self.pub_path.publish(msg_path)
 
 
 if __name__ == "__main__":

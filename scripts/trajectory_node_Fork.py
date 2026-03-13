@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 """
-Trajectory Follower for FORK - Continuous Blending Approach
+Trajectory Follower for FORK - Continuous Blending Approach (OPTIMIZED)
 
-DIFFERENT PHILOSOPHY:
-Instead of discrete chunks with commitment, this version:
-1. Always accepts the latest trajectory
-2. Continuously blends toward a "target" point that advances along the trajectory
-3. Uses a pursuit-style algorithm (like Pure Pursuit for mobile robots)
-
-This often produces smoother results for diffusion policies because:
-- No hard transitions between chunks
-- Natural velocity limiting through the blending
-- Automatic handling of prediction noise
-
-The key idea: Don't commit to waypoints, commit to a DIRECTION.
+Optimization: 
+Instead of computing Inverse Kinematics (IK) for the entire trajectory array 
+(which blocks the thread and causes massive latency/lag), this version computes 
+the closest point in pure Cartesian space, selects the Lookahead target, 
+and computes IK ONLY ONCE per control cycle.
 """
 import rospy
 import rospkg
@@ -22,6 +15,8 @@ import sys
 import os
 import numpy as np
 import threading
+import tf
+import tf.transformations as tft
 from geometry_msgs.msg import PoseArray, Pose
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import JointState
@@ -50,32 +45,20 @@ class TrajectoryFollowerContinuous:
         # KEY PARAMETERS
         # =============================================
         
-        # High control rate for smooth motion
         self.control_rate = 30.0  # Hz
-        
-        # LOOKAHEAD: How far ahead in the trajectory to target
-        # Larger = smoother but slower to react
-        # Smaller = more reactive but potentially jerky
         self.lookahead_steps = 3  # Target the 3rd waypoint ahead
-        
-        # BLEND RATE: How fast to blend toward target (per control step)
-        # 0.0 = don't move, 1.0 = instant snap to target
-        # 0.1-0.3 is usually good
         self.blend_rate = 0.15
-        
-        # Maximum joint velocity (rad/s) - limits motion speed
         self.max_joint_velocity = 0.7  # rad/s per joint
-        
-        # Safety
         self.max_joint_jump = 0.5
-        self.z_min_safety = 0.000
         
         # State
         self.current_joints = None
-        self.target_joints = None  # Current target we're blending toward
-        self.latest_trajectory = None  # Most recent trajectory from inference
-        self.trajectory_timestamp = None
+        self.target_joints = None  
+        self.latest_msg = None     # We now store the raw ROS message
         self.lock = threading.Lock()
+        
+        # TF Listener pour trouver la position Cartesienne instantanée
+        self.tf_listener = tf.TransformListener()
         
         # MoveIt setup
         moveit_commander.roscpp_initialize(sys.argv)
@@ -95,17 +78,12 @@ class TrajectoryFollowerContinuous:
             "/diffusion/target_trajectory", 
             PoseArray, 
             self.traj_callback, 
-            queue_size=1,
-            buff_size=2**24 
+            queue_size=1
         )
         self.sub_joints = rospy.Subscriber("/joint_states", JointState, self.joint_cb)
         
         rospy.loginfo("=" * 60)
-        rospy.loginfo("🚀 Fork Trajectory Follower (Continuous Blending)")
-        rospy.loginfo(f"   Control rate: {self.control_rate} Hz")
-        rospy.loginfo(f"   Lookahead steps: {self.lookahead_steps}")
-        rospy.loginfo(f"   Blend rate: {self.blend_rate}")
-        rospy.loginfo(f"   Max velocity: {self.max_joint_velocity} rad/s")
+        rospy.loginfo("🚀 Fork Trajectory Follower (ULTRA-FAST Cartesian Blending)")
         rospy.loginfo("=" * 60)
 
     def joint_cb(self, msg):
@@ -115,13 +93,10 @@ class TrajectoryFollowerContinuous:
                 positions.append(pos)
         if len(positions) == 7:
             self.current_joints = np.array(positions)
-            
-            # Initialize target to current position
             if self.target_joints is None:
                 self.target_joints = self.current_joints.copy()
 
     def transform_fork_to_tcp(self, pose_fork):
-        """Transform pose from fork_tip frame to TCP frame."""
         p = np.array([pose_fork.position.x, pose_fork.position.y, pose_fork.position.z])
         q = np.array([pose_fork.orientation.x, pose_fork.orientation.y, 
                       pose_fork.orientation.z, pose_fork.orientation.w])
@@ -140,7 +115,6 @@ class TrajectoryFollowerContinuous:
         pose_tcp.orientation.y = q_tcp[1]
         pose_tcp.orientation.z = q_tcp[2]
         pose_tcp.orientation.w = q_tcp[3]
-        
         return pose_tcp
 
     def compute_ik(self, pose, frame_id, seed=None, timeout=0.03):
@@ -164,107 +138,64 @@ class TrajectoryFollowerContinuous:
         except:
             return None
 
-    def process_trajectory(self, msg, frame_id):
-        """Convert PoseArray to joint configurations."""
-        if self.current_joints is None:
-            return None
-        
-        trajectory_joints = []
-        prev_joints = self.current_joints.copy()
-        
-        for i, pose_fork in enumerate(msg.poses):
-            if pose_fork.position.z < self.z_min_safety:
-                pose_fork.position.z = self.z_min_safety
-            
-            pose_tcp = self.transform_fork_to_tcp(pose_fork)
-            sol = self.compute_ik(pose_tcp, frame_id, seed=prev_joints)
-            
-            if sol is not None:
-                if np.max(np.abs(sol - prev_joints)) <= self.max_joint_jump:
-                    trajectory_joints.append(sol)
-                    prev_joints = sol
-                else:
-                    break
-            else:
-                if len(trajectory_joints) > 0:
-                    trajectory_joints.append(trajectory_joints[-1])
-        
-        return trajectory_joints if len(trajectory_joints) > 0 else None
-
-    def find_closest_index(self, trajectory):
-        """Find index of closest point in trajectory to current position."""
-        if self.current_joints is None or len(trajectory) == 0:
-            return 0
-        
-        distances = [np.linalg.norm(t - self.current_joints) for t in trajectory]
-        return np.argmin(distances)
-
     def traj_callback(self, msg):
         """
-        Store the latest trajectory. No commitment - just update.
+        Stocke simplement le message. AUCUN CALCUL BLOQUANT ICI.
         """
         with self.lock:
-            trajectory_joints = self.process_trajectory(msg, msg.header.frame_id)
-            
-            if trajectory_joints is not None and len(trajectory_joints) >= 2:
-                self.latest_trajectory = trajectory_joints
-                self.trajectory_timestamp = rospy.Time.now()
-
-    def get_lookahead_target(self):
-        """
-        Find the target point to blend toward.
-        
-        Uses "carrot on a stick" approach:
-        1. Find closest point on trajectory
-        2. Look ahead by lookahead_steps
-        3. Return that as target
-        """
-        if self.latest_trajectory is None or len(self.latest_trajectory) == 0:
-            return None
-        
-        # Find where we are on the trajectory
-        closest_idx = self.find_closest_index(self.latest_trajectory)
-        
-        # Look ahead
-        target_idx = min(closest_idx + self.lookahead_steps, len(self.latest_trajectory) - 1)
-        
-        return self.latest_trajectory[target_idx]
+            if len(msg.poses) > 0:
+                self.latest_msg = msg
 
     def compute_command(self):
-        """
-        Compute the joint command by blending toward the lookahead target.
-        
-        This is the core of the continuous blending approach:
-        - Find where we want to go (lookahead target)
-        - Blend smoothly toward it
-        - Limit velocity
-        """
-        if self.current_joints is None or self.target_joints is None:
+        if self.current_joints is None or self.latest_msg is None:
             return None
         
-        # Get lookahead target from latest trajectory
-        lookahead_target = self.get_lookahead_target()
+        # 1. Calculer la position Cartésienne ACTUELLE de la fourchette via TF
+        try:
+            (trans, rot) = self.tf_listener.lookupTransform('world', 'panda_hand_tcp', rospy.Time(0))
+            T_world_tcp = tft.quaternion_matrix(rot)
+            T_world_tcp[:3, 3] = trans
+            T_world_fork = T_world_tcp @ self.T_tcp_fork_tip
+            current_fork_pos = T_world_fork[:3, 3]
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return self.target_joints # Fallback si TF échoue
+
+        # 2. Trouver l'index le plus proche en espace Cartésien (Calcul matriciel ultra rapide)
+        with self.lock:
+            msg = self.latest_msg
+            
+        positions = np.array([[p.position.x, p.position.y, p.position.z] for p in msg.poses])
+        distances = np.linalg.norm(positions - current_fork_pos, axis=1)
+        closest_idx = np.argmin(distances)
+
+        # 3. Appliquer le Lookahead
+        target_idx = min(closest_idx + self.lookahead_steps, len(msg.poses) - 1)
+        target_pose_fork = msg.poses[target_idx]
+
+        # 4. Calculer l'IK UNIQUEMENT pour ce point cible précis (Gain de perf massif)
+        pose_tcp = self.transform_fork_to_tcp(target_pose_fork)
+        ik_sol = self.compute_ik(pose_tcp, msg.header.frame_id, seed=self.current_joints)
+
+        # 5. Filtrage de sécurité
+        if ik_sol is not None:
+            if np.max(np.abs(ik_sol - self.current_joints)) <= self.max_joint_jump:
+                target_lookahead_joints = ik_sol
+            else:
+                target_lookahead_joints = self.target_joints
+        else:
+            target_lookahead_joints = self.target_joints
         
-        if lookahead_target is None:
-            # No trajectory - hold position
-            return self.target_joints
+        # 6. Continuous Blending
+        self.target_joints = (1 - self.blend_rate) * self.target_joints + self.blend_rate * target_lookahead_joints
         
-        # Blend current target toward lookahead target
-        # This creates smooth transitions even when trajectory changes
-        self.target_joints = (1 - self.blend_rate) * self.target_joints + self.blend_rate * lookahead_target
-        
-        # Compute command with velocity limiting
+        # 7. Limite de Vélocité
         direction = self.target_joints - self.current_joints
         distance = np.linalg.norm(direction)
-        
         if distance < 0.001:
             return self.target_joints
-        
-        # Maximum step size based on velocity limit and control rate
+            
         max_step = self.max_joint_velocity / self.control_rate
-        
         if distance > max_step:
-            # Limit velocity
             direction = direction / distance * max_step
             command = self.current_joints + direction
         else:
@@ -274,26 +205,19 @@ class TrajectoryFollowerContinuous:
 
     def run(self):
         rate = rospy.Rate(self.control_rate)
-        
         while not rospy.is_shutdown():
             if self.current_joints is None:
                 rate.sleep()
                 continue
             
-            with self.lock:
-                command = self.compute_command()
+            command = self.compute_command()
             
             if command is not None:
-                # Safety check
-                max_diff = np.max(np.abs(command - self.current_joints))
-                
-                if max_diff < 0.5:
-                    msg = Float64MultiArray()
-                    msg.data = command.tolist()
-                    self.pub_joints.publish(msg)
+                msg = Float64MultiArray()
+                msg.data = command.tolist()
+                self.pub_joints.publish(msg)
             
             rate.sleep()
-
 
 if __name__ == '__main__':
     TrajectoryFollowerContinuous().run()

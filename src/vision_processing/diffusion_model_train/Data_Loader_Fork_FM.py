@@ -203,9 +203,9 @@ class Robot3DDataset(Dataset):
             obs = obs.copy()
             act = act.copy()
             pcd, obs, act = self._apply_augmentation(pcd, obs, act)
-            if random.random() < 0.5:
-                # On met à zéro les colonnes 3 à 9 (les rotations 6D)
-                obs[:, 3:] = 0.0
+            # if random.random() < 0.5:
+            #     # On met à zéro les colonnes 3 à 9 (les rotations 6D)
+            #     obs[:, 3:] = 0.0
         
         data_dict = {
             'obs': {

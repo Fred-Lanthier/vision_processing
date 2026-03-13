@@ -13,7 +13,6 @@ from mani_skill.sensors.camera import CameraConfig
 import os
 import glob
 import json
-import numpy as np
 from PIL import Image
 import rospkg
 import time
@@ -114,12 +113,6 @@ class PandaFork(Panda):
 # =================================================================
 # 2. FOOD CONFIGURATION
 # =================================================================
-#
-# FOOD_BUILD_CONFIGS replaces the old if/elif chain in _load_scene.
-# All mesh/scale/pose info for building each food actor lives here.
-#
-#   half_z:      the "food radius" used to compute spiking depth
-#   yaw_offset:  if True, base_yaw gets +90° (organic shapes like broccoli/chicken)
 
 FOOD_BUILD_CONFIGS = {
     "patate": {
@@ -193,14 +186,6 @@ ALL_FOOD_TYPES = list(FOOD_BUILD_CONFIGS.keys())
 # =================================================================
 # 3. ENVIRONMENT
 # =================================================================
-#
-# KEY IDEA: We build ALL 7 food actors in every scene.
-# Each env gets a random food type per episode.
-# The "active" actor sits on the pedestal; the other 6 are hidden at (99, 99, -10).
-#
-# Two helper methods handle the routing:
-#   get_active_food_poses()      -> (p, q)   reads from the correct actor per env
-#   set_active_food_poses(p, q)              writes to the correct actor per env
 
 @register_env("FoodSpiking-v1", max_episode_steps=750)
 class FoodSpikingEnv(PickCubeEnv):
@@ -209,14 +194,12 @@ class FoodSpikingEnv(PickCubeEnv):
         self.per_env_food_type = []
         self.per_env_food_half_z = None
         self.per_env_yaw_offset = None
+        self.per_env_has_pedestal = None # Ajouté pour le suivi
         self.food_actors = {}
         self.food_masks = {}
         self.principal_axis_world = None
         super().__init__(*args, **kwargs)
 
-    # ---------------------------------------------------------
-    # SCENE LOADING: build ALL 7 food actors + pedestal
-    # ---------------------------------------------------------
     def _load_scene(self, options: dict):
         super()._load_scene(options)
 
@@ -240,19 +223,20 @@ class FoodSpikingEnv(PickCubeEnv):
             )
             self.food_actors[food_type] = builder.build_kinematic(name=f"food_{food_type}")
 
+        # Piédestal rendu visible et de petite taille
         ped_builder = self.scene.create_actor_builder()
-        self.pedestal_half_z = 0.20
+        self.pedestal_half_z = 0.04 
         ped_builder.add_box_collision(half_size=[0.05, 0.05, self.pedestal_half_z])
-        ped_builder.add_box_visual(half_size=[0.05, 0.05, self.pedestal_half_z])
+        ped_builder.add_box_visual(
+            half_size=[0.05, 0.05, self.pedestal_half_z]
+        )
         self.pedestal = ped_builder.build_kinematic(name="pedestal")
 
-    # ---------------------------------------------------------
-    # EPISODE INIT: random food type per env, place actors
-    # ---------------------------------------------------------
     def _initialize_episode(self, env_idx, options):
         super()._initialize_episode(env_idx, options)
         b = len(env_idx)
 
+        # 1. Homing du robot
         homing_qpos = torch.tensor(
             [[-0.000059, -0.125928, 0.000117, -2.193312,
               -0.000251, 2.064780, 0.785511, 0.04, 0.04]],
@@ -260,12 +244,11 @@ class FoodSpikingEnv(PickCubeEnv):
         ).repeat(b, 1)
         self.agent.reset(homing_qpos)
 
-        far_away = torch.tensor([[99.0, 99.0, -10.0]], device=self.device).repeat(b, 1)
-        self.cube.set_pose(Pose.create_from_pq(p=far_away))
+        # 2. Cacher le cube par défaut
+        far_away_p = torch.tensor([[99.0, 99.0, -10.0]], device=self.device).repeat(b, 1)
+        self.cube.set_pose(Pose.create_from_pq(p=far_away_p))
 
-        # =========================================================
-        # RANDOM FOOD TYPE PER ENV
-        # =========================================================
+        # 3. TIRAGE AU SORT DES ALIMENTS
         self.per_env_food_type = np.random.choice(ALL_FOOD_TYPES, size=b).tolist()
 
         self.per_env_food_half_z = torch.tensor(
@@ -277,8 +260,6 @@ class FoodSpikingEnv(PickCubeEnv):
             device=self.device, dtype=torch.bool
         )
 
-        # Pre-compute masks (which envs use which food type)
-        # so we don't rebuild them every step
         self.food_masks = {}
         for food_type in ALL_FOOD_TYPES:
             self.food_masks[food_type] = torch.tensor(
@@ -286,13 +267,30 @@ class FoodSpikingEnv(PickCubeEnv):
                 dtype=torch.bool, device=self.device
             )
 
-        # =========================================================
-        # RANDOM POSITIONS AND ORIENTATIONS
-        # =========================================================
+        # 4. GÉNÉRATION DES COORDONNÉES DE BASE
         rand_x = -0.23 + torch.rand(b, device=self.device) * 0.12
         rand_y = -0.14 + torch.rand(b, device=self.device) * 0.16
-        random_z_offset = torch.rand(b, device=self.device) * 0.08
 
+        # 5. INITIALISATION DU PIÉDESTAL (EN PREMIER)
+        self.per_env_has_pedestal = torch.rand(b, device=self.device) > 0.5
+        pedestal_heights = 0.04 + torch.rand(b, device=self.device) * 0.06
+        
+        random_z_offset = torch.where(
+            self.per_env_has_pedestal,
+            pedestal_heights,
+            torch.zeros(b, device=self.device)
+        )
+
+        ped_p = torch.zeros((b, 3), device=self.device)
+        ped_p[:, 0] = rand_x
+        ped_p[:, 1] = rand_y
+        ped_p[:, 2] = random_z_offset - self.pedestal_half_z
+        ped_p[~self.per_env_has_pedestal] = torch.tensor([99.0, 99.0, -10.0], device=self.device)
+        ped_q = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device).repeat(b, 1)
+        
+        self.pedestal.set_pose(Pose.create_from_pq(p=ped_p.contiguous(), q=ped_q.contiguous()))
+
+        # 6. INITIALISATION DE LA NOURRITURE (EN SECOND)
         self.target_yaw = (torch.rand(b, device=self.device) * 2 * np.pi) - np.pi
         yaw_np = self.target_yaw.cpu().numpy()
 
@@ -314,30 +312,21 @@ class FoodSpikingEnv(PickCubeEnv):
         food_pos[:, 1] = rand_y
         food_pos[:, 2] = random_z_offset + self.per_env_food_half_z
 
-        # =========================================================
-        # PLACE ACTORS: active one on pedestal, others hidden
-        # =========================================================
         far_p = torch.tensor([[99.0, 99.0, -10.0]], device=self.device).repeat(b, 1)
         far_q = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device).repeat(b, 1)
 
         for food_type, actor in self.food_actors.items():
             mask = self.food_masks[food_type]
-            p = far_p.clone()
-            q = far_q.clone()
+            new_p = far_p.clone()
+            new_q = far_q.clone()
             if mask.any():
-                p[mask] = food_pos[mask]
-                q[mask] = food_q_tensor[mask]
-            actor.set_pose(Pose.create_from_pq(p=p, q=q))
+                new_p[mask] = food_pos[mask]
+                new_q[mask] = food_q_tensor[mask]
+                
+            actor.set_pose(Pose.create_from_pq(p=new_p.contiguous(), q=new_q.contiguous()))
 
-        ped_pos = food_pos.clone()
-        ped_pos[:, 2] = random_z_offset - self.pedestal_half_z
-        self.pedestal.set_pose(Pose.create_from_pq(p=ped_pos))
 
-    # ---------------------------------------------------------
-    # HELPERS: read/write food poses through the correct actors
-    # ---------------------------------------------------------
     def get_active_food_poses(self):
-        """Gather (p [B,3], q [B,4]) from each env's active food actor."""
         B = self.num_envs
         p = torch.zeros((B, 3), device=self.device)
         q = torch.zeros((B, 4), device=self.device)
@@ -352,7 +341,6 @@ class FoodSpikingEnv(PickCubeEnv):
         return p, q
 
     def set_active_food_poses(self, p, q):
-        """Scatter poses to the correct actors. Inactive envs stay hidden."""
         B = self.num_envs
         FAR_P = torch.tensor([[99.0, 99.0, -10.0]], device=self.device).expand(B, 3)
         FAR_Q = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device).expand(B, 4)
@@ -377,7 +365,7 @@ class FoodSpikingEnv(PickCubeEnv):
 
 if __name__ == "__main__":
 
-    num_envs = 2
+    num_envs = 3
     env = gym.make(
         "FoodSpiking-v1",
         num_envs=num_envs,
@@ -386,7 +374,7 @@ if __name__ == "__main__":
         control_mode="pd_ee_delta_pose",
     )
 
-    NUM_EPISODES = 1
+    NUM_EPISODES = 5
     os.makedirs(BASE_RECORD_DIR, exist_ok=True)
     starts = time.time()
 
@@ -403,7 +391,8 @@ if __name__ == "__main__":
     
     for ep in range(NUM_EPISODES):
 
-        obs, _ = env.reset(seed=ep, options=dict(reconfigure=True))
+        # Note: Plus de reconfigure=True ici puisque les acteurs sont tous chargés
+        obs, _ = env.reset(seed=ep)
         robot = uw.agent.robot
         links = {l.name: l for l in robot.get_links()}
 
@@ -425,15 +414,12 @@ if __name__ == "__main__":
         cam_wrist_pose = links["camera_wrist_link"].pose
         rel_wrist_pose = base_pose.inv() * cam_wrist_pose
         
-        # 1. On extrait la matrice SAPIEN relative à la base [B, 4, 4]
         T_ee_s_sapien = rel_wrist_pose.to_transformation_matrix()
         T_static_s_sapien = rel_static_pose.to_transformation_matrix()
 
-        # 2. On la convertit en OpenCV via une multiplication matricielle
         T_ee_s_cv = torch.matmul(T_ee_s_sapien, sapien2opencv)
         T_static_s_cv = torch.matmul(T_static_s_sapien, sapien2opencv)
 
-        # 3. ON ENREGISTRE LES MATRICES CORRIGÉES (Et non plus les anciennes !)
         camera_poses_batch = []
         for b_idx in range(B):
             camera_poses_batch.append({
@@ -473,14 +459,10 @@ if __name__ == "__main__":
 
         USER_MOUTH_POS = torch.tensor([-0.2, 0.3, 0.16], dtype=torch.float32, device=device).unsqueeze(0).expand(B, 3)
 
-        # ==============================================================
-        # BASE YAW: per-env offset via uw.per_env_yaw_offset
-        # ==============================================================
         base_yaw = uw.get_desired_fork_yaw()
         if not isinstance(base_yaw, torch.Tensor):
             base_yaw = torch.tensor(base_yaw, dtype=torch.float32, device=device)
 
-        # Only broccoli/chicken envs get +90° (per_env_yaw_offset is a [B] bool tensor)
         base_yaw[uw.per_env_yaw_offset] += 90.0
         base_yaw = (base_yaw + 180) % 360 - 180
 
@@ -506,7 +488,6 @@ if __name__ == "__main__":
             fork_pose = fork_tip.pose
             fork_pos = fork_pose.p
 
-            # Read food poses through per-env routing
             food_pos, food_q = uw.get_active_food_poses()
 
             q_wxyz = fork_pose.q.cpu().numpy()
@@ -540,12 +521,10 @@ if __name__ == "__main__":
                 rec_idx = int(record_step_count[b_idx])
                 sensors = obs["sensor_data"]
 
-                # --- SAUVEGARDE DES IMAGES (C'est de retour !) ---
                 rgb_static_bufs[b_idx].append(sensors["static"]["rgb"][b_idx].cpu().numpy())
                 depth_static_bufs[b_idx].append(sensors["static"]["depth"][b_idx].cpu().numpy())
                 rgb_ee_bufs[b_idx].append(sensors["ee"]["rgb"][b_idx].cpu().numpy())
                 depth_ee_bufs[b_idx].append(sensors["ee"]["depth"][b_idx].cpu().numpy())
-                # -------------------------------------------------
 
                 time_step = int(step_count[b_idx]) * uw.control_timestep
                 states_batch[b_idx].append({
@@ -554,11 +533,8 @@ if __name__ == "__main__":
                     "time_step": round(time_step, 4),
                     "joint_positions": robot.get_qpos()[b_idx].cpu().numpy().tolist(),
                     "joint_velocities": robot.get_qvel()[b_idx].cpu().numpy().tolist(),
-                    
-                    # CORRECTION DU RÉFÉRENTIEL : rel_tcp_pose au lieu de panda_tcp.pose
                     "end_effector_position": rel_tcp_pose.p[b_idx].cpu().numpy().tolist(),
                     "end_effector_orientation": rel_tcp_pose.q[b_idx].cpu().numpy().tolist(),
-                    
                     "end_effector_velocity": panda_tcp.linear_velocity[b_idx].cpu().numpy().tolist() +
                                              panda_tcp.angular_velocity[b_idx].cpu().numpy().tolist(),
                     "phase": int(current_phase[b_idx]),
@@ -573,14 +549,27 @@ if __name__ == "__main__":
                         "depth_npy": f"ee_depth_step_{rec_idx:04d}.npy"
                     }
                 })
-                # TRÈS IMPORTANT : Ne pas oublier de l'incrémenter !
                 record_step_count[b_idx] += 1
 
             # ---------------------------------------------------------
             # PHASE 1: APPROACH + YAW ALIGNMENT
             # ---------------------------------------------------------
             if phase1_mask.any():
-                hover_pos = food_pos.clone()
+                # 1. Calcul du vrai centre avec offsets locaux pour le batch
+                local_offsets_np = np.zeros((B, 3), dtype=np.float32)
+                for i in range(B):
+                    ft = uw.per_env_food_type[i]
+                    if ft in ["broccoli", "chicken"]:
+                        local_offsets_np[i] = [0.0, 0.015, 0.0] 
+                
+                food_q_wxyz_np = food_q.cpu().numpy()
+                food_q_xyzw_np = np.concatenate((food_q_wxyz_np[:, 1:], food_q_wxyz_np[:, 0:1]), axis=1)
+                world_offsets_np = R.from_quat(food_q_xyzw_np).apply(local_offsets_np)
+                world_offsets = torch.tensor(world_offsets_np, dtype=torch.float32, device=device)
+                
+                true_food_pos = food_pos + world_offsets
+
+                hover_pos = true_food_pos.clone()
                 hover_pos[:, 2] += 0.03
 
                 yaw_err = desired_approach_yaw - yaw
@@ -617,17 +606,20 @@ if __name__ == "__main__":
 
                 spiking_mask = phase1_mask & hover_reached
                 if spiking_mask.any():
-                    # Per-env food_half_z from config
                     food_half_z = uw.per_env_food_half_z
-                    z_top = food_pos[:, 2] + food_half_z
+                    z_top = true_food_pos[:, 2] + food_half_z
+                    
                     theoretical_penetration = torch.clamp(2.0 * food_half_z - 0.002, max=0.015)
                     target_z = z_top - theoretical_penetration
+                    
+                    # Garde-fou intelligent contre la table (Z=0) ou le piédestal
                     pedestal_surface_z = uw.pedestal.pose.p[:, 2] + uw.pedestal_half_z
-                    target_z = torch.max(target_z, pedestal_surface_z + 0.004)
+                    safe_bottom_z = torch.max(pedestal_surface_z + 0.004, torch.tensor(0.004, device=device))
+                    target_z = torch.max(target_z, safe_bottom_z)
 
                     above_mask = spiking_mask & (fork_pos[:, 2] > target_z + 0.001)
                     if above_mask.any():
-                        target_spike_pos = food_pos[above_mask].clone()
+                        target_spike_pos = true_food_pos[above_mask].clone()
                         target_spike_pos[:, 2] = target_z[above_mask]
                         direction = target_spike_pos - fork_pos[above_mask]
                         action[above_mask, :3] = torch.clamp(direction * 3.0, min=-0.02, max=0.02)
@@ -640,6 +632,7 @@ if __name__ == "__main__":
                         pitch_start[idx] = pitch[idx].clone()
 
                         f_pose_iso = Pose.create_from_pq(p=fork_pos[idx].clone(), q=fork_pose.q[idx].clone())
+                        # On se lie bien au food_pos normal pour tourner toute la structure 3D !
                         fd_pose_iso = Pose.create_from_pq(p=food_pos[idx].clone(), q=food_q[idx].clone())
                         rel_pose_iso = f_pose_iso.inv() * fd_pose_iso
 
@@ -681,11 +674,13 @@ if __name__ == "__main__":
                 dir_to_user = USER_MOUTH_POS - fork_pos
                 dist = torch.norm(dir_to_user, dim=1)
 
+                # Le Wrap est réactivé ici pour permettre le passage par l'arrière (-180/180)
                 yaw_err = absolute_target_yaw - yaw
                 yaw_err = torch.where(yaw_err > 180, yaw_err - 360, yaw_err)
                 yaw_err = torch.where(yaw_err < -180, yaw_err + 360, yaw_err)
 
-                speed_factor = torch.clamp(1.0 - (torch.abs(yaw_err) / 60.0), 0.1, 1.0)
+                # Diviseur de vitesse ajusté à 180.0 pour une rotation douce sur les longs trajets
+                speed_factor = torch.clamp(1.0 - (torch.abs(yaw_err) / 180.0), 0.1, 1.0)
                 max_trans_speed = 0.075 * speed_factor
 
                 trans_mask = phase3_mask & (dist > 0.01)
@@ -721,7 +716,8 @@ if __name__ == "__main__":
                 new_food_q[idx] = target_pose_active.q.clone()
 
                 uw.set_active_food_poses(new_food_p, new_food_q)
-                uw.scene._gpu_apply_all()
+                if num_envs > 1:
+                    uw.scene._gpu_apply_all()
 
             obs, reward, terminated, truncated, info = env.step(action)
 
@@ -749,13 +745,16 @@ if __name__ == "__main__":
                     os.path.join(img_dirs[b_idx], f"ee_depth_step_{i:04d}.npy"),
                     depth_ee_bufs[b_idx][i])
 
+            # Assigne dynamiquement le type de plateforme pour l'entrainement !
+            plate_string = "pedestal" if uw.per_env_has_pedestal[b_idx].item() else "table"
+
             save_states_to_json(
                 trajectory_path=traj_paths[b_idx],
                 trajectory_id=traj_ids[b_idx],
                 states=states_batch[b_idx],
                 current_task="FoodSpiking",
                 food_type=food_names[b_idx],
-                plate_type="pedestal",
+                plate_type=plate_string, 
                 camera_pose=camera_poses_batch[b_idx]
             )
 

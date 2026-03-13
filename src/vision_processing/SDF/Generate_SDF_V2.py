@@ -288,20 +288,24 @@ class GenerateSDF:
         vertices_to_remove = densities < np.quantile(densities, 0.005) 
         mesh.remove_vertices_by_mask(vertices_to_remove)
         
-        # --- FIX 2: DISTANCE THRESHOLD ---
-        pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-        vertices = np.asarray(mesh.vertices)
-        
+        # --- FIX 2: DISTANCE THRESHOLD (VECTORISÉ) ---
         dist_threshold = 0.02 
+        # Transformer les vertices du mesh en nuage de points Open3D
+        mesh_pcd = o3d.geometry.PointCloud(mesh.vertices)
+        # Calculer les distances de tous les vertices vers le nuage d'origine en une seule ligne
+        distances = np.asarray(mesh_pcd.compute_point_cloud_distance(pcd))
+        points_to_keep = distances < dist_threshold
         
-        points_to_keep = []
-        for i in range(len(vertices)):
-            [k, idx, _] = pcd_tree.search_knn_vector_3d(vertices[i], 1)
-            dist = np.linalg.norm(vertices[i] - np.asarray(pcd.points)[idx[0]])
-            points_to_keep.append(dist < dist_threshold)
-
         mesh.remove_vertices_by_mask(np.invert(points_to_keep))
 
+        target_faces = 10000
+        if len(mesh.triangles) > target_faces:
+            mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target_faces)
+        
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=20)
+        mesh.compute_vertex_normals()
+        
+        # Ensuite vous convertissez vers PyVista comme avant :
         verts = np.asarray(mesh.vertices)
         faces = np.hstack([[3, *face] for face in np.asarray(mesh.triangles)])
         pv_mesh = pv.PolyData(verts, faces)
@@ -570,12 +574,17 @@ class GenerateSDF:
     
     def save(self, path):
         if self.sdf_grid is None: raise RuntimeError("SDF not computed.")
-        np.savez(path, sdf_grid=self.sdf_grid, bounds_min=self.bounds_min,
-                 bounds_max=self.bounds_max, voxel_size=self.voxel_size,
-                 n_voxels=self.n_voxels, virtual_radius=self.virtual_radius,
+        # Utilisation de np.savez_compressed et cast en float16
+        np.savez_compressed(path, 
+                 sdf_grid=self.sdf_grid.astype(np.float16), 
+                 bounds_min=self.bounds_min,
+                 bounds_max=self.bounds_max, 
+                 voxel_size=self.voxel_size,
+                 n_voxels=self.n_voxels, 
+                 virtual_radius=self.virtual_radius,
                  inner_radius=getattr(self, 'inner_radius', self.virtual_radius),
                  outer_radius=getattr(self, 'outer_radius', self.virtual_radius))
-        print(f"Saved SDF to: {path}")
+        print(f"Saved compressed SDF to: {path}")
     
     def load(self, path):
         data = np.load(path)
@@ -597,7 +606,7 @@ if __name__ == "__main__":
     intrinsics_path = "Images_Test/intrinsics.json"
     LIST_OBJECTS = ["Bowl", "Plate", "Shallow bowl", "Shallow plate"]
     package_path = rospkg.RosPack().get_path('vision_processing')
-    npz_file = os.path.join(package_path, "models", "sdf_field_No_outter.npz")
+    npz_file = os.path.join(package_path, "models", "sdf_field_No_outter_tiny.npz")
     if not os.path.exists(npz_file):
         depth_map = np.load(depth_path)
         with open(intrinsics_path, 'r') as f:
@@ -607,7 +616,7 @@ if __name__ == "__main__":
         # NOTE: inner_radius_mm = thin buffer on cavity side
         #       outer_radius_mm = massive forbidden zone on outer/under side
         sdf.run_pipeline(inner_radius_mm=2.0, outer_radius_mm=0.0,
-                         object_list=LIST_OBJECTS, target_faces=10000, sdf_resolution=400)
+                         object_list=LIST_OBJECTS, target_faces=10000, sdf_resolution=150)
         
         sdf.save(npz_file)
         sdf.cleanup()

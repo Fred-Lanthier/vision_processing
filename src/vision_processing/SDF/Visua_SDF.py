@@ -262,7 +262,7 @@ def visualize_3d_slice(sdf_data, mesh_path, slice_axis='y', slice_value=None,
 if __name__ == "__main__":
     import os
     package_path = rospkg.RosPack().get_path('vision_processing')
-    grid_file = os.path.join(package_path, "models", "sdf_field_No_outter.npz")
+    grid_file = os.path.join(package_path, "models", "sdf_field_No_outter_tiny.npz")
     mesh_file = "03_surface_aligned.obj"
     
     if not os.path.exists(grid_file):
