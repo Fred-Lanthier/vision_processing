@@ -1,141 +1,194 @@
 #!/usr/bin/env python3
 """
-Déplacer le Franka Panda à une pose cartésienne spécifique
+Move fork_tip toward target centroid — one-shot, fixed orientation.
+
+Strategy (same as homing.py):
+  1. Wait for one /vision/target_centroid
+  2. Compute IK ONCE for the goal pose (fork_tip at target, fixed vertical orientation)
+  3. Cosine-interpolate in joint space from current → goal
+  4. Hold at goal forever
 """
 
 import rospy
+import rospkg
 import moveit_commander
 import sys
+import os
+import math
 import numpy as np
-from geometry_msgs.msg import Pose
+import tf
+import tf.transformations as tft
+from geometry_msgs.msg import PointStamped, Pose
+from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import JointState
+from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
+from moveit_msgs.msg import MoveItErrorCodes
 from scipy.spatial.transform import Rotation as R
 
-def main():
-    # Initialisation
-    rospy.init_node('move_to_pose')
-    moveit_commander.roscpp_initialize(sys.argv)
-    
-    robot = moveit_commander.RobotCommander()
-    move_group = moveit_commander.MoveGroupCommander("panda_arm")
-    move_group.set_end_effector_link("panda_hand_tcp")
-    
-    rospy.loginfo("=" * 60)
-    rospy.loginfo("Déplacement vers pose cible")
-    rospy.loginfo("=" * 60)
-    
-    # Attendre que MoveIt soit prêt
-    rospy.sleep(2)
-    
-    # ============================================
-    # POSE ACTUELLE
-    # ============================================
-    current = move_group.get_current_pose().pose
-    current_quat_scipy = [current.orientation.x, current.orientation.y, 
-                          current.orientation.z, current.orientation.w]
-    current_r = R.from_quat(current_quat_scipy)
-    current_roll, current_pitch, current_yaw = current_r.as_euler('xyz', degrees=True)
-    
-    rospy.loginfo(f"Pose actuelle:")
-    rospy.loginfo(f"  Position: x={current.position.x:.3f}, y={current.position.y:.3f}, z={current.position.z:.3f}")
-    rospy.loginfo(f"  Quaternion: qw={current.orientation.w:.4f}, qx={current.orientation.x:.4f}, qy={current.orientation.y:.4f}, qz={current.orientation.z:.4f}")
-    rospy.loginfo(f"  Euler XYZ: roll={current_roll:.1f}°, pitch={current_pitch:.1f}°, yaw={current_yaw:.1f}°")
-    
-    # ============================================
-    # POSE CIBLE
-    # ============================================
-    target_pose = Pose()
-    
-    # Position
-    target_pose.position.x = 0.5064181802418
-    target_pose.position.y = 9.677804093958376e-05
-    target_pose.position.z = 0.335494979650072
-    
-    # Quaternion depuis le JSON (ordre dans JSON: qw, qx, qy, qz)
-    # Note: Dans ton JSON "end_effector_orientation", c'est probablement [qw, qx, qy, qz]
-    # Quaternion cible du JSON
-    qw_json = 0.9999962676013766
-    qx_json = 6.836190407025131e-05
-    qy_json = -0.0016231937042559697
-    qz_json = -0.00010979196759587877
-    
-    # Créer la rotation depuis le quaternion JSON
-    quaternion_scipy = np.array([qx_json, qy_json, qz_json, qw_json])
-    r_json = R.from_quat(quaternion_scipy)
-    
-    # Ajouter une rotation de 180° autour de X pour inverser
-    r_flip = R.from_euler('x', 180, degrees=True)
-    r_final = r_flip * r_json
-    
-    # Convertir en quaternion pour ROS
-    quat_final = r_final.as_quat()  # [qx, qy, qz, qw]
-    
-    # Assigner à ROS Pose
-    target_pose.orientation.x = quat_final[0]
-    target_pose.orientation.y = quat_final[1]
-    target_pose.orientation.z = quat_final[2]
-    target_pose.orientation.w = quat_final[3]
-    
-    # Convertir en Euler pour affichage
-    roll, pitch, yaw = r_final.as_euler('xyz', degrees=True)
-    
-    rospy.loginfo(f"\nPose cible (AVEC rotation de 180° en X):")
-    rospy.loginfo(f"  Position: x={target_pose.position.x:.4f}, y={target_pose.position.y:.6f}, z={target_pose.position.z:.4f}")
-    rospy.loginfo(f"  Quaternion: qw={target_pose.orientation.w:.4f}, qx={target_pose.orientation.x:.6f}, qy={target_pose.orientation.y:.4f}, qz={target_pose.orientation.z:.6f}")
-    rospy.loginfo(f"  Euler XYZ: roll={roll:.1f}°, pitch={pitch:.1f}°, yaw={yaw:.1f}°")
-    
-    # ============================================
-    # PLANIFICATION
-    # ============================================
-    move_group.set_pose_target(target_pose)
-    
-    rospy.loginfo("\nPlanification...")
-    move_group.set_planning_time(5.0)
-    plan = move_group.plan()
-    
-    # Vérifier si la planification a réussi
-    if isinstance(plan, tuple):
-        success = plan[0]
-        trajectory = plan[1]
-    else:
-        success = len(plan.joint_trajectory.points) > 0
-        trajectory = plan
-    
-    # ============================================
-    # EXÉCUTION
-    # ============================================
-    if success:
-        rospy.loginfo("✓ Planification réussie!")
-        rospy.loginfo("\nExécution du mouvement...")
-        
-        # Exécuter
-        move_group.execute(trajectory, wait=True)
-        move_group.stop()
-        move_group.clear_pose_targets()
-        
-        rospy.loginfo("=" * 60)
-        rospy.loginfo("✓ MOUVEMENT COMPLÉTÉ!")
-        rospy.loginfo("=" * 60)
-        
-        # Afficher la pose finale
-        final = move_group.get_current_pose().pose
-        final_quat_scipy = [final.orientation.x, final.orientation.y, 
-                           final.orientation.z, final.orientation.w]
-        final_r = R.from_quat(final_quat_scipy)
-        final_roll, final_pitch, final_yaw = final_r.as_euler('xyz', degrees=True)
-        
-        rospy.loginfo(f"\nPose finale:")
-        rospy.loginfo(f"  Position: x={final.position.x:.4f}, y={final.position.y:.6f}, z={final.position.z:.4f}")
-        rospy.loginfo(f"  Quaternion: qw={final.orientation.w:.4f}, qx={final.orientation.x:.6f}, qy={final.orientation.y:.4f}, qz={final.orientation.z:.6f}")
-        rospy.loginfo(f"  Euler XYZ: roll={final_roll:.1f}°, pitch={final_pitch:.1f}°, yaw={final_yaw:.1f}°")
-        
-    else:
-        rospy.logerr("✗ Planification échouée!")
-        rospy.logerr("La pose cible n'est peut-être pas atteignable.")
-    
-    moveit_commander.roscpp_shutdown()
+sys.path.append(os.path.join(rospkg.RosPack().get_path('vision_processing'), 'scripts'))
+from utils import compute_T_child_parent_xacro
+
+
+class MoveToTarget:
+
+    def __init__(self):
+        rospy.init_node('move_to_target', anonymous=True)
+
+        # ── Fork transform ──
+        rospack = rospkg.RosPack()
+        xacro = os.path.join(rospack.get_path('vision_processing'), 'urdf', 'panda_camera.xacro')
+        self.T_tcp_fork = compute_T_child_parent_xacro(xacro, 'fork_tip', 'panda_TCP')
+
+        # ── Parameters ──
+        self.z_offset = rospy.get_param('~z_offset', 0.05)
+        self.duration = rospy.get_param('~duration', 4.0)  # seconds for the motion
+
+        # Fixed vertical orientation: RPY = [180°, 0°, 0°] → quat [1, 0, 0, 0]
+        self.fixed_quat = np.array(
+            rospy.get_param('~orientation', [1.0, 0.0, 0.0, 0.0]),
+            dtype=np.float64
+        )
+        self.fixed_quat /= np.linalg.norm(self.fixed_quat)
+
+        # ── State ──
+        self.current_joints = None
+
+        # ── MoveIt IK only ──
+        moveit_commander.roscpp_initialize(sys.argv)
+        rospy.wait_for_service('/compute_ik')
+        self.ik_service = rospy.ServiceProxy('/compute_ik', GetPositionIK)
+
+        # ── Pub / Sub ──
+        self.pub_joints = rospy.Publisher(
+            '/joint_group_position_controller/command',
+            Float64MultiArray, queue_size=1
+        )
+        rospy.Subscriber('/joint_states', JointState, self._joint_cb)
+
+        rospy.loginfo(f"MoveToTarget ready. z_offset={self.z_offset}m "
+                      f"duration={self.duration}s quat={self.fixed_quat}")
+
+    def _joint_cb(self, msg):
+        positions = []
+        for name, pos in zip(msg.name, msg.position):
+            if "panda_joint" in name:
+                positions.append(pos)
+        if len(positions) == 7:
+            self.current_joints = np.array(positions)
+
+    def _compute_ik(self, pose_tcp, seed, timeout=0.1):
+        req = GetPositionIKRequest()
+        req.ik_request.group_name = "panda_arm"
+        req.ik_request.pose_stamped.header.frame_id = "world"
+        req.ik_request.pose_stamped.pose = pose_tcp
+        req.ik_request.avoid_collisions = False
+        req.ik_request.ik_link_name = "panda_hand_tcp"
+        req.ik_request.timeout = rospy.Duration(timeout)
+        req.ik_request.robot_state.joint_state.name = [
+            f"panda_joint{i+1}" for i in range(7)
+        ]
+        req.ik_request.robot_state.joint_state.position = seed.tolist()
+
+        try:
+            resp = self.ik_service(req)
+            if resp.error_code.val == MoveItErrorCodes.SUCCESS:
+                return np.array(list(resp.solution.joint_state.position)[:7])
+            return None
+        except Exception:
+            return None
+
+    def _fork_goal_to_tcp_pose(self, fork_pos):
+        R_world_tcp = R.from_quat(self.fixed_quat).as_matrix()
+        offset_world = R_world_tcp @ self.T_tcp_fork[:3, 3]
+        tcp_pos = fork_pos - offset_world
+
+        pose = Pose()
+        pose.position.x = tcp_pos[0]
+        pose.position.y = tcp_pos[1]
+        pose.position.z = tcp_pos[2]
+        pose.orientation.x = self.fixed_quat[0]
+        pose.orientation.y = self.fixed_quat[1]
+        pose.orientation.z = self.fixed_quat[2]
+        pose.orientation.w = self.fixed_quat[3]
+        return pose
+
+    def move_to(self, goal_joints, duration):
+        """Cosine-interpolate from current joints to goal, same as homing.py."""
+        while self.current_joints is None and not rospy.is_shutdown():
+            rospy.sleep(0.1)
+
+        start_joints = self.current_joints.copy()
+        start_time = rospy.Time.now().to_sec()
+        rate = rospy.Rate(100)
+
+        rospy.loginfo(f"Moving... duration={duration}s")
+
+        while not rospy.is_shutdown():
+            t = rospy.Time.now().to_sec() - start_time
+            alpha = min(t / duration, 1.0)
+
+            # Cosine smoothing (same as homing.py)
+            smooth = (1.0 - math.cos(math.pi * alpha)) / 2.0
+            cmd = (1 - smooth) * start_joints + smooth * goal_joints
+
+            msg = Float64MultiArray()
+            msg.data = cmd.tolist()
+            self.pub_joints.publish(msg)
+
+            if alpha >= 1.0:
+                # Send exact final position
+                msg.data = goal_joints.tolist()
+                self.pub_joints.publish(msg)
+                break
+
+            rate.sleep()
+
+        rospy.loginfo("Motion complete.")
+
+    def run(self):
+        rospy.sleep(1.0)
+
+        # ── Wait for joints ──
+        while self.current_joints is None and not rospy.is_shutdown():
+            rospy.sleep(0.1)
+        rospy.loginfo("Got joint states.")
+
+        # ── Wait for one centroid ──
+        rospy.loginfo("Waiting for /vision/target_centroid ...")
+        msg = rospy.wait_for_message('/vision/target_centroid', PointStamped,
+                                      timeout=30.0)
+        target = np.array([msg.point.x, msg.point.y, msg.point.z])
+        goal_fork = target.copy()
+        goal_fork[2] += self.z_offset
+        rospy.loginfo(f"Target: {target} → fork goal: {goal_fork}")
+
+        # ── Compute IK once ──
+        tcp_pose = self._fork_goal_to_tcp_pose(goal_fork)
+        rospy.loginfo(f"TCP goal: [{tcp_pose.position.x:.3f}, "
+                      f"{tcp_pose.position.y:.3f}, {tcp_pose.position.z:.3f}]")
+
+        goal_joints = self._compute_ik(tcp_pose, seed=self.current_joints, timeout=1.0)
+        if goal_joints is None:
+            rospy.logerr("IK failed for target pose. Aborting.")
+            return
+
+        rospy.loginfo(f"IK solution: {np.round(goal_joints, 3)}")
+
+        # ── Execute smooth motion ──
+        self.move_to(goal_joints, self.duration)
+
+        # ── Hold position ──
+        rospy.loginfo("Holding position. Ctrl+C to stop.")
+        rate = rospy.Rate(50)
+        while not rospy.is_shutdown():
+            msg = Float64MultiArray()
+            msg.data = goal_joints.tolist()
+            self.pub_joints.publish(msg)
+            rate.sleep()
+
 
 if __name__ == '__main__':
     try:
-        main()
+        MoveToTarget().run()
     except rospy.ROSInterruptException:
         pass

@@ -1,0 +1,63 @@
+Panels:
+  - Class: rviz/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Status1
+        - /RobotModel1
+        - /Target Marker1
+        - /Obstacles1
+      Splitter Ratio: 0.5
+    Tree Height: 500
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Name: Grid
+    - Alpha: 1
+      Class: rviz/RobotModel
+      Enabled: true
+      Name: RobotModel
+      Robot Description: robot_description
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /viz/target_pose
+      Name: Target Marker
+      Namespaces:
+        target: true
+    - Alpha: 1
+      Class: rviz/PointCloud2
+      Color Transformer: FlatColor
+      Color: 255; 0; 0
+      Enabled: true
+      Name: Obstacles
+      Size (Pixels): 5
+      Style: Points
+      Topic: /viz/obstacles
+      Unreliable: false
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 800
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Width: 1200
+  X: 0
+  Y: 0

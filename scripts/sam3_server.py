@@ -43,9 +43,10 @@ class Sam3Server:
         rospy.loginfo("  SAM3 SERVER STARTING")
         rospy.loginfo("=" * 60)
         
-        # Device
+        # Device et Dtype 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        rospy.loginfo(f"Device: {self.device}")
+        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+        rospy.loginfo(f"Device: {self.device} | Autocast Dtype: {self.dtype}")
         
         # Load model (slow part - only done once!)
         rospy.loginfo("Loading SAM3 model... (30-60 seconds)")
@@ -53,7 +54,10 @@ class Sam3Server:
         
         self.sam_model = build_sam3_image_model()
         if hasattr(self.sam_model, "to"):
-            self.sam_model.to(self.device)
+            # CORRECTION : On ne force plus le dtype ici ! 
+            # On laisse le modèle garder ses buffers Float32 intacts.
+            self.sam_model.to(device=self.device)
+            
         self.sam_processor = Sam3Processor(self.sam_model, confidence_threshold=0.1)
         
         load_time = (rospy.Time.now() - t0).to_sec()
@@ -100,9 +104,10 @@ class Sam3Server:
             
             threshold = req.confidence_threshold if req.confidence_threshold > 0 else 0.1
             
-            # Run SAM3
-            state = self.sam_processor.set_image(pil_img)
-            output = self.sam_processor.set_text_prompt(state=state, prompt=req.text_prompt)
+            # On garde l'autocast dynamique pour la vitesse et la compatibilité
+            with torch.inference_mode(), torch.autocast(device_type=self.device, dtype=self.dtype):
+                state = self.sam_processor.set_image(pil_img)
+                output = self.sam_processor.set_text_prompt(state=state, prompt=req.text_prompt)
             
             # Get scores
             raw_scores = output.get("scores", [])

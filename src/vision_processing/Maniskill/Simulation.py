@@ -425,13 +425,21 @@ def draw_complete_interface(image, distance, status, face_landmarks, center_poin
 
 if __name__ == "__main__":
 
+    # env = gym.make(
+    #     "FoodSpiking-v1",
+    #     num_envs=1,
+    #     robot_uids="panda_fork",
+    #     obs_mode="rgbd",
+    #     control_mode="pd_ee_delta_pose",
+    #     render_mode="human",
+    # )
     env = gym.make(
         "FoodSpiking-v1",
         num_envs=1,
         robot_uids="panda_fork",
         obs_mode="rgbd",
         control_mode="pd_ee_delta_pose",
-        render_mode="human",
+        render_mode="rgb_array", # <-- Modification ici
     )
 
     mp_face_mesh = mp.solutions.face_mesh
@@ -453,8 +461,10 @@ if __name__ == "__main__":
     cam_width, cam_height = 256, 256 # Valeurs par défaut typiques, à ajuster si besoin
     geom = CameraGeometry(cam_width, cam_height)
 
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Codec standard pour .mp4
+    video_writer = None
 
-    NUM_EPISODES = 50
+    NUM_EPISODES = 1
     all_trajectories = []
 
     for ep in range(NUM_EPISODES):
@@ -854,15 +864,26 @@ if __name__ == "__main__":
                     # Sécurité si la structure du dictionnaire ManiSkill change
                     print("Attention: Matrice de caméra non trouvée.")
             
-            # --- 4. AFFICHAGE DE L'INTERFACE ---
+           # --- 4. AFFICHAGE DE L'INTERFACE ---
             img_bgr = draw_complete_interface(
                 img_bgr, 0, status, 
                 results.multi_face_landmarks[0] if results.multi_face_landmarks else None, 
                 center_px, metric_coords
             )
             
-            cv2.imshow("Live Feed - Camera EE avec Tracking", img_bgr)
-            cv2.waitKey(1)
+            # --- ÉCRITURE DANS LE FICHIER MP4 AU LIEU DE L'AFFICHAGE ---
+            if video_writer is None:
+                # Initialisation dynamique basée sur la taille réelle de l'image
+                h_img, w_img, _ = img_bgr.shape
+                # 25.0 correspond aux FPS de la vidéo. Tu peux ajuster si ça te semble trop rapide/lent.
+                video_writer = cv2.VideoWriter('mouth_tracking_output_3.mp4', fourcc, 25.0, (w_img, h_img))
+            
+            video_writer.write(img_bgr)
+            
+            # (Supprime ou commente ces deux lignes)
+            # cv2.imshow("Live Feed - Camera EE avec Tracking", img_bgr)
+            # cv2.waitKey(1)
+            
             step_count += 1
 
             if truncated:
@@ -872,7 +893,9 @@ if __name__ == "__main__":
         trajectory["num_steps"] = step_count
         trajectory["completed"] = (current_phase == 3)
         all_trajectories.append(trajectory)
-    cv2.destroyAllWindows()
+    if video_writer is not None:
+        video_writer.release()
+    # cv2.destroyAllWindows()
     env.close()
 
     import json

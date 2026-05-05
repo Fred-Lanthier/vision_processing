@@ -4,6 +4,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import rospkg
 import os
 import json
+import zipfile
 
 def quick_3d_view(depth_image_path, json_path, filter_percentile=0):
     """
@@ -62,7 +63,13 @@ def main():
     package_path = rospack.get_path('vision_processing')
 
     # --- Build both file paths dynamically ---
-    base_path = os.path.join(package_path, 'scripts')
+    base_path = os.path.join(package_path, 'src', 'vision_processing', 'vision_tracking')
+    zip_file_path = os.path.join(base_path, 'Trajectories_record.zip')
+    
+    prefix = f'Trajectories_record/Trajectory_1/images_Trajectory_1/'
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        zip_ref.extractall(base_path)
+
     depth_image_path = f"{base_path}/Robot_pcd_filtered/robot_cloud_latest.npy"
     json_path = f"{base_path}/Robot_depth_trajectory/trajectory_1.json"
     

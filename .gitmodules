@@ -1,3 +1,21 @@
 [submodule "src/vision_processing/calories_app/backend/core/dust3r"]
 	path = src/vision_processing/calories_app/backend/core/dust3r
 	url = https://github.com/naver/dust3r.git
+[submodule "third_party/flow_mp"]
+	path = third_party/flow_mp
+	url = https://github.com/Fred-Lanthier/flow_mp.git
+[submodule "third_party/muggled_sam"]
+	path = third_party/muggled_sam
+	url = https://github.com/Fred-Lanthier/muggled_sam.git
+[submodule "third_party/RDF"]
+	path = third_party/RDF
+	url = https://github.com/Fred-Lanthier/RDF.git
+[submodule "third_party/SafeFlowMatcher"]
+	path = third_party/SafeFlowMatcher
+	url = https://github.com/Fred-Lanthier/SafeFlowMatcher.git
+[submodule "third_party/SDF_Bernstein_Basis"]
+	path = third_party/SDF_Bernstein_Basis
+	url = https://github.com/Fred-Lanthier/SDF_Bernstein_Basis.git
+[submodule "third_party/tapnet"]
+	path = third_party/tapnet
+	url = https://github.com/Fred-Lanthier/tapnet.git

@@ -1,0 +1,40 @@
+<launch>
+  <!-- 1. Charger l'URDF du robot sur le serveur de paramètres -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro" /> 
+
+  <!-- 2. Lancer le Robot State Publisher (Publie les TFs à partir de /joint_states) -->
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" />
+
+  <!-- Lien statique de world vers panda_link0 pour s'assurer que RViz trouve la racine -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="world_to_panda" args="0 0 0 0 0 0 world panda_link0" />
+
+  <!-- 3. Mock Environment (Cible + Obstacles) -->
+  <!-- Note: Ce noeud publie la cible /perception/target mais aussi la sphère bleue !
+       Si tu veux uniquement éviter ta main, tu devras peut-être commenter la partie obs_points de ce script python -->
+  <node name="mock_env" pkg="vision_processing" type="mock_environment_node.py" output="screen" 
+        args="" cwd="node" />
+
+  <!-- 4. Dummy Robot (Simulateur d'intégration de cinématique) -->
+  <node name="dummy_robot" pkg="vision_processing" type="dummy_robot_node.py" output="screen" 
+        args="" cwd="node" />
+
+  <!-- (Le driver RealSense a été retiré ici car sam3_sam2_node.py utilise désormais pyrealsense2 en natif via USB) -->
+  <!-- 5. Noeud Perception IA (SAM3 + SAM2) -->
+  <!-- Assure-toi que sam3_server.py tourne dans un autre terminal ! -->
+  <node name="sam3_sam2" pkg="vision_processing" type="sam3_sam2_node.py" output="screen" 
+        args="" cwd="node">
+        <param name="prompt" value="hand" />
+        <!-- On utilise les topics de simulation de panda_camera.xacro par défaut -->
+        <param name="rgb_topic" value="/camera_wrist/color/image_raw" />
+        <param name="depth_topic" value="/camera_wrist/aligned_depth_to_color/image_raw" />
+        <param name="info_topic" value="/camera_wrist/color/camera_info" />
+  </node>
+
+  <!-- 6. Noeud CBF pour la sécurité -->
+  <node name="cbf_safety_Bernstein" pkg="vision_processing" type="cbf_safety_node_Bernstein.py" output="screen" 
+        args="" cwd="node" />
+
+  <!-- 7. RViz avec configuration par défaut -->
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find vision_processing)/config/cbf_config.rviz" />
+</launch>

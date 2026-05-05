@@ -1,0 +1,27 @@
+<launch>
+  <!-- 1. Charger l'URDF du robot sur le serveur de paramètres -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro" /> 
+
+  <!-- 2. Lancer le Robot State Publisher (Publie les TFs à partir de /joint_states) -->
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" />
+
+  <!-- Lien statique de world vers panda_link0 pour s'assurer que RViz trouve la racine -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="world_to_panda" args="0 0 0 0 0 0 world panda_link0" />
+
+  <!-- 3. Mock Environment (Cible + Obstacles) -->
+  <!-- Note: On spécifie cwd pour être sûr qu'il trouve les scripts python s'ils ne sont pas installés par catkin -->
+  <node name="mock_env" pkg="vision_processing" type="mock_environment_node.py" output="screen" 
+        args="" cwd="node" />
+
+  <!-- 4. Dummy Robot (Simulateur d'intégration de cinématique) -->
+  <node name="dummy_robot" pkg="vision_processing" type="dummy_robot_node.py" output="screen" 
+        args="" cwd="node" />
+
+  <!-- 5. Noeud CBF pour la sécurité -->
+  <node name="cbf_safety" pkg="vision_processing" type="cbf_safety_node.py" output="screen" 
+        args="" cwd="node" />
+
+  <!-- 6. RViz avec configuration par défaut -->
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find vision_processing)/config/cbf_config.rviz" />
+</launch>

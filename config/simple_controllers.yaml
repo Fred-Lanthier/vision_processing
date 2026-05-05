@@ -6,7 +6,7 @@ effort_joint_trajectory_controller:
   type: position_controllers/JointTrajectoryController
   joints:
     - panda_joint1
-    - panda_joint2
+    - panda_joint1
     - panda_joint3
     - panda_joint4
     - panda_joint5
@@ -25,9 +25,8 @@ joint_group_position_controller:
     - panda_joint7
     
   constraints:
-    goal_time: 1.0  # Augmenté de 0.5 à 1.0
-    # Tolérances beaucoup plus permissives
-    panda_joint1: {trajectory: 0.1, goal: 0.05}  # Avant: 0.05, 0.01
+    goal_time: 1.0  
+    panda_joint1: {trajectory: 0.1, goal: 0.05}  
     panda_joint2: {trajectory: 0.1, goal: 0.05}
     panda_joint3: {trajectory: 0.1, goal: 0.05}
     panda_joint4: {trajectory: 0.1, goal: 0.05}
@@ -37,12 +36,12 @@ joint_group_position_controller:
 
 gazebo_ros_control:
   pid_gains:
-    panda_joint1: {p: 6000.0, i: 0.0, d: 50.0, i_clamp: 10000.0}
-    panda_joint2: {p: 15000.0, i: 0.0, d: 100.0, i_clamp: 10000.0} # Gros moteur épaule
-    panda_joint3: {p: 9000.0, i: 0.0, d: 50.0, i_clamp: 10000.0}
-    panda_joint4: {p: 9000.0, i: 0.0, d: 70.0, i_clamp: 10000.0} # Coude (souvent responsable du drift)
-    panda_joint5: {p: 6000.0, i: 0.0, d: 70.0, i_clamp: 10000.0}
-    panda_joint6: {p: 3500.0,  i: 0.0, d: 50.0, i_clamp: 10000.0}
-    panda_joint7: {p: 2000.0,  i: 0.0, d: 20.0, i_clamp: 10000.0}
+    panda_joint1: {p: 600.0, i: 0.0, d: 30.0, i_clamp: 10000.0}
+    panda_joint2: {p: 600.0, i: 0.0, d: 30.0, i_clamp: 10000.0}
+    panda_joint3: {p: 600.0, i: 0.0, d: 30.0, i_clamp: 10000.0}
+    panda_joint4: {p: 600.0, i: 0.0, d: 30.0, i_clamp: 10000.0}
+    panda_joint5: {p: 250.0, i: 0.0, d: 10.0, i_clamp: 10000.0}
+    panda_joint6: {p: 150.0, i: 0.0, d: 10.0, i_clamp: 10000.0}
+    panda_joint7: {p: 50.0,  i: 0.0, d: 5.0,  i_clamp: 10000.0}
     panda_finger_joint1: {p: 100, d: 10, i: 1}
     panda_finger_joint2: {p: 100, d: 10, i: 1}

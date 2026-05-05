@@ -1,70 +1,47 @@
 <?xml version="1.0"?>
-<!--
-  Container (Bowl/Plate) URDF — for SafeFlow SDF integration
-  ============================================================
-
-  The mesh 03_surface_aligned.obj is PCA-aligned, meaning its vertices
-  are already expressed in the container's local coordinate frame — the
-  SAME frame where the SDF was computed. No visual origin offset is needed.
-
-  The joint origin (xyz, rpy) defines T_world_container directly.
-  This frame is published in TF as "container_link", so the inference
-  node can look it up instead of hardcoding ~container_pose.
-
-  Usage in panda_camera.xacro:
-  ─────────────────────────────
-    <xacro:include filename="$(find vision_processing)/urdf/container.xacro"/>
-    <xacro:container xyz="0.5 0.3 0.0" rpy="0 0 0"/>
-
-  The xyz/rpy should match where you place the real bowl in the world.
--->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="container">
 
-  <xacro:macro name="container" params="xyz:='0.5 0.0 0.0' rpy:='0 0 0'">
+  <xacro:property name="mesh_scale" value="0.025 0.025 0.025"/>
 
-    <!-- Container visual + collision link -->
-    <link name="container_link">
-      <visual>
-        <origin xyz="0 0 0" rpy="0 0 0"/>
-        <geometry>
-          <mesh filename="package://vision_processing/src/vision_processing/SDF/03_surface_aligned.obj"/>
-        </geometry>
-        <material name="container_material">
-          <color rgba="0.85 0.75 0.65 0.6"/>
-        </material>
-      </visual>
+  <link name="container_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://vision_processing/urdf/basic-bowl/source/Basic Bowl/Bowl.obj" scale="${mesh_scale}"/>
+      </geometry>
+      <material name="container_material">
+        <color rgba="1.0 1.0 1.0 1.0"/>
+      </material>
+    </visual>
 
-      <!-- Collision is optional here: the fork_tip has no collision geometry,
-           so Gazebo won't detect fork-bowl contact regardless.
-           The real safety comes from the SDF + FMBF in the inference node,
-           which steers trajectories AROUND the bowl at the planning level.
-           We keep collision so the panda arm links can't clip through. -->
-      <collision>
-        <origin xyz="0 0 0" rpy="0 0 0"/>
-        <geometry>
-          <mesh filename="package://vision_processing/src/vision_processing/SDF/03_surface_aligned.obj"/>
-        </geometry>
-      </collision>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://vision_processing/urdf/basic-bowl/source/Basic Bowl/Bowl.obj" scale="${mesh_scale}"/>
+      </geometry>
+    </collision>
 
-      <inertial>
-        <mass value="0.3"/>
-        <inertia ixx="1e-3" ixy="0" ixz="0" iyy="1e-3" iyz="0" izz="1e-3"/>
-      </inertial>
-    </link>
+    <inertial>
+      <mass value="0.3"/>
+      <inertia ixx="1e-3" ixy="0" ixz="0" iyy="1e-3" iyz="0" izz="1e-3"/>
+    </inertial>
+  </link>
 
-    <!-- Fixed joint: world → container -->
-    <joint name="container_joint" type="fixed">
-      <parent link="world"/>
-      <child link="container_link"/>
-      <origin xyz="${xyz}" rpy="${rpy}"/>
-    </joint>
+  <gazebo reference="container_link">
+    <material>Gazebo/White</material>
+  </gazebo>
 
-    <!-- Gazebo appearance -->
-    <gazebo reference="container_link">
-      <material>Gazebo/Wood</material>
-      <static>true</static>
-    </gazebo>
-
-  </xacro:macro>
+  <gazebo>
+    <plugin name="p3d_base_controller" filename="libgazebo_ros_p3d.so">
+      <alwaysOn>true</alwaysOn>
+      <updateRate>50.0</updateRate>
+      <bodyName>container_link</bodyName>
+      <topicName>container_pose</topicName>
+      <gaussianNoise>0.0</gaussianNoise>
+      <frameName>world</frameName>
+      <xyzOffsets>0 0 0</xyzOffsets>
+      <rpyOffsets>0 0 0</rpyOffsets>
+    </plugin>
+  </gazebo>
 
 </robot>

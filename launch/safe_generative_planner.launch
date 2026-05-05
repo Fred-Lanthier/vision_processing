@@ -1,0 +1,36 @@
+<launch>
+  <!-- 1. Robot Model and TFs -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro" /> 
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" />
+  <node pkg="tf2_ros" type="static_transform_publisher" name="world_to_panda" args="0 0 0 0 0 0 world panda_link0" />
+
+  <!-- 2. Simulation / Environment Mock (For Testing) -->
+  <!-- Note: This node simulates moving targets and obstacles -->
+  <node name="mock_env" pkg="vision_processing" type="mock_environment_node.py" output="screen" cwd="node" />
+  
+  <!-- Dummy Robot Node (Integrates joint velocities for sim) -->
+  <node name="dummy_robot" pkg="vision_processing" type="dummy_robot_node.py" output="screen" cwd="node" />
+
+  <!-- 3. Perception IA Node (SAM3 + SAM2.1) -->
+  <!-- This node handles segmented point cloud generation for the planner and safety shield -->
+  <node name="sam3_sam2" pkg="vision_processing" type="sam3_sam2_node.py" output="screen" cwd="node">
+        <param name="prompt" value="hand" />
+        <param name="rgb_topic" value="/camera_wrist/color/image_raw" />
+        <param name="depth_topic" value="/camera_wrist/aligned_depth_to_color/image_raw" />
+        <param name="info_topic" value="/camera_wrist/color/camera_info" />
+  </node>
+
+  <!-- 4. Safe Generative Planner (8Hz) -->
+  <!-- Generates nominal 9D Flow Matching trajectories conditioned on point clouds -->
+  <node name="safe_generative_planner" pkg="vision_processing" type="safe_generative_node.py" output="screen" cwd="node">
+        <param name="model_name" value="best_fm_model_high_dim_CFM_relative_dropout.ckpt" />
+  </node>
+
+  <!-- 5. Bernstein-Basis CBF Safety Shield (150Hz) -->
+  <!-- High-frequency safety guard that filters planner trajectories against obstacles -->
+  <node name="cbf_safety_Bernstein" pkg="vision_processing" type="cbf_safety_node_Bernstein.py" output="screen" cwd="node" />
+
+  <!-- 6. RViz Visualization -->
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find vision_processing)/config/cbf_config.rviz" />
+</launch>

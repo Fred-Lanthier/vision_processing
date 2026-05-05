@@ -22,8 +22,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from diffusers.training_utils import EMAModel 
-from diffusers.optimization import get_scheduler
+try:
+    from diffusers.training_utils import EMAModel 
+    from diffusers.optimization import get_scheduler
+except Exception as e:
+    print(f"⚠️ Diffusers not available ({e}). Training features disabled.")
+    pass
 from tqdm.auto import tqdm
 import numpy as np
 import copy

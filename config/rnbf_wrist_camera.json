@@ -1,0 +1,59 @@
+{
+  "dataset": {
+    "format": "realsense_franka",
+    "depth_scale": 1000,
+    "camera": {
+      "w": 640,
+      "h": 480,
+      "fx": 604.9,
+      "fy": 604.9,
+      "cx": 320,
+      "cy": 240
+    }
+  },
+  "optimiser": {
+    "lr": 0.0004,
+    "weight_decay": 0.012
+  },
+  "sample": {
+    "n_rays": 300,
+    "n_rays_is_kf": 400,
+    "n_strat_samples": 19,
+    "n_surf_samples": 8,
+    "depth_range": [
+      0.1,
+      1.5
+    ],
+    "dist_behind_surf": 0.01
+  },
+  "model": {
+    "scale_output": 0.10,
+    "noise_std": 0.025,
+    "noise_kf": 0.08,
+    "noise_frame": 0.04,
+    "window_size": 8,
+    "hidden_layers_block": 2,
+    "hidden_feature_size": 256,
+    "positional_encoding_degree": 8,
+    "iters_per_kf": 60,
+    "iters_per_frame": 10,
+    "kf_dist_th": 0.12,
+    "kf_pixel_ratio": 0.65,
+    "embedding_scale": 0.4
+  },
+  "loss": {
+    "bounds_method": "ray",
+    "loss_type": "Huber",
+    "trunc_weight": 30,
+    "trunc_distance": 0.03,
+    "eik_weight": 0.268,
+    "eik_apply_dist": 0.1,
+    "grad_weight": 0.018
+  },
+  "training": {
+    "steps_per_frame": 10,
+    "steps_per_keyframe": 60,
+    "learning_rate": 0.0001,
+    "freeze_after_n_missing": 30
+  }
+}

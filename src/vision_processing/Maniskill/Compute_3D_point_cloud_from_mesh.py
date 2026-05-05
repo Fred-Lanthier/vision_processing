@@ -284,9 +284,9 @@ class RobotMeshLoaderOptimized:
                 
                 # Application de la matrice T (4x4) sur tous les points (Nx4)
                 transformed = (T @ points_homo.T).T[:, :3]
-                # all_transformed_points.append(transformed)
-                if link_name == 'fork_tip':
-                    all_transformed_points.append(transformed)
+                all_transformed_points.append(transformed)
+                # if link_name == 'fork_tip':
+                #     all_transformed_points.append(transformed)
 
         return np.vstack(all_transformed_points)
     
@@ -409,7 +409,7 @@ def main():
     # Load trajectory data
     
     write_folder = "datas/Trajectories_record_TEST"
-    total_traj = 47
+    total_traj = 64
     for traj_id in range(46, total_traj+1):
         json_file = os.path.join(package_path_vision_processing, write_folder, 
                                 f'Trajectory_{traj_id}', f'trajectory_{traj_id}.json')
@@ -459,8 +459,8 @@ def main():
             num_0 = 4 - len(str(idx+1))
             id = '0'*num_0 + str(idx+1)
             # Define the filename for your .npy file
-            filename = f'Fork_point_cloud_{id}.npy'
-            # filename = f'Robot_point_cloud_{id}.npy'
+            # filename = f'Fork_point_cloud_{id}.npy'
+            filename = f'Robot_point_cloud_{id}.npy'
             save_file = os.path.join(images_folder, filename)
             # Save the NumPy array to the .npy file
             np.save(save_file, pcd[idx])

@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(vision_processing)
 
+## [MODIF 1] Fix impératif pour pybind11 sur Noetic
+cmake_policy(SET CMP0057 NEW)
+
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
@@ -19,9 +22,23 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_geometry_msgs
 )
 
-find_package(OpenCV REQUIRED)
+# Fixer le chemin du python AVANT de chercher pybind11
+set(PYTHON_EXECUTABLE "/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3")
 
-## Add service files
+# Trouver le chemin d'inclusion de Pybind11 via Python
+execute_process(
+    COMMAND ${PYTHON_EXECUTABLE} -c "import pybind11; print(pybind11.get_include())"
+    OUTPUT_VARIABLE PYBIND11_VENV_INCLUDE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+find_package(OpenCV REQUIRED)
+find_package(pinocchio REQUIRED)
+find_package(pybind11 REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(PCL REQUIRED)
+
+## 1. Services et Messages
 add_service_files(
   FILES
   ProcessImage.srv
@@ -29,10 +46,10 @@ add_service_files(
   Sam3Segment.srv
 )
 
-## Python setup
+## 2. Configuration Python (DOIT être avant generate_messages)
 catkin_python_setup()
 
-## Generate added messages and services
+## 3. Génération des messages
 generate_messages(
   DEPENDENCIES
   sensor_msgs
@@ -56,29 +73,70 @@ catkin_package(
     tf2_geometry_msgs
 )
 
+## Inclusions
 include_directories(
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
+  ${PINOCCHIO_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIR}
+  ${PYBIND11_VENV_INCLUDE_DIR}
+  ${PCL_INCLUDE_DIRS}
 )
 
-add_executable(franka_state_camera_reader src/vision_processing/gazebo_simulation/franka_state_camera_reader.cpp)
+link_directories(${PCL_LIBRARY_DIRS})
+add_definitions(${PCL_DEFINITIONS})
 
+## 4. Module Pybind11 (Fast IK)
+pybind11_add_module(fast_ik_module src/vision_processing/fast_ik.cpp)
+target_compile_options(fast_ik_module PRIVATE -O3)
+
+target_link_libraries(fast_ik_module PUBLIC 
+    pinocchio::pinocchio 
+    Eigen3::Eigen
+    ${catkin_LIBRARIES}
+)
+
+set_target_properties(fast_ik_module PROPERTIES 
+    LIBRARY_OUTPUT_DIRECTORY ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_PYTHON_DESTINATION}/vision_processing
+)
+
+## 5. Module Pybind11 (Fast Perception)
+pybind11_add_module(fast_perception_module src/vision_processing/fast_perception.cpp)
+
+target_link_libraries(fast_perception_module PUBLIC 
+    ${catkin_LIBRARIES}
+    ${PCL_LIBRARIES}
+)
+
+set_target_properties(fast_perception_module PROPERTIES 
+    LIBRARY_OUTPUT_DIRECTORY ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_PYTHON_DESTINATION}/vision_processing
+)
+
+## Autres exécutables
+add_executable(franka_state_camera_reader src/vision_processing/gazebo_simulation/franka_state_camera_reader.cpp)
 target_link_libraries(
   franka_state_camera_reader 
   ${catkin_LIBRARIES}
   ${OpenCV_LIBS}
 )
-set(PYTHON_EXECUTABLE "/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3")
 
+## Installation
 catkin_install_python(PROGRAMS
   scripts/vision_server_food_segmentation.py
   scripts/vision_server_robot_segmentation.py
   scripts/trajectory_node.py
   scripts/inference_node.py
-  
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 install(DIRECTORY launch/
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+)
+
+install(TARGETS fast_ik_module
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_PYTHON_DESTINATION}
+)
+
+install(TARGETS fast_perception_module
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_PYTHON_DESTINATION}
 )

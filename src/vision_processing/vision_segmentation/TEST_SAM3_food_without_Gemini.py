@@ -145,8 +145,8 @@ if __name__ == "__main__":
     rospkg = rospkg.RosPack()
     pkg_path = rospkg.get_path("vision_processing")
     step = 11
-    IMAGE_PATH = os.path.join(pkg_path, f"datas/Trajectories_record/Trajectory_{step}/images_Trajectory_{step}/ee_rgb_step_0001.png") 
-    LISTE_ALIMENTS = ["dark object in trapezoidal shape with pink side"]
+    IMAGE_PATH = os.path.join(pkg_path, f"src/vision_processing/vision_segmentation/images/ros_image.jpg") 
+    LISTE_ALIMENTS = ["plate"]
     
     segmenter = FoodSegmenterNative()
     segmenter.process_food_list(IMAGE_PATH, LISTE_ALIMENTS)

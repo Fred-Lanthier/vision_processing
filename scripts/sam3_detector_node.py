@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from std_msgs.msg import String
+
 import rospy
 import numpy as np
 from sensor_msgs.msg import Image
@@ -14,7 +16,8 @@ class Sam3DetectorNode:
     def __init__(self):
         rospy.init_node('sam3_detector_node', anonymous=True)
         
-        self.target_object = rospy.get_param("~target_object", "cube")
+        self.sub_prompt = rospy.Subscriber('/vision/sam3_prompt', String, self._prompt_cb, queue_size=1)
+
         self.detection_confidence = 0.10
         
         rospy.loginfo("⏳ Chargement du modèle SAM 3...")
@@ -27,6 +30,10 @@ class Sam3DetectorNode:
         self.sub_req = rospy.Subscriber('/vision/sam3_request', Image, self.request_cb, queue_size=1)
         self.pub_reply = rospy.Publisher('/vision/sam3_reply', Image, queue_size=1)
 
+    def _prompt_cb(self, msg):
+            self.target_object = msg.data
+            rospy.loginfo(f"SAM3 prompt changed to: '{msg.data}'")
+        
     def request_cb(self, msg):
         if self.is_processing:
             return 
@@ -48,7 +55,7 @@ class Sam3DetectorNode:
                 mask_np = (mask > 0).astype(np.uint8) * 255
                 reply_msg.data = mask_np.tobytes()
             else:
-                rospy.logwarn("❌ SAM 3 n'a rien trouvé. Renvoi d'un masque vide pour continuer la boucle.")
+                rospy.logwarn("❌ SAM 3 n'a pas trouvé " + self.target_object + ". Renvoi d'un masque vide pour continuer la boucle.")
                 # Création d'un masque tout noir (vide)
                 empty_mask = np.zeros((msg.height, msg.width), dtype=np.uint8)
                 reply_msg.data = empty_mask.tobytes()

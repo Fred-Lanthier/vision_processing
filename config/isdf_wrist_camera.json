@@ -1,0 +1,25 @@
+{
+  "camera": {
+    "w": 640,
+    "h": 480,
+    "fx": 604.9,
+    "fy": 604.9,
+    "cx": 320.0,
+    "cy": 240.0,
+    "depth_scale": 1.0
+  },
+  "scene": {
+    "bounds_min": [-0.4, -0.4, -0.1],
+    "bounds_max": [0.4, 0.4, 0.5]
+  },
+  "model": {
+    "hidden_layers": 5,
+    "hidden_features": 256,
+    "positional_encoding_degree": 6
+  },
+  "training": {
+    "learning_rate": 0.001,
+    "steps_per_frame": 10,
+    "truncation_distance": 0.02
+  }
+}
