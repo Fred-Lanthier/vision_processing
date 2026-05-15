@@ -1,18 +1,15 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="panda">
 
-  <xacro:include filename="$(find franka_description)/robots/common/franka_arm.xacro"/>
-  <xacro:include filename="$(find franka_description)/robots/common/franka_hand.xacro"/>
+  <xacro:include filename="$(find franka_description)/robots/common/franka_robot.xacro"/>
   
   <xacro:arg name="arm_id" default="panda" />
-  <link name="world" />
 
-  <xacro:franka_arm arm_id="$(arg arm_id)" connected_to="world" xyz="0 0 0" 
-                    safety_distance="0.03" gazebo="true" 
-                    joint_limits="${xacro.load_yaml('$(find franka_description)/robots/panda/joint_limits.yaml')}"/>
-
-  <xacro:franka_hand arm_id="$(arg arm_id)" rpy="0 0 ${-pi/4}" 
-                    connected_to="$(arg arm_id)_link8" safety_distance="0.03" gazebo="true"/>
+  <xacro:franka_robot arm_id="$(arg arm_id)"
+                       joint_limits="${xacro.load_yaml('$(find franka_description)/robots/panda/joint_limits.yaml')}"
+                       parent="world"
+                       hand="true"
+                       gazebo="true"/>
 
   <link name="panda_TCP"/>
   <joint name="panda_TCP_joint" type="fixed">
@@ -24,7 +21,7 @@
   <link name="fork_tip">
     <visual>
       <origin xyz="-0.033 -0.02 0.0171378" rpy="0 ${27.5 * pi / 180} 0"/>
-      <geometry><mesh filename="package://vision_processing/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/></geometry>
+      <geometry><mesh filename="package://vision_processing/src/vision_processing/diffusion_model_train/fork_tip.stl" scale="0.001 0.001 0.001"/></geometry>
     </visual>
     <inertial> <mass value="0.1" />
       <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001" />
@@ -37,26 +34,16 @@
     <child link="fork_tip"/>
   </joint>
 
-  <xacro:macro name="create_transmission" params="joint_name">
-    <transmission name="${joint_name}_tran">
-      <type>transmission_interface/SimpleTransmission</type>
-      <joint name="${joint_name}">
-        <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
-      </joint>
-      <actuator name="${joint_name}_motor">
-        <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
-        <mechanicalReduction>1</mechanicalReduction>
-      </actuator>
-    </transmission>
-  </xacro:macro>
-
-  <xacro:create_transmission joint_name="$(arg arm_id)_joint1"/>
-  <xacro:create_transmission joint_name="$(arg arm_id)_joint2"/>
-  <xacro:create_transmission joint_name="$(arg arm_id)_joint3"/>
-  <xacro:create_transmission joint_name="$(arg arm_id)_joint4"/>
-  <xacro:create_transmission joint_name="$(arg arm_id)_joint5"/>
-  <xacro:create_transmission joint_name="$(arg arm_id)_joint6"/>
-  <xacro:create_transmission joint_name="$(arg arm_id)_joint7"/>
+  <!-- Physical tine tip: centroid of fork tine endpoints in fork_tip frame.
+       Computed from fork_tip.stl bounding box (top-1% Z vertices, scale 0.001):
+         STL tip ~ [30.5, 19.8, 180.0] mm → R_y(27.5°) × tip_m + visual_offset
+       Result: [0.0771, -0.0002, 0.1627] in fork_tip frame. -->
+  <link name="fork_tine_tip"/>
+  <joint name="fork_tine_tip_joint" type="fixed">
+    <origin xyz="0.0771 -0.0002 0.1627" rpy="0 0 0"/>
+    <parent link="fork_tip"/>
+    <child link="fork_tine_tip"/>
+  </joint>
 
   <joint name="camera_static_joint" type="fixed">
     <parent link="world" />
@@ -151,12 +138,5 @@
         <updateRate>12.0</updateRate>
       </plugin>
     </sensor>
-  </gazebo>
-  
-  <gazebo>
-    <plugin name="gazebo_ros_control" filename="libgazebo_ros_control.so">
-      <robotNamespace>/</robotNamespace>
-      <robotSimType>gazebo_ros_control/DefaultRobotHWSim</robotSimType>
-    </plugin>
   </gazebo>
 </robot>

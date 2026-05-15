@@ -43,6 +43,7 @@ class DirectHoming:
         rate = rospy.Rate(100)
         
         rospy.loginfo("🚀 Début du Homing...")
+        rospy.set_param('/homing_done', False)
         
         while not rospy.is_shutdown():
             now = rospy.Time.now().to_sec()
@@ -67,7 +68,8 @@ class DirectHoming:
                 
             rate.sleep()
             
-        rospy.loginfo("✅ Homing Terminé ! Fermeture automatique du script.")
+        rospy.loginfo("✅ Homing Terminé !")
+        rospy.set_param('/homing_done', True)
         # On donne une petite demi-seconde à ROS pour être sûr que 
         # le tout dernier message est bien parti avant de tuer le noeud.
         rospy.sleep(0.5) 

@@ -54,6 +54,7 @@ class TrajectoryFollowerContinuous:
         # State
         self.current_joints = None
         self.target_joints = None  
+        self.last_command_joints = None
         self.latest_msg = None     # We now store the raw ROS message
         self.lock = threading.Lock()
         
@@ -95,6 +96,8 @@ class TrajectoryFollowerContinuous:
             self.current_joints = np.array(positions)
             if self.target_joints is None:
                 self.target_joints = self.current_joints.copy()
+            if self.last_command_joints is None:
+                self.last_command_joints = self.current_joints.copy()
 
     def transform_fork_to_tcp(self, pose_fork):
         p = np.array([pose_fork.position.x, pose_fork.position.y, pose_fork.position.z])
@@ -188,18 +191,20 @@ class TrajectoryFollowerContinuous:
         # 6. Continuous Blending
         self.target_joints = (1 - self.blend_rate) * self.target_joints + self.blend_rate * target_lookahead_joints
         
-        # 7. Limite de Vélocité
-        direction = self.target_joints - self.current_joints
+        # 7. Limite de Vélocité (Fixed to prevent stuttering)
+        direction = self.target_joints - self.last_command_joints
         distance = np.linalg.norm(direction)
         if distance < 0.001:
-            return self.target_joints
-            
-        max_step = self.max_joint_velocity / self.control_rate
-        if distance > max_step:
-            direction = direction / distance * max_step
-            command = self.current_joints + direction
-        else:
             command = self.target_joints
+        else:
+            max_step = self.max_joint_velocity / self.control_rate
+            if distance > max_step:
+                direction = direction / distance * max_step
+                command = self.last_command_joints + direction
+            else:
+                command = self.target_joints
+        
+        self.last_command_joints = command.copy()
         
         return command
 

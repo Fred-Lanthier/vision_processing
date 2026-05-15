@@ -1,7 +1,11 @@
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import cv2
 import mediapipe as mp
 import math
 import numpy as np
+import pyrealsense2 as rs
 
 # Initialisation
 mp_face_mesh = mp.solutions.face_mesh
@@ -20,20 +24,11 @@ COLOR_HUD_BG = (30, 30, 30)
 
 # --- CLASSE DE GÉOMÉTRIE CORRIGÉE ---
 class CameraGeometry:
-    def __init__(self, width, height):
-        # Paramètres intrinsèques (Matrice K)
-        # cx, cy : Centre optique de l'image
-        self.cx = width / 2
-        self.cy = height / 2
-        
-        # --- ESTIMATION DES FOCALES (fx, fy) ---
-        # Sans calibration (checkerboard), on estime fx et fy.
-        # Pour une webcam standard (FOV ~60°), fx est souvent proche de la largeur.
-        # NOTE : Sur les capteurs modernes, les pixels sont carrés, donc souvent fx ~= fy.
-        # Mais nous les séparons ici pour respecter la formule mathématique.
-        
-        self.fx = width  # Approximation standard
-        self.fy = width  # On assume des pixels carrés. Si non, fy serait différent.
+    def __init__(self, width, height, fx, fy, cx, cy):
+        self.cx = cx
+        self.cy = cy
+        self.fx = fx
+        self.fy = fy
         
         # Constante physique : Ecart moyen entre les coins des yeux (en cm)
         self.REAL_EYE_DIST_CM = 6.4 
@@ -60,6 +55,29 @@ class CameraGeometry:
         Y_cm = (v - self.cy) * Z_cm / self.fy
 
         return (X_cm, Y_cm, Z_cm)
+
+
+class RealSenseColorCapture:
+    def __init__(self, width=640, height=480, fps=30):
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        self.profile = self.pipeline.start(self.config)
+        stream_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
+        self.intrinsics = stream_profile.get_intrinsics()
+
+    def read(self):
+        frames = self.pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            return False, None
+        return True, np.asanyarray(color_frame.get_data())
+
+    def isOpened(self):
+        return True
+
+    def release(self):
+        self.pipeline.stop()
 
 
 def draw_complete_interface(image, distance, status, face_landmarks, center_point, metric_coords):
@@ -106,14 +124,23 @@ def draw_complete_interface(image, distance, status, face_landmarks, center_poin
     return image
 
 
-cap = cv2.VideoCapture(0)
+try:
+    cap = RealSenseColorCapture()
+except RuntimeError as exc:
+    raise SystemExit(
+        "Cannot start RealSense color stream. Close realsense-viewer/ROS camera nodes "
+        f"or check USB connection. Details: {exc}"
+    )
 
-# Initialisation Géométrie
 success, frame = cap.read()
-if success:
-    h, w, _ = frame.shape
-    geom = CameraGeometry(w, h)
-    print(f"Géométrie initialisée : fx={geom.fx}, fy={geom.fy}, Centre=({geom.cx}, {geom.cy})")
+if not success:
+    cap.release()
+    raise SystemExit("RealSense started, but no color frame was received.")
+
+h, w, _ = frame.shape
+intr = cap.intrinsics
+geom = CameraGeometry(w, h, intr.fx, intr.fy, intr.ppx, intr.ppy)
+print(f"Géométrie RealSense : fx={geom.fx:.2f}, fy={geom.fy:.2f}, Centre=({geom.cx:.2f}, {geom.cy:.2f})")
 
 while cap.isOpened():
     success, image = cap.read()

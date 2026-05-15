@@ -43,6 +43,10 @@ class Sam3Server:
         rospy.loginfo("  SAM3 SERVER STARTING")
         rospy.loginfo("=" * 60)
         
+        # Create service FIRST so it's advertised even if model loading is slow
+        self.service = rospy.Service('/sam3/segment', Sam3Segment, self.handle_request)
+        self.model_ready = False
+
         # Device et Dtype 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
@@ -54,17 +58,15 @@ class Sam3Server:
         
         self.sam_model = build_sam3_image_model()
         if hasattr(self.sam_model, "to"):
-            # CORRECTION : On ne force plus le dtype ici ! 
-            # On laisse le modèle garder ses buffers Float32 intacts.
             self.sam_model.to(device=self.device)
+        if hasattr(self.sam_model, "eval"):
+            self.sam_model.eval()
             
         self.sam_processor = Sam3Processor(self.sam_model, confidence_threshold=0.1)
-        
+        self.model_ready = True
+
         load_time = (rospy.Time.now() - t0).to_sec()
         rospy.loginfo(f"✅ SAM3 loaded in {load_time:.1f}s")
-        
-        # Create service
-        self.service = rospy.Service('/sam3/segment', Sam3Segment, self.handle_request)
         
         rospy.loginfo("=" * 60)
         rospy.loginfo("🚀 SAM3 SERVER READY")
@@ -96,6 +98,10 @@ class Sam3Server:
         resp.success = False
         resp.confidence = 0.0
         resp.bbox = []
+
+        if not self.model_ready:
+            resp.message = "SAM3 model is still loading, please wait..."
+            return resp
         
         try:
             # Convert image
@@ -118,20 +124,46 @@ class Sam3Server:
             scores = raw_scores.detach().cpu().numpy().flatten() if isinstance(raw_scores, torch.Tensor) else np.array(raw_scores).flatten()
             best_idx = np.argmax(scores)
             best_score = float(scores[best_idx])
-            
+
             if best_score < threshold:
                 resp.message = f"Score {best_score:.3f} < threshold {threshold:.3f}"
                 resp.confidence = best_score
                 return resp
-            
-            # Get mask
+
+            # Get masks
             masks = output.get("masks", [])
             masks = masks.detach().cpu().numpy() if isinstance(masks, torch.Tensor) else np.array(masks)
-            mask = masks[best_idx]
-            while mask.ndim > 2:
-                mask = mask[0]
-            
-            mask_uint8 = (mask > 0).astype(np.uint8) * 255
+
+            # top_k=0 or 1 → single best mask (backward-compatible default)
+            top_k = max(1, int(req.top_k)) if req.top_k > 1 else 1
+            top_k = min(top_k, len(scores))
+
+            if top_k == 1:
+                # Original behaviour
+                mask = masks[best_idx]
+                while mask.ndim > 2:
+                    mask = mask[0]
+                combined_mask = mask > 0
+            else:
+                # Union of the top-K scoring masks that clear the threshold
+                top_indices = np.argsort(scores)[::-1][:top_k]
+                valid = [i for i in top_indices if scores[i] >= threshold]
+                if not valid:
+                    valid = [best_idx]
+                combined_mask = np.zeros_like(
+                    masks[0].squeeze() if masks[0].ndim > 2 else masks[0], dtype=bool
+                )
+                for i in valid:
+                    m = masks[i]
+                    while m.ndim > 2:
+                        m = m[0]
+                    combined_mask |= (m > 0)
+                rospy.loginfo(
+                    f"  top-{top_k} union: used {len(valid)} masks "
+                    f"scores={scores[top_indices].round(3).tolist()}"
+                )
+
+            mask_uint8 = combined_mask.astype(np.uint8) * 255
             
             # Bounding box
             rows, cols = np.any(mask_uint8, axis=1), np.any(mask_uint8, axis=0)

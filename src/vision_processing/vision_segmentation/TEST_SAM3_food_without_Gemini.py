@@ -40,70 +40,81 @@ class FoodSegmenterNative:
         rainbow_map_image = Image.new("RGB", image_pil.size, (0, 0, 0))
         
         # Initialisation SAM 3
-        inference_state = self.processor.set_image(image_pil)
+        self.dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
+        print(f"🔹 Using autocast with dtype: {self.dtype}")
+
+        with torch.inference_mode(), torch.autocast(device_type=self.device, dtype=self.dtype):
+            inference_state = self.processor.set_image(image_pil)
 
         cmap = plt.get_cmap("hsv")
         colors = [cmap(i / (len(food_list) + 1))[:3] for i in range(len(food_list))]
 
         print(f"🍽️  Analyse de la liste : {food_list}")
         print("-" * 40)
+        while True:
+            for i, food_name in enumerate(food_list):
+                start = time.time()
+                color_rgb = tuple(int(c * 255) for c in colors[i])
 
-        for i, food_name in enumerate(food_list):
-            start = time.time()
-            color_rgb = tuple(int(c * 255) for c in colors[i])
+                print(f"   👉 Recherche de : '{food_name}' (Couleur ID: {color_rgb})")
 
-            print(f"   👉 Recherche de : '{food_name}' (Couleur ID: {color_rgb})")
-
-            try:
-                output = self.processor.set_text_prompt(state=inference_state, prompt=food_name)
-                print(output["scores"])
-                masks = output["masks"]
-                
-                if masks is not None:
-                    # Conversion Tensor -> Numpy
-                    if isinstance(masks, torch.Tensor):
-                        masks = masks.detach().cpu().numpy()
+                try:
+                    with torch.inference_mode(), torch.autocast(device_type=self.device, dtype=self.dtype):
+                        output = self.processor.set_text_prompt(state=inference_state, prompt=food_name)
+                    print(output["scores"])
+                    masks = output["masks"]
                     
-                    if masks.size == 0 or not np.any(masks):
-                        print(f"      ⚠️ Aucun pixel trouvé pour '{food_name}'")
-                        continue
+                    if masks is not None:
+                        # Conversion Tensor -> Numpy
+                        if isinstance(masks, torch.Tensor):
+                            # NumPy ne supporte pas BFloat16, on cast en float32 d'abord
+                            masks = masks.detach().to(torch.float32).cpu().numpy()
+                        
+                        if masks.size == 0 or not np.any(masks):
+                            print(f"      ⚠️ Aucun pixel trouvé pour '{food_name}'")
+                            continue
 
-                    # --- COMPTAGE SUPER SIMPLE ---
-                    # Si le tableau est en 3D (N, H, W), len(masks) donne N.
-                    # Si le tableau est en 2D (H, W), c'est qu'il y a 1 seul masque.
-                    if masks.ndim > 2:
-                        count = len(masks) # C'est ça que tu voulais
+                        # --- COMPTAGE SUPER SIMPLE ---
+                        # Si le tableau est en 3D (N, H, W), len(masks) donne N.
+                        # Si le tableau est en 2D (H, W), c'est qu'il y a 1 seul masque.
+                        if masks.ndim > 2:
+                            count = len(masks) # C'est ça que tu voulais
+                        else:
+                            count = 1
+                        
+                        print(f"      🔢 Nombre de masques (len) : {count}")
+
+                        # --- Fusion pour l'affichage ---
+                        # On combine les TOP 4 masques (pour capturer les 4 dents de la fourchette)
+                        if masks.ndim > 2:
+                            scores = output["scores"].to(torch.float32).cpu().numpy()
+                            # On prend les 4 meilleurs indices
+                            top_k = min(4, len(scores))
+                            top_indices = np.argsort(scores)[::-1][:top_k]
+                            
+                            print(f"      🔝 Top {top_k} scores : {scores[top_indices]}")
+                            
+                            # On combine les masques avec un OR logique (np.any)
+                            combined_mask = np.any(masks[top_indices] > 0, axis=0)
+                        else:
+                            combined_mask = masks > 0
+
+                        # --- Application sur les images ---
+                        # 1. Overlay Transparent
+                        final_overlay_image = self.overlay_mask_transparent(final_overlay_image, combined_mask, color_rgb)
+                        
+                        # 2. Rainbow Map (Solide)
+                        self.paint_rainbow_mask(rainbow_map_image, combined_mask, color_rgb)
+                        
+                        print(f"      ✅ Masques appliqués.")
+                        print(f"      ⏱️ Temps écoulé : {time.time() - start:.2f} secondes")
+                        print("-" * 20)
+
                     else:
-                        count = 1
-                    
-                    print(f"      🔢 Nombre de masques (len) : {count}")
+                        print(f"      ⚠️ Retour vide pour '{food_name}'")
 
-                    # --- Fusion pour l'affichage ---
-                    # On doit quand même combiner les masques pour l'affichage visuel
-                    if masks.ndim > 2:
-                        # On aplatit pour l'image (N, H, W) -> (H, W)
-                        scores = output["scores"].cpu().numpy()
-                        max_score_idx = np.argmax(scores)
-                        combined_mask = masks[max_score_idx] > 0
-                    else:
-                        combined_mask = masks > 0
-
-                    # --- Application sur les images ---
-                    # 1. Overlay Transparent
-                    final_overlay_image = self.overlay_mask_transparent(final_overlay_image, combined_mask, color_rgb)
-                    
-                    # 2. Rainbow Map (Solide)
-                    self.paint_rainbow_mask(rainbow_map_image, combined_mask, color_rgb)
-                    
-                    print(f"      ✅ Masques appliqués.")
-                    print(f"      ⏱️ Temps écoulé : {time.time() - start:.2f} secondes")
-                    print("-" * 20)
-
-                else:
-                    print(f"      ⚠️ Retour vide pour '{food_name}'")
-
-            except Exception as e:
-                print(f"      ❌ Erreur critique sur '{food_name}': {e}")
+                except Exception as e:
+                    print(f"      ❌ Erreur critique sur '{food_name}': {e}")
 
         # Sauvegarde
         final_overlay_image.save(overlay_filename)
@@ -146,7 +157,7 @@ if __name__ == "__main__":
     pkg_path = rospkg.get_path("vision_processing")
     step = 11
     IMAGE_PATH = os.path.join(pkg_path, f"src/vision_processing/vision_segmentation/images/ros_image.jpg") 
-    LISTE_ALIMENTS = ["plate"]
+    LISTE_ALIMENTS = ["Fork teeth"]
     
     segmenter = FoodSegmenterNative()
     segmenter.process_food_list(IMAGE_PATH, LISTE_ALIMENTS)

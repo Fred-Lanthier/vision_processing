@@ -442,7 +442,7 @@
     <visual>
       <origin rpy="0 0.4799655442984406 0" xyz="-0.033 -0.02 0.0171378"/>
       <geometry>
-        <mesh filename="package://vision_processing/src/vision_processing/diffusion_model_train/fork.STL" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://vision_processing/src/vision_processing/diffusion_model_train/fork_tip.stl" scale="0.001 0.001 0.001"/>
       </geometry>
     </visual>
     <inertial>

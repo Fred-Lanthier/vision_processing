@@ -19,3 +19,6 @@
 [submodule "third_party/tapnet"]
 	path = third_party/tapnet
 	url = https://github.com/Fred-Lanthier/tapnet.git
+[submodule "third_party/panda-simulator"]
+	path = third_party/panda-simulator
+	url = https://github.com/Fred-Lanthier/panda-simulator.git

@@ -8,6 +8,7 @@
 sensor_msgs/Image rgb_image
 string text_prompt
 float32 confidence_threshold
+int32 top_k                    # combine top-K masks (0 or 1 = single best, 4 = all 4 fork teeth)
 
 ---
 

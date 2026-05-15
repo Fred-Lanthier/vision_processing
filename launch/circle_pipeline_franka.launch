@@ -1,0 +1,78 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- FlowMatching-style circular trajectory pipeline:
+       circle_trajectory_publisher -> /planner/nominal_trajectory
+       trajectory_executor -> /planner/safe_joint_command
+       trajectory_controller_bridge -> /position_joint_trajectory_controller/command
+
+       This uses franka_gazebo's stable trajectory controller so the simulated
+       arm remains gravity-held, while preserving the planner/executor split. -->
+
+  <arg name="bridge_rate_hz" default="20.0" />
+  <arg name="bridge_horizon_points" default="3" />
+  <arg name="bridge_point_dt" default="0.05" />
+  <arg name="bridge_lead_time" default="0.06" />
+  <arg name="monitor_hz" default="5.0" />
+  <arg name="start_delay" default="0.25" />
+  <arg name="log_ik_each_waypoint" default="false" />
+  <arg name="smooth_velocities" default="true" />
+  <arg name="publish_waypoint_markers" default="true" />
+  <arg name="launch_rviz" default="true" />
+
+  <include file="$(find franka_gazebo)/launch/panda.launch">
+    <arg name="controller"  value="position_joint_trajectory_controller" />
+    <arg name="use_gripper" value="false" />
+    <arg name="initial_joint_positions"
+         value="-J panda_joint1 -0.000059
+                -J panda_joint2 -0.125928
+                -J panda_joint3  0.000117
+                -J panda_joint4 -2.193312
+                -J panda_joint5 -0.000251
+                -J panda_joint6  2.064780
+                -J panda_joint7  0.785511" />
+  </include>
+
+  <node name="circle_trajectory_publisher"
+        pkg="vision_processing"
+        type="circle_trajectory_publisher.py"
+        output="screen">
+    <param name="execution_mode" value="planner" />
+    <param name="planner_topic" value="/planner/nominal_trajectory" />
+    <param name="start_delay" value="$(arg start_delay)" />
+    <param name="monitor_hz" value="$(arg monitor_hz)" />
+    <param name="log_ik_each_waypoint" value="$(arg log_ik_each_waypoint)" />
+    <param name="smooth_velocities" value="$(arg smooth_velocities)" />
+    <param name="publish_waypoint_markers" value="$(arg publish_waypoint_markers)" />
+  </node>
+
+  <node name="trajectory_executor"
+        pkg="vision_processing"
+        type="trajectory_executor.py"
+        output="screen">
+    <param name="rate_hz" value="50.0" />
+    <param name="out_topic" value="/planner/safe_joint_command" />
+    <param name="hold_current_until_trajectory" value="true" />
+  </node>
+
+  <node name="trajectory_controller_bridge"
+        pkg="vision_processing"
+        type="trajectory_controller_bridge.py"
+        output="screen">
+    <param name="rate_hz" value="$(arg bridge_rate_hz)" />
+    <param name="in_topic" value="/planner/safe_joint_command" />
+    <param name="out_topic" value="/position_joint_trajectory_controller/command" />
+    <param name="horizon_points" value="$(arg bridge_horizon_points)" />
+    <param name="point_dt" value="$(arg bridge_point_dt)" />
+    <param name="lead_time" value="$(arg bridge_lead_time)" />
+    <param name="hold_current_until_command" value="true" />
+    <param name="hold_when_stale" value="true" />
+    <param name="hold_duration" value="0.25" />
+  </node>
+
+  <node if="$(arg launch_rviz)"
+        name="rviz"
+        pkg="rviz"
+        type="rviz"
+        args="-d $(find vision_processing)/config/circle_trajectory.rviz"
+        output="screen" />
+</launch>

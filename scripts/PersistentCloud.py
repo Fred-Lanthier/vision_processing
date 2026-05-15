@@ -13,6 +13,7 @@ ObjectCloud — movable target (food)
               follows — no clones, no ghost copies.
 """
 
+import threading
 import numpy as np
 
 
@@ -38,12 +39,12 @@ def _dedup(hashes, points):
     return hashes[unique_idx], points[unique_idx]
 
 
-def _merge(old_h, old_p, old_c, old_s, new_h, new_p, frame, max_pts):
+def _merge(old_h, old_p, old_c, new_h, new_p, max_pts):
     if len(old_h) == 0:
         n = min(len(new_h), max_pts)
         order = np.argsort(new_h[:n])
         return (new_h[:n][order].copy(), new_p[:n][order].copy(),
-                np.ones(n, dtype=np.int32), np.full(n, frame, dtype=np.int32))
+                np.ones(n, dtype=np.int32))
 
     ins = np.searchsorted(old_h, new_h)
     ins_c = np.clip(ins, 0, len(old_h) - 1)
@@ -53,7 +54,6 @@ def _merge(old_h, old_p, old_c, old_s, new_h, new_p, frame, max_pts):
         idx = ins_c[existing]
         old_p[idx] = new_p[existing]
         old_c[idx] += 1
-        old_s[idx] = frame
 
     n_new = (~existing).sum()
     if n_new > 0:
@@ -63,11 +63,10 @@ def _merge(old_h, old_p, old_c, old_s, new_h, new_p, frame, max_pts):
             all_h = np.concatenate([old_h, new_h[~existing][:n_add]])
             all_p = np.vstack([old_p, new_p[~existing][:n_add]])
             all_c = np.concatenate([old_c, np.ones(n_add, dtype=np.int32)])
-            all_s = np.concatenate([old_s, np.full(n_add, frame, dtype=np.int32)])
             order = np.argsort(all_h)
-            return all_h[order], all_p[order], all_c[order], all_s[order]
+            return all_h[order], all_p[order], all_c[order]
 
-    return old_h, old_p, old_c, old_s
+    return old_h, old_p, old_c
 
 
 # =====================================================================
@@ -75,73 +74,95 @@ def _merge(old_h, old_p, old_c, old_s, new_h, new_p, frame, max_pts):
 # =====================================================================
 
 class WorldCloud:
+    """
+    Sparse voxel map for the static environment.
 
-    def __init__(self, voxel_size=0.01, max_age=2000, max_points=50000):
+    Voxels are added via integrate() and evicted via evict_hashes() (called
+    by the freespace checker when the camera sees background at a voxel).
+    There is no age-based eviction: voxels outside the camera FOV persist
+    indefinitely. Memory is bounded by max_points.
+    """
+
+    def __init__(self, voxel_size=0.01, max_points=50000):
         self.voxel_size = voxel_size
-        self.max_age = max_age
         self.max_points = max_points
-        self.frame = 0
+        self._lock = threading.Lock()
         self._h = np.empty(0, dtype=np.int64)
         self._p = np.empty((0, 3), dtype=np.float32)
         self._c = np.empty(0, dtype=np.int32)
-        self._s = np.empty(0, dtype=np.int32)
 
     def integrate(self, points_world):
         if points_world is None or len(points_world) == 0:
             return
-        self.frame += 1
         h = _to_hashes(points_world, self.voxel_size)
         h, p = _dedup(h, points_world.astype(np.float32))
-        self._h, self._p, self._c, self._s = _merge(
-            self._h, self._p, self._c, self._s, h, p, self.frame, self.max_points
-        )
-        if self.frame % 50 == 0:
-            self._prune()
+        with self._lock:
+            self._h, self._p, self._c = _merge(
+                self._h, self._p, self._c, h, p, self.max_points)
 
     def exclude_near(self, center, radius):
-        """
-        Remove stored points within 'radius' of 'center'.
-        Call BEFORE integrate() to strip target leakage.
-        """
-        if len(self._p) == 0 or center is None:
+        """Remove stored points within 'radius' of 'center'."""
+        if center is None:
             return
-        dists = np.linalg.norm(self._p - center, axis=1)
-        keep = dists > radius
-        if keep.all():
-            return
-        self._h = self._h[keep]
-        self._p = self._p[keep]
-        self._c = self._c[keep]
-        self._s = self._s[keep]
-
-    def _prune(self):
-        if len(self._s) == 0:
-            return
-        keep = self._s >= (self.frame - self.max_age)
-        if keep.all():
-            return
-        self._h = self._h[keep]
-        self._p = self._p[keep]
-        self._c = self._c[keep]
-        self._s = self._s[keep]
+        with self._lock:
+            if len(self._p) == 0:
+                return
+            dists = np.linalg.norm(self._p - center, axis=1)
+            keep = dists > radius
+            if keep.all():
+                return
+            self._h = self._h[keep]
+            self._p = self._p[keep]
+            self._c = self._c[keep]
 
     def get_points(self, min_confidence=1):
-        if len(self._p) == 0:
-            return None
-        if min_confidence <= 1:
-            return self._p.copy()
-        mask = self._c >= min_confidence
-        return self._p[mask].copy() if mask.any() else None
+        with self._lock:
+            if len(self._p) == 0:
+                return None
+            if min_confidence <= 1:
+                return self._p.copy()
+            mask = self._c >= min_confidence
+            return self._p[mask].copy() if mask.any() else None
+
+    def get_points_and_hashes(self, min_confidence=1):
+        """Return (points [N,3], hashes [N]) for voxels meeting min_confidence."""
+        with self._lock:
+            if len(self._p) == 0:
+                return None, None
+            mask = (self._c >= min_confidence) if min_confidence > 1 else slice(None)
+            p = self._p[mask]
+            h = self._h[mask]
+            if len(p) == 0:
+                return None, None
+            return p.copy(), h.copy()
+
+    def evict_hashes(self, hash_array):
+        """Remove voxels whose hash is in hash_array (sorted int64 numpy array)."""
+        if len(hash_array) == 0:
+            return
+        with self._lock:
+            if len(self._h) == 0:
+                return
+            ins   = np.searchsorted(self._h, hash_array)
+            ins_c = np.clip(ins, 0, len(self._h) - 1)
+            found = self._h[ins_c] == hash_array
+            if not found.any():
+                return
+            keep = np.ones(len(self._h), dtype=bool)
+            keep[ins_c[found]] = False
+            self._h = self._h[keep]
+            self._p = self._p[keep]
+            self._c = self._c[keep]
 
     def count(self):
-        return len(self._p)
+        with self._lock:
+            return len(self._p)
 
     def clear(self):
-        self._h = np.empty(0, dtype=np.int64)
-        self._p = np.empty((0, 3), dtype=np.float32)
-        self._c = np.empty(0, dtype=np.int32)
-        self._s = np.empty(0, dtype=np.int32)
-        self.frame = 0
+        with self._lock:
+            self._h = np.empty(0, dtype=np.int64)
+            self._p = np.empty((0, 3), dtype=np.float32)
+            self._c = np.empty(0, dtype=np.int32)
 
 
 # =====================================================================

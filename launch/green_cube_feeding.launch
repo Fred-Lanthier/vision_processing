@@ -1,0 +1,107 @@
+<launch>
+  <!-- 0. Start Gazebo Simulation Environment.
+       This version starts only the stable JointTrajectory controller path.
+       It intentionally does not start MoveIt or joint_group_position_controller. -->
+  <include file="$(find vision_processing)/launch/feeding_simulation_position_controller.launch" />
+
+  <!-- 1. General Parameters -->
+  <arg name="target_prompt" default="green cube" />
+  <arg name="venv_python" default="/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3" />
+  <arg name="rgb_topic" default="/camera_wrist/color/image_raw" />
+  <arg name="depth_topic" default="/camera_wrist/aligned_depth_to_color/image_raw" />
+  <arg name="info_topic" default="/camera_wrist/color/camera_info" />
+  <arg name="bridge_rate_hz" default="20.0" />
+  <arg name="bridge_horizon_points" default="3" />
+  <arg name="bridge_point_dt" default="0.05" />
+  <arg name="bridge_lead_time" default="0.06" />
+
+  <!-- 2. Dual SAM3+SAM2 Detector -->
+  <node name="sam3_sam2" pkg="vision_processing" type="sam3_sam2_node.py" output="screen" cwd="node">
+    <param name="target_prompt" value="$(arg target_prompt)" />
+    <param name="publish_all_as_obstacles" value="true" />
+    <param name="target_frame" value="world" />
+    <param name="rgb_topic" value="$(arg rgb_topic)" />
+    <param name="depth_topic" value="$(arg depth_topic)" />
+    <param name="info_topic" value="$(arg info_topic)" />
+  </node>
+
+  <!-- 3. Project 2D mask + depth into target/obstacle point clouds. -->
+  <node name="point_cloud_projector" pkg="vision_processing" type="point_cloud_projector_node.py" output="screen" cwd="node">
+    <param name="target_frame" value="world" />
+    <param name="camera_frame" value="camera_wrist_optical_frame" />
+    <param name="depth_topic" value="$(arg depth_topic)" />
+    <param name="mask_topic" value="/vision/sam2_tracked_mask" />
+    <param name="info_topic" value="$(arg info_topic)" />
+    <param name="max_points" value="5000" />
+    <param name="max_target_points" value="2000" />
+    <param name="obstacle_sample_multiplier" value="3.0" />
+    <param name="tf_timeout" value="0.01" />
+    <param name="run_3d_fork_filter_backup" value="false" />
+  </node>
+
+  <!-- 4. Perception Processing -->
+  <node name="perception_processor" pkg="vision_processing" type="perception_processing_node.py" output="screen" cwd="node" />
+
+  <node name="persistent_cloud" pkg="vision_processing" type="persistent_cloud_node.py" output="screen" cwd="node">
+    <param name="depth_topic" value="$(arg depth_topic)" />
+    <param name="info_topic" value="$(arg info_topic)" />
+    <param name="voxel_size" value="0.005" />
+    <param name="commit_threshold" value="2" />
+    <param name="max_voxels" value="50000" />
+  </node>
+
+  <!-- 5. Condition Merger -->
+  <node name="condition_merger" pkg="vision_processing" type="condition_pcd_from_perception.py" output="screen">
+    <param name="num_points" value="256" />
+  </node>
+
+  <!-- 6. Safe Generative Planner (8Hz) -->
+  <node name="safe_generative_planner" pkg="vision_processing" type="safe_generative_node.py" output="screen" cwd="node">
+    <param name="model_name" value="last_fm_model_27D_dynamics_1024.ckpt" />
+    <param name="obstacle_pre_sample_max" value="2000" />
+    <param name="planner_cbf_max_obstacles" value="256" />
+    <param name="check_finite_debug" value="false" />
+    <param name="n_steps" value="20" />
+    <param name="ode_method" value="euler" />
+    <param name="cbf_start_t" value="0.6" />
+    <param name="cbf_gain" value="0.5" />
+  </node>
+
+  <!-- 7. Convert planner JointTrajectory into nominal joint commands. -->
+  <node name="trajectory_executor" pkg="vision_processing" type="trajectory_executor.py" output="screen">
+    <param name="rate_hz" value="50.0" />
+    <param name="out_topic" value="/planner/nominal_joint_command" />
+    <param name="hold_current_until_trajectory" value="true" />
+  </node>
+
+  <!-- 8. CBF filters nominal commands, but does not command the controller directly. -->
+  <node name="cbf_safety_Bernstein" pkg="vision_processing" type="cbf_safety_node_Bernstein.py" output="screen" cwd="node">
+    <param name="enable_cbf" value="true" />
+    <param name="publish_controller_command" value="false" />
+    <param name="cbf_kappa" value="2.0" />
+    <param name="barrier_alpha" value="0.001" />
+    <param name="d_safe" value="0.005" />
+    <param name="obs_topic" value="/perception/persistent_obstacles" />
+    <param name="preprocess_rate_hz" value="30.0" />
+    <param name="viz_rate_hz" value="5.0" />
+    <param name="publish_debug_topics" value="false" />
+    <param name="publish_viz_topics" value="true" />
+    <param name="profile_sync" value="false" />
+  </node>
+
+  <!-- 9. Bridge safe joint commands into short JointTrajectory chunks. -->
+  <node name="trajectory_controller_bridge" pkg="vision_processing" type="trajectory_controller_bridge.py" output="screen">
+    <param name="rate_hz" value="$(arg bridge_rate_hz)" />
+    <param name="in_topic" value="/planner/safe_joint_command" />
+    <param name="out_topic" value="/position_joint_trajectory_controller/command" />
+    <param name="horizon_points" value="$(arg bridge_horizon_points)" />
+    <param name="point_dt" value="$(arg bridge_point_dt)" />
+    <param name="lead_time" value="$(arg bridge_lead_time)" />
+    <param name="hold_current_until_command" value="true" />
+    <param name="hold_when_stale" value="true" />
+    <param name="hold_duration" value="0.25" />
+  </node>
+
+  <!-- 10. RViz Visualization -->
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find vision_processing)/config/cbf_config.rviz" />
+</launch>

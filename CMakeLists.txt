@@ -126,6 +126,22 @@ catkin_install_python(PROGRAMS
   scripts/vision_server_robot_segmentation.py
   scripts/trajectory_node.py
   scripts/inference_node.py
+  scripts/casf_generative_node_PC.py
+  scripts/safe_generative_node.py
+  scripts/condition_pcd_from_perception.py
+  scripts/point_cloud_projector_node.py
+  scripts/persistent_cloud_node.py
+  scripts/nominal_fork_pose_follower.py
+  scripts/nominal_trajectory_follower.py
+  scripts/perception_processing_node.py
+  scripts/trajectory_executor.py
+  scripts/trajectory_controller_bridge.py
+  scripts/circle_trajectory_publisher.py
+  scripts/face_detection_mock.py
+  scripts/fake_finger_publisher.py
+  scripts/sam3_server.py
+  test_novelty/cbf_safety_node_Bernstein.py
+  test_novelty/sam3_sam2_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

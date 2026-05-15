@@ -8,6 +8,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/pybind11.h>
 #include <vector>
+#include <cmath>
 
 namespace py = pybind11;
 
@@ -42,6 +43,18 @@ public:
     int get_nq() const { return model.nq; }
     int get_nv() const { return model.nv; }
 
+    Eigen::Matrix3d projectToSO3(const Eigen::Matrix3d& R_in) const {
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(R_in, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d U = svd.matrixU();
+        Eigen::Matrix3d V = svd.matrixV();
+        Eigen::Matrix3d R = U * V.transpose();
+        if (R.determinant() < 0.0) {
+            U.col(2) *= -1.0;
+            R = U * V.transpose();
+        }
+        return R;
+    }
+
     // Résolution IK pour une seule pose (Damped Least Squares)
     Eigen::VectorXd solve_single_ik(const Eigen::Matrix4d& target_pose_mat, const Eigen::VectorXd& q_start) {
         Eigen::VectorXd q = q_start;
@@ -49,7 +62,17 @@ public:
         const int IT_MAX = 50;   // Max itérations
         const double damp = 1e-6; // Facteur de damping (DLS)
 
-        pinocchio::SE3 oMdes(target_pose_mat);
+        if (!target_pose_mat.allFinite() || !q_start.allFinite()) {
+            return q_start;
+        }
+
+        Eigen::Matrix4d target_clean = target_pose_mat;
+        target_clean.block<3,3>(0,0) = projectToSO3(target_clean.block<3,3>(0,0));
+        if (!target_clean.allFinite()) {
+            return q_start;
+        }
+
+        pinocchio::SE3 oMdes(target_clean);
 
         for (int i=0; i<IT_MAX; i++) {
             // 1. Cinématique directe et placement des frames
@@ -58,7 +81,21 @@ public:
             
             // 2. Erreur SE(3) (actuelle - cible)
             const pinocchio::SE3 dMi = oMdes.actInv(data.oMf[ee_frame_id]);
-            pinocchio::Motion err = pinocchio::log6(dMi);
+            
+            // --- GUARD: Protection contre rotation dégénérée (NaN dans log6) ---
+            Eigen::Matrix3d R_check = dMi.rotation();
+            double det = R_check.determinant();
+            double tr = R_check.trace();
+            if (!std::isfinite(det) || std::abs(det - 1.0) > 0.1 || tr < -1.0 || tr > 3.0) {
+                break; // Retourner q courant au lieu de crasher
+            }
+            
+            pinocchio::Motion err;
+            try {
+                err = pinocchio::log6(dMi);
+            } catch (...) {
+                break;
+            }
             
             auto err_vec = err.toVector(); // Stack allocation 6x1
             if(err_vec.norm() < eps) {

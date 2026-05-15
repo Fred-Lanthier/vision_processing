@@ -1,0 +1,56 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="start_delay" default="0.25" />
+  <arg name="monitor_hz" default="1.0" />
+  <arg name="log_ik_each_waypoint" default="true" />
+  <arg name="smooth_velocities" default="true" />
+  <arg name="publish_waypoint_markers" default="true" />
+  <arg name="launch_rviz" default="true" />
+  <arg name="execution_mode" default="stream" />
+  <arg name="stream_segment_duration" default="0.3333333333" />
+  <arg name="stream_horizon_points" default="4" />
+  <arg name="stream_command_lead_time" default="0.08" />
+
+  <!-- Franka Gazebo simulation with position JointTrajectoryController.
+       The circle_trajectory_publisher generates a circular set of Cartesian
+       waypoints, solves IK for each, and sends the resulting JointTrajectory
+       directly to the controller. No custom follower node needed. -->
+
+  <include file="$(find franka_gazebo)/launch/panda.launch">
+    <!-- Start the position trajectory controller instead of an example controller -->
+    <arg name="controller"  value="position_joint_trajectory_controller" />
+    <arg name="use_gripper" value="false" />
+    <!-- Start at the same home position used throughout the pipeline -->
+    <arg name="initial_joint_positions"
+         value="-J panda_joint1 -0.000059
+                -J panda_joint2 -0.125928
+                -J panda_joint3  0.000117
+                -J panda_joint4 -2.193312
+                -J panda_joint5 -0.000251
+                -J panda_joint6  2.064780
+                -J panda_joint7  0.785511" />
+  </include>
+
+  <!-- Generate a circle of Cartesian waypoints and publish as JointTrajectory -->
+  <node name="circle_trajectory_publisher"
+        pkg="vision_processing"
+        type="circle_trajectory_publisher.py"
+        output="screen">
+    <param name="start_delay" value="$(arg start_delay)" />
+    <param name="monitor_hz" value="$(arg monitor_hz)" />
+    <param name="log_ik_each_waypoint" value="$(arg log_ik_each_waypoint)" />
+    <param name="smooth_velocities" value="$(arg smooth_velocities)" />
+    <param name="publish_waypoint_markers" value="$(arg publish_waypoint_markers)" />
+    <param name="execution_mode" value="$(arg execution_mode)" />
+    <param name="stream_segment_duration" value="$(arg stream_segment_duration)" />
+    <param name="stream_horizon_points" value="$(arg stream_horizon_points)" />
+    <param name="stream_command_lead_time" value="$(arg stream_command_lead_time)" />
+  </node>
+
+  <node if="$(arg launch_rviz)"
+        name="rviz"
+        pkg="rviz"
+        type="rviz"
+        args="-d $(find vision_processing)/config/circle_trajectory.rviz"
+        output="screen" />
+</launch>

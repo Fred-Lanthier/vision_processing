@@ -21,10 +21,21 @@
         <param name="info_topic" value="/camera_wrist/color/camera_info" />
   </node>
 
+  <!-- Perception Processing Node (30Hz) -->
+  <!-- Heavy filtering: CropBox, Robot-Self Filtering, ROR -->
+  <node name="perception_processor" pkg="vision_processing" type="perception_processing_node.py" output="screen" cwd="node" />
+
   <!-- 4. Safe Generative Planner (8Hz) -->
   <!-- Generates nominal 9D Flow Matching trajectories conditioned on point clouds -->
   <node name="safe_generative_planner" pkg="vision_processing" type="safe_generative_node.py" output="screen" cwd="node">
         <param name="model_name" value="best_fm_model_high_dim_CFM_relative_dropout.ckpt" />
+        <param name="obstacle_pre_sample_max" value="2000" />
+        <param name="planner_cbf_max_obstacles" value="256" />
+        <param name="check_finite_debug" value="false" />
+        <param name="n_steps" value="20" />
+        <param name="ode_method" value="euler" />
+        <param name="cbf_start_t" value="0.6" />
+        <param name="cbf_gain" value="0.5" />
   </node>
 
   <!-- 5. Bernstein-Basis CBF Safety Shield (150Hz) -->

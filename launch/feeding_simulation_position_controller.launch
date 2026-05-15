@@ -1,0 +1,110 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="arm_id" default="panda"/>
+  <arg name="paused" default="false"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find vision_processing)/worlds/feeding.world"/>
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="gui" value="true"/>
+    <arg name="use_sim_time" value="true"/>
+  </include>
+
+  <param name="person_description"
+         textfile="$(find vision_processing)/urdf/person_seated.urdf"/>
+
+  <node name="spawn_person" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -model person -param person_description
+              -x 0.3 -y 0.70 -z 0.0
+              -R 0 -P 0 -Y -1.5708"/>
+
+  <node name="person_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher">
+    <remap from="robot_description" to="person_description"/>
+    <param name="tf_prefix" value="person"/>
+  </node>
+
+  <!--
+  <node name="mock_face_detection" pkg="vision_processing" type="face_detection_mock.py"
+        output="screen">
+    <param name="mouth_frame" value="person/mouth_link"/>
+    <param name="rate" value="10"/>
+  </node>
+  -->
+
+  <param name="table_description"
+         textfile="$(find vision_processing)/urdf/table.urdf"/>
+
+  <node name="spawn_table" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -model table -param table_description
+              -x 0.3 -y 0.0 -z 0.0"/>
+
+  <param name="container_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/container.xacro"/>
+
+  <node name="spawn_container" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -param container_description -model container
+              -x 0.43 -y 0.0 -z 0.76"/>
+
+  <param name="food_description"
+         textfile="$(find vision_processing)/urdf/food.urdf"/>
+
+  <node name="spawn_food" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -param food_description -model food_cube
+              -x 0.5 -y 0.0 -z 0.775"/>
+
+  <param name="robot_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro arm_id:=$(arg arm_id)"/>
+
+  <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+        args="-param robot_description
+              -urdf
+              -model panda
+              -z 0.75
+              -J panda_joint1 -0.000059
+              -J panda_joint2 -0.125928
+              -J panda_joint3  0.000117
+              -J panda_joint4 -2.193312
+              -J panda_joint5 -0.000251
+              -J panda_joint6  2.064780
+              -J panda_joint7  0.785511
+              -J panda_finger_joint1 0.001
+              -J panda_finger_joint2 0.001"/>
+
+  <node name="fake_finger_publisher" pkg="vision_processing" type="fake_finger_publisher.py" output="screen">
+    <remap from="/joint_states" to="/fake_finger_joint_states"/>
+  </node>
+
+  <rosparam file="$(find franka_gazebo)/config/franka_hw_sim.yaml" command="load" subst_value="true"/>
+  <rosparam file="$(find franka_gazebo)/config/sim_controllers.yaml" command="load" subst_value="true"/>
+
+  <node name="controller_spawner" pkg="controller_manager" type="spawner"
+        respawn="false" output="screen"
+        args="franka_state_controller position_joint_trajectory_controller"/>
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"
+        respawn="true" output="screen"/>
+
+  <node name="joint_state_publisher" type="joint_state_publisher" pkg="joint_state_publisher">
+    <rosparam param="source_list">[franka_state_controller/joint_states, /fake_finger_joint_states]</rosparam>
+    <param name="rate" value="30"/>
+  </node>
+
+  <node name="franka_state_camera_reader"
+        pkg="vision_processing" type="franka_state_camera_reader"
+        respawn="true" output="screen"/>
+
+  <node name="publish_homing_hold"
+        pkg="vision_processing" type="publish_homing_hold.py"
+        output="screen">
+    <param name="controller_name" value="position_joint_trajectory_controller"/>
+    <param name="command_topic" value="/position_joint_trajectory_controller/command"/>
+    <rosparam param="homing_position">[-0.000059, -0.125928, 0.000117, -2.193312, -0.000251, 2.064780, 0.785511]</rosparam>
+    <param name="lead_time" value="0.10"/>
+    <param name="hold_duration" value="2.0"/>
+    <param name="publish_repeats" value="20"/>
+    <param name="publish_period" value="0.05"/>
+  </node>
+
+  <node name="sam3_server" pkg="vision_processing" type="sam3_server.py"
+        respawn="true" output="screen"/>
+</launch>

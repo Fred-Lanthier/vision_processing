@@ -41,7 +41,9 @@ class CBFSafetyNode:
         model = torch.load(model_path, map_location=self.device, weights_only=False)
         self.rdf_core = RDFCore(8, -1.0, 1.0, self.robot_layer, self.device, model)
         
-        rdf_barrier = RDF_Barrier(self.rdf_core, d_safe=0.10)
+        self.d_safe = float(rospy.get_param("~d_safe", 0.005))
+        self.robot_filter_distance = self.d_safe / 2.0
+        rdf_barrier = RDF_Barrier(self.rdf_core, d_safe=self.d_safe)
         self.cbf = RDF_CBF(rdf_barrier, self.robot_layer, gamma=10.0)
         
         # Graphe CUDA à 100 points (Taille fixe)
@@ -156,7 +158,7 @@ class CBFSafetyNode:
                 if pts_inside.shape[0] > 0:
                     # 2. Iso-surface Filtering
                     sdf_vals = self.rdf_core.get_whole_body_sdf_batch(pts_inside, base, self.current_q)
-                    mask_not_robot = sdf_vals[0] > 0.03 
+                    mask_not_robot = sdf_vals[0] > self.robot_filter_distance
                     pts_inside = pts_inside[mask_not_robot]
                 
                 if pts_inside.shape[0] > 0:

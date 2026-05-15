@@ -1,0 +1,149 @@
+<launch>
+  <!-- 0. Start Gazebo Simulation Environment -->
+  <include file="$(find vision_processing)/launch/feeding_simulation_position_controller.launch" />
+
+  <!-- 1. General Parameters -->
+  <arg name="target_prompt" default="green cube" />
+  <arg name="venv_python" default="/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3" />
+  
+  <!-- 2. SAM3 Server is already included in feeding_simulation_position_controller.launch -->
+  
+  <arg name="rgb_topic" default="/camera_wrist/color/image_raw" />
+  <arg name="depth_topic" default="/camera_wrist/aligned_depth_to_color/image_raw" />
+  <arg name="info_topic" default="/camera_wrist/color/camera_info" />
+  <arg name="launch_rviz" default="true" />
+
+  <!-- 3. Dual SAM3+SAM2 Detector -->
+  <!-- Tracks the target and publishes a 2D mask -->
+  <node name="sam3_sam2" pkg="vision_processing" type="sam3_sam2_node.py" output="screen" cwd="node">
+        <param name="target_prompt" value="$(arg target_prompt)" />
+        <param name="publish_all_as_obstacles" value="true" />
+        <param name="tracking_rate_hz" value="5.0" />
+        <param name="sam2_max_side_length" value="512" />
+        <param name="target_frame" value="world" />
+        <param name="rgb_topic" value="$(arg rgb_topic)" />
+        <param name="depth_topic" value="$(arg depth_topic)" />
+        <param name="info_topic" value="$(arg info_topic)" />
+  </node>
+
+  <!-- 3.5. 3D Point Cloud Projector -->
+  <!-- Converts the 2D mask + Depth into 3D Target and Obstacle point clouds -->
+  <node name="point_cloud_projector" pkg="vision_processing" type="point_cloud_projector_node.py" output="screen" cwd="node">
+        <param name="target_frame" value="world" />
+        <param name="camera_frame" value="camera_wrist_optical_frame" />
+        <param name="depth_topic" value="$(arg depth_topic)" />
+        <param name="mask_topic" value="/vision/sam2_tracked_mask" />
+        <param name="info_topic" value="$(arg info_topic)" />
+        <param name="max_points" value="5000" />
+        <param name="max_target_points" value="2000" />
+        <param name="obstacle_sample_multiplier" value="3.0" />
+        <param name="tf_timeout" value="0.01" />
+        <param name="run_3d_fork_filter_backup" value="false" />
+        <param name="enable_fork_sam3_mask" value="true" />
+        <param name="fork_sam3_prompt" value="4 fork tips" />
+        <param name="fork_mask_dilation_px" value="3" />
+  </node>
+
+  <!-- 4. Perception Processing (CropBox + ROR) -->
+  <node name="perception_processor" pkg="vision_processing" type="perception_processing_node.py" output="screen" cwd="node" />
+
+  <!-- 4.5. Persistent Obstacle Map -->
+  <!-- Sparse WorldCloud + GPU per-voxel freespace eviction.
+       Voxels outside FOV persist indefinitely (no age-based eviction).
+       Voxels inside FOV where camera sees background are evicted immediately.
+       Tuning guide:
+         voxel_size       — obstacle resolution (5 mm for fork-tip accuracy)
+         commit_threshold — obs frames before a voxel is published (2 = fast, 3 = robust)
+         free_margin      — depth band (m); camera must see this far beyond voxel to evict
+                            (default 2×voxel_size = 10 mm)
+         robot_body_radius — filter radius around each body link to remove self-projections -->
+  <node name="persistent_cloud" pkg="vision_processing" type="persistent_cloud_node.py" output="screen" cwd="node">
+        <param name="depth_topic"       value="$(arg depth_topic)" />
+        <param name="info_topic"        value="$(arg info_topic)" />
+        <param name="voxel_size"        value="0.005" />
+        <param name="commit_threshold"  value="2" />
+        <param name="max_voxels"        value="50000" />
+  </node>
+
+  <!-- 5. Condition Merger (Target + Fork Mesh) -->
+  <!-- Creates the conditioned point cloud for the Flow Matching model -->
+  <node name="condition_merger" pkg="vision_processing" type="condition_pcd_from_perception.py" output="screen">
+        <param name="num_points" value="256" />
+        <param name="target_timeout" value="5.0" />
+  </node>
+
+  <!-- 6. CASF Generative Planner (3Hz) -->
+  <!-- Generates nominal trajectories using Riemannian Metric Warping -->
+  <node name="safe_generative_planner" pkg="vision_processing" type="casf_generative_node_PC.py" output="screen" cwd="node">
+        <param name="model_name" value="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
+        <!-- Woodbury metric warp gains -->
+        <param name="casf_kappa" value="50.0" />
+        <param name="casf_alpha" value="10.0" />
+        <!-- CASF integration: n_pred controls pure FM trajectory smoothness;
+             n_corr controls safety correction strength and cost. -->
+        <param name="n_pred"     value="20" />
+        <param name="n_corr"     value="5" />
+        <param name="alpha_corr" value="2.0" />
+        <param name="merged_cloud_contains_fork" value="true" />
+        <param name="obstacle_pre_sample_max" value="2000" />
+        <param name="planner_cbf_max_obstacles" value="256" />
+        <param name="casf_spatial_max_obstacles" value="100" />
+        <param name="check_finite_debug" value="false" />
+        <param name="single_shot" value="false" />
+        <param name="tcp_frame" value="panda_TCP" />
+  </node>
+
+  <!-- 7. Trajectory Executor (150Hz) -->
+  <!-- Interpolates the CASF JointTrajectory at 150 Hz and feeds the CBF. -->
+  <node name="trajectory_executor" pkg="vision_processing" type="trajectory_executor.py" output="screen">
+        <param name="rate_hz"   value="150.0" />
+        <param name="out_topic" value="/planner/nominal_joint_command" />
+        <param name="hold_current_until_trajectory" value="true" />
+  </node>
+
+  <!-- 8. Bernstein-Basis CBF Safety Shield.
+       The CBF intercepts the nominal command and publishes /planner/safe_joint_command.
+       The trajectory_controller_bridge is the only node that commands Gazebo.
+       Tuning guide:
+         cbf_kappa    — class-K gain: lower = softer correction (try 1.0–3.0, was 10.0)
+         barrier_alpha — softmin temperature: higher = smoother gradient direction (try 0.003–0.007)
+         d_safe        — minimum clearance enforced by the QP (metres) -->
+  <node name="cbf_safety_Bernstein" pkg="vision_processing" type="cbf_safety_node_Bernstein.py" output="screen" cwd="node">
+        <param name="enable_cbf"               value="true" />
+        <param name="publish_controller_command" value="false" />
+        <param name="cbf_kappa"    value="2.0" />
+        <param name="barrier_alpha" value="0.001" />
+        <param name="d_safe"       value="0.005" />
+        <!-- persistent_obstacles is built from cleaned_obstacles (food already excluded by SAM2)
+             so the food cube never blocks approach, while outside-FOV obstacles persist. -->
+        <param name="obs_topic"    value="/perception/persistent_obstacles" />
+        <param name="preprocess_rate_hz" value="30.0" />
+        <param name="viz_rate_hz" value="5.0" />
+        <param name="publish_debug_topics" value="false" />
+        <param name="publish_viz_topics" value="$(arg launch_rviz)" />
+        <param name="profile_sync" value="false" />
+        <param name="cuda_memory_log_period" value="10.0" />
+        <param name="nominal_hold_deadband" value="0.0001" />
+  </node>
+
+  <!-- 9. Trajectory Controller Bridge -->
+  <!-- Converts the CBF safe Float64MultiArray commands (150 Hz) into rolling
+       JointTrajectory horizon chunks for position_joint_trajectory_controller.
+       Tune horizon_points * point_dt to control lookahead. Short horizons reduce lag. -->
+  <node name="trajectory_controller_bridge" pkg="vision_processing" type="trajectory_controller_bridge.py" output="screen">
+        <param name="rate_hz"        value="20.0" />
+        <param name="in_topic"       value="/planner/safe_joint_command" />
+        <param name="out_topic"      value="/position_joint_trajectory_controller/command" />
+        <param name="horizon_points" value="3" />
+        <param name="point_dt"       value="0.05" />
+        <param name="lead_time"      value="0.06" />
+        <param name="hold_current_until_command" value="true" />
+        <param name="hold_when_stale" value="true" />
+        <param name="hold_duration"   value="0.25" />
+  </node>
+
+  <!-- 10. RViz Visualization -->
+  <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find vision_processing)/config/cbf_config.rviz"
+        if="$(arg launch_rviz)" />
+</launch>
