@@ -5,6 +5,58 @@
   <!-- 1. General Parameters -->
   <arg name="target_prompt" default="green cube" />
   <arg name="venv_python" default="/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3" />
+  <arg name="casf_model_name" default="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
+  <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
+  <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
+  <arg name="planner_rate_hz" default="3.0" />
+  <arg name="trajectory_waypoint_rate_hz" default="10.0" />
+  <arg name="control_rate_hz" default="75.0" />
+  <arg name="cbf_preprocess_rate_hz" default="30.0" />
+  <arg name="viz_rate_hz" default="5.0" />
+  <arg name="bridge_rate_hz" default="20.0" />
+  <arg name="bridge_horizon_points" default="3" />
+  <arg name="bridge_point_dt" default="0.05" />
+  <arg name="bridge_lead_time" default="0.06" />
+  <arg name="cbf_graph_points" default="10" />
+  <arg name="cbf_preprocess_max_points" default="512" />
+  <arg name="cbf_selection_metric" default="fork_mesh" />
+  <arg name="cbf_fork_mesh_selection_points" default="512" />
+  <arg name="cbf_publish_yellow_points" default="false" />
+  <arg name="cbf_selected_obstacle_hold_time" default="0.5" />
+  <arg name="obstacle_pre_sample_max" default="2000" />
+  <arg name="planner_cbf_max_obstacles" default="256" />
+  <arg name="casf_spatial_max_obstacles" default="100" />
+  <arg name="casf_barrier_memory_fraction" default="0.75" />
+  <arg name="casf_barrier_min_obstacles" default="8" />
+  <arg name="casf_kappa" default="50.0" />
+  <arg name="casf_alpha" default="10.0" />
+  <arg name="n_pred" default="10" />
+  <arg name="n_corr" default="5" />
+  <arg name="alpha_corr" default="2.0" />
+  <arg name="commit_distance" default="0.035" />
+  <arg name="cbf_kappa" default="2.0" />
+  <arg name="barrier_alpha" default="0.001" />
+  <arg name="d_safe" default="0.005" />
+  <arg name="sam_tracking_rate_hz" default="5.0" />
+  <arg name="sam2_max_side_length" default="512" />
+  <arg name="projector_max_points" default="5000" />
+  <arg name="projector_max_target_points" default="2000" />
+  <arg name="obstacle_sample_multiplier" default="3.0" />
+  <arg name="projector_tf_timeout" default="0.01" />
+  <arg name="fork_sam3_prompt" default="4 fork tips" />
+  <arg name="fork_mask_dilation_px" default="3" />
+  <arg name="persistent_voxel_size" default="0.005" />
+  <arg name="persistent_commit_threshold" default="2" />
+  <arg name="persistent_max_voxels" default="50000" />
+  <arg name="condition_num_points" default="256" />
+  <arg name="condition_target_timeout" default="5.0" />
+  <arg name="max_joint_velocity" default="0.7" />
+  <arg name="tcp_filter_radius" default="0.40" />
+  <arg name="fork_filter_radius" default="0.15" />
+  <arg name="cuda_memory_log_period" default="10.0" />
+  <arg name="nominal_hold_deadband" default="0.0001" />
+  <arg name="bridge_command_timeout" default="0.5" />
+  <arg name="bridge_hold_duration" default="0.25" />
   
   <!-- 2. SAM3 Server is already included in feeding_simulation_position_controller.launch -->
   
@@ -16,10 +68,11 @@
   <!-- 3. Dual SAM3+SAM2 Detector -->
   <!-- Tracks the target and publishes a 2D mask -->
   <node name="sam3_sam2" pkg="vision_processing" type="sam3_sam2_node.py" output="screen" cwd="node">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
         <param name="target_prompt" value="$(arg target_prompt)" />
         <param name="publish_all_as_obstacles" value="true" />
-        <param name="tracking_rate_hz" value="5.0" />
-        <param name="sam2_max_side_length" value="512" />
+        <param name="tracking_rate_hz" value="$(arg sam_tracking_rate_hz)" />
+        <param name="sam2_max_side_length" value="$(arg sam2_max_side_length)" />
         <param name="target_frame" value="world" />
         <param name="rgb_topic" value="$(arg rgb_topic)" />
         <param name="depth_topic" value="$(arg depth_topic)" />
@@ -34,14 +87,14 @@
         <param name="depth_topic" value="$(arg depth_topic)" />
         <param name="mask_topic" value="/vision/sam2_tracked_mask" />
         <param name="info_topic" value="$(arg info_topic)" />
-        <param name="max_points" value="5000" />
-        <param name="max_target_points" value="2000" />
-        <param name="obstacle_sample_multiplier" value="3.0" />
-        <param name="tf_timeout" value="0.01" />
+        <param name="max_points" value="$(arg projector_max_points)" />
+        <param name="max_target_points" value="$(arg projector_max_target_points)" />
+        <param name="obstacle_sample_multiplier" value="$(arg obstacle_sample_multiplier)" />
+        <param name="tf_timeout" value="$(arg projector_tf_timeout)" />
         <param name="run_3d_fork_filter_backup" value="false" />
         <param name="enable_fork_sam3_mask" value="true" />
-        <param name="fork_sam3_prompt" value="4 fork tips" />
-        <param name="fork_mask_dilation_px" value="3" />
+        <param name="fork_sam3_prompt" value="$(arg fork_sam3_prompt)" />
+        <param name="fork_mask_dilation_px" value="$(arg fork_mask_dilation_px)" />
   </node>
 
   <!-- 4. Perception Processing (CropBox + ROR) -->
@@ -60,43 +113,51 @@
   <node name="persistent_cloud" pkg="vision_processing" type="persistent_cloud_node.py" output="screen" cwd="node">
         <param name="depth_topic"       value="$(arg depth_topic)" />
         <param name="info_topic"        value="$(arg info_topic)" />
-        <param name="voxel_size"        value="0.005" />
-        <param name="commit_threshold"  value="2" />
-        <param name="max_voxels"        value="50000" />
+        <param name="voxel_size"        value="$(arg persistent_voxel_size)" />
+        <param name="commit_threshold"  value="$(arg persistent_commit_threshold)" />
+        <param name="max_voxels"        value="$(arg persistent_max_voxels)" />
   </node>
 
   <!-- 5. Condition Merger (Target + Fork Mesh) -->
   <!-- Creates the conditioned point cloud for the Flow Matching model -->
   <node name="condition_merger" pkg="vision_processing" type="condition_pcd_from_perception.py" output="screen">
-        <param name="num_points" value="256" />
-        <param name="target_timeout" value="5.0" />
+        <param name="num_points" value="$(arg condition_num_points)" />
+        <param name="target_timeout" value="$(arg condition_target_timeout)" />
   </node>
 
-  <!-- 6. CASF Generative Planner (3Hz) -->
+  <!-- 6. CASF Generative Planner -->
   <!-- Generates nominal trajectories using Riemannian Metric Warping -->
   <node name="safe_generative_planner" pkg="vision_processing" type="casf_generative_node_PC.py" output="screen" cwd="node">
-        <param name="model_name" value="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
+        <param name="model_name" value="$(arg casf_model_name)" />
         <!-- Woodbury metric warp gains -->
-        <param name="casf_kappa" value="50.0" />
-        <param name="casf_alpha" value="10.0" />
+        <param name="casf_kappa" value="$(arg casf_kappa)" />
+        <param name="casf_alpha" value="$(arg casf_alpha)" />
         <!-- CASF integration: n_pred controls pure FM trajectory smoothness;
              n_corr controls safety correction strength and cost. -->
-        <param name="n_pred"     value="20" />
-        <param name="n_corr"     value="5" />
-        <param name="alpha_corr" value="2.0" />
+        <param name="n_pred"     value="$(arg n_pred)" />
+        <param name="n_corr"     value="$(arg n_corr)" />
+        <param name="alpha_corr" value="$(arg alpha_corr)" />
+        <param name="barrier_alpha" value="$(arg barrier_alpha)" />
+        <param name="d_safe" value="$(arg d_safe)" />
+        <param name="planner_rate_hz" value="$(arg planner_rate_hz)" />
+        <param name="trajectory_waypoint_rate_hz" value="$(arg trajectory_waypoint_rate_hz)" />
+        <param name="commit_distance" value="$(arg commit_distance)" />
         <param name="merged_cloud_contains_fork" value="true" />
-        <param name="obstacle_pre_sample_max" value="2000" />
-        <param name="planner_cbf_max_obstacles" value="256" />
-        <param name="casf_spatial_max_obstacles" value="100" />
+        <param name="obstacle_pre_sample_max" value="$(arg obstacle_pre_sample_max)" />
+        <param name="planner_cbf_max_obstacles" value="$(arg planner_cbf_max_obstacles)" />
+        <param name="casf_spatial_max_obstacles" value="$(arg casf_spatial_max_obstacles)" />
+        <param name="casf_barrier_memory_fraction" value="$(arg casf_barrier_memory_fraction)" />
+        <param name="casf_barrier_min_obstacles" value="$(arg casf_barrier_min_obstacles)" />
         <param name="check_finite_debug" value="false" />
         <param name="single_shot" value="false" />
         <param name="tcp_frame" value="panda_TCP" />
   </node>
 
-  <!-- 7. Trajectory Executor (150Hz) -->
-  <!-- Interpolates the CASF JointTrajectory at 150 Hz and feeds the CBF. -->
+  <!-- 7. Trajectory Executor -->
+  <!-- Interpolates the CASF JointTrajectory at the control rate and feeds the CBF. -->
   <node name="trajectory_executor" pkg="vision_processing" type="trajectory_executor.py" output="screen">
-        <param name="rate_hz"   value="150.0" />
+        <param name="rate_hz"   value="$(arg control_rate_hz)" />
         <param name="out_topic" value="/planner/nominal_joint_command" />
         <param name="hold_current_until_trajectory" value="true" />
   </node>
@@ -109,37 +170,49 @@
          barrier_alpha — softmin temperature: higher = smoother gradient direction (try 0.003–0.007)
          d_safe        — minimum clearance enforced by the QP (metres) -->
   <node name="cbf_safety_Bernstein" pkg="vision_processing" type="cbf_safety_node_Bernstein.py" output="screen" cwd="node">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
         <param name="enable_cbf"               value="true" />
         <param name="publish_controller_command" value="false" />
-        <param name="cbf_kappa"    value="2.0" />
-        <param name="barrier_alpha" value="0.001" />
-        <param name="d_safe"       value="0.005" />
+        <param name="rate_hz"      value="$(arg control_rate_hz)" />
+        <param name="cbf_graph_points" value="$(arg cbf_graph_points)" />
+        <param name="preprocess_max_points" value="$(arg cbf_preprocess_max_points)" />
+        <param name="cbf_selection_metric" value="$(arg cbf_selection_metric)" />
+        <param name="fork_mesh_selection_points" value="$(arg cbf_fork_mesh_selection_points)" />
+        <param name="publish_yellow_points" value="$(arg cbf_publish_yellow_points)" />
+        <param name="selected_obstacle_hold_time" value="$(arg cbf_selected_obstacle_hold_time)" />
+        <param name="cbf_kappa"    value="$(arg cbf_kappa)" />
+        <param name="barrier_alpha" value="$(arg barrier_alpha)" />
+        <param name="d_safe"       value="$(arg d_safe)" />
+        <param name="max_joint_velocity" value="$(arg max_joint_velocity)" />
+        <param name="tcp_filter_radius" value="$(arg tcp_filter_radius)" />
+        <param name="fork_filter_radius" value="$(arg fork_filter_radius)" />
         <!-- persistent_obstacles is built from cleaned_obstacles (food already excluded by SAM2)
              so the food cube never blocks approach, while outside-FOV obstacles persist. -->
         <param name="obs_topic"    value="/perception/persistent_obstacles" />
-        <param name="preprocess_rate_hz" value="30.0" />
-        <param name="viz_rate_hz" value="5.0" />
+        <param name="preprocess_rate_hz" value="$(arg cbf_preprocess_rate_hz)" />
+        <param name="viz_rate_hz" value="$(arg viz_rate_hz)" />
         <param name="publish_debug_topics" value="false" />
         <param name="publish_viz_topics" value="$(arg launch_rviz)" />
         <param name="profile_sync" value="false" />
-        <param name="cuda_memory_log_period" value="10.0" />
-        <param name="nominal_hold_deadband" value="0.0001" />
+        <param name="cuda_memory_log_period" value="$(arg cuda_memory_log_period)" />
+        <param name="nominal_hold_deadband" value="$(arg nominal_hold_deadband)" />
   </node>
 
   <!-- 9. Trajectory Controller Bridge -->
-  <!-- Converts the CBF safe Float64MultiArray commands (150 Hz) into rolling
+  <!-- Converts the CBF safe Float64MultiArray commands into rolling
        JointTrajectory horizon chunks for position_joint_trajectory_controller.
        Tune horizon_points * point_dt to control lookahead. Short horizons reduce lag. -->
   <node name="trajectory_controller_bridge" pkg="vision_processing" type="trajectory_controller_bridge.py" output="screen">
-        <param name="rate_hz"        value="20.0" />
+        <param name="rate_hz"        value="$(arg bridge_rate_hz)" />
         <param name="in_topic"       value="/planner/safe_joint_command" />
         <param name="out_topic"      value="/position_joint_trajectory_controller/command" />
-        <param name="horizon_points" value="3" />
-        <param name="point_dt"       value="0.05" />
-        <param name="lead_time"      value="0.06" />
+        <param name="horizon_points" value="$(arg bridge_horizon_points)" />
+        <param name="point_dt"       value="$(arg bridge_point_dt)" />
+        <param name="lead_time"      value="$(arg bridge_lead_time)" />
+        <param name="command_timeout" value="$(arg bridge_command_timeout)" />
         <param name="hold_current_until_command" value="true" />
         <param name="hold_when_stale" value="true" />
-        <param name="hold_duration"   value="0.25" />
+        <param name="hold_duration"   value="$(arg bridge_hold_duration)" />
   </node>
 
   <!-- 10. RViz Visualization -->

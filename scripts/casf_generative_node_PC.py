@@ -24,11 +24,13 @@ from scipy.interpolate import interp1d
 # TEMPORAL ENSEMBLER
 # ==============================================================
 class TemporalEnsembler:
-    def __init__(self, pred_horizon, buffer_size=3, weights='exponential'):
+    def __init__(self, pred_horizon, buffer_size=3, weights='exponential',
+                 waypoint_dt=0.1, decay=1.0):
         self.pred_horizon = pred_horizon
         self.buffer = collections.deque(maxlen=buffer_size)
         self.weights_type = weights
-        self.wp_dt = 0.1  # 1.6 seconds / 16 waypoints
+        self.wp_dt = float(waypoint_dt)
+        self.decay = float(decay)
     
     def add_prediction(self, prediction, current_time):
         self.buffer.append((current_time, prediction.copy()))
@@ -49,7 +51,7 @@ class TemporalEnsembler:
                 
                 if 0 <= pred_index < self.pred_horizon:
                     actions.append(prediction[pred_index])
-                    w = np.exp(-1.0 * age_sec) if self.weights_type == 'exponential' else 1.0
+                    w = np.exp(-self.decay * age_sec) if self.weights_type == 'exponential' else 1.0
                     weights.append(w)
             
             if not actions:
@@ -60,7 +62,11 @@ class TemporalEnsembler:
             weights = np.array(weights)
             weights /= weights.sum()
             trajectory.append(np.average(actions, axis=0, weights=weights))
-            
+
+        if not trajectory:
+            return None
+        while len(trajectory) < num_steps:
+            trajectory.append(trajectory[-1])
         return np.array(trajectory)
 
 # Standard imports for this workspace
@@ -155,16 +161,16 @@ class CASFGenerativeNode:
         self.robot_layer = URDFLayer(urdf_path=urdf_path, device=self.device, package_dir=pkg_path, voxel_dir=voxel_dir)
         weight_handler = RDF_Weights(device=self.device, dtype=torch.float32)
         weight_handler.init_robot_folder(weights_dir, robot_name='panda')
-        link_names = ['panda_link0', 'panda_link1', 'panda_link2', 'panda_link3', 'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7', 'panda_hand', 'panda_leftfinger', 'panda_rightfinger', 'fork_tip']
+        link_names = [
+            'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
+            'panda_hand', 'panda_leftfinger', 'panda_rightfinger', 'fork_tip',
+        ]
         weight_handler.add_models(link_names, robot_name='panda')
         self.bernstein_core = BernsteinCore(weight_handler, self.robot_layer, self.device, link_names)
         self.d_safe = float(rospy.get_param("~d_safe", 0.005))
-        # alpha=0.001 matches the CBF 150Hz node: softmin bias ≈ alpha*log(N) ≈ 4.6mm for N=100,
-        # acceptable for d_safe in mm range. Default 0.01 would bias h by 46mm, firing too early.
-        self.barrier = BernsteinBarrier(self.bernstein_core, d_safe=self.d_safe, alpha=0.001)
-        # Body links (link0→panda_hand) used for self-filter; end-effector links excluded so
-        # real obstacle points near the fork tip are never silently removed.
-        self.n_body_links = 9  # indices 0-8 in link_names (panda_link0 … panda_hand)
+        self.barrier_alpha = float(rospy.get_param("~barrier_alpha", 0.001))
+        self.barrier = BernsteinBarrier(self.bernstein_core, d_safe=self.d_safe, alpha=self.barrier_alpha)
+        self.n_body_links = 5  # indices 0-4 in link_names (panda_link4 ... panda_hand)
         
         # 2. Initialize IK Solver (Ultra-fast Pybind11 Pinocchio)
         # The FM model predicts fork-tip poses, but the robot IK target is the TCP.
@@ -198,10 +204,11 @@ class CASFGenerativeNode:
         cfg = payload.get('config', {})
         self.action_dim = cfg.get('action_dim', 9)
         self.obs_dim = cfg.get('obs_dim', 9)
+        self.pred_horizon = int(cfg.get('pred_horizon', 16))
         self.fm_agent = FlowMatchingAgent(
             action_dim=self.action_dim,
             obs_horizon=cfg.get('obs_horizon', 2),
-            pred_horizon=cfg.get('pred_horizon', 16),
+            pred_horizon=self.pred_horizon,
             encoder_output_dim=cfg.get('encoder_output_dim', 64),
             diffusion_step_embed_dim=cfg.get('diffusion_step_embed_dim', 256),
             down_dims=cfg.get('down_dims', [256, 512, 1024]),
@@ -234,11 +241,28 @@ class CASFGenerativeNode:
         self.n_pred = int(rospy.get_param("~n_pred", 5))
         self.n_corr = int(rospy.get_param("~n_corr", 5))
         self.alpha_corr = float(rospy.get_param("~alpha_corr", 2.0))
+        self.casf_barrier_memory_fraction = float(rospy.get_param("~casf_barrier_memory_fraction", 0.75))
+        self.casf_barrier_min_obstacles = max(1, int(rospy.get_param("~casf_barrier_min_obstacles", 8)))
+        self.commit_distance = float(rospy.get_param("~commit_distance", 0.035))
+        self.planner_rate_hz = float(rospy.get_param("~planner_rate_hz", 3.0))
+        self.trajectory_waypoint_rate_hz = float(rospy.get_param("~trajectory_waypoint_rate_hz", 10.0))
+        if self.planner_rate_hz <= 0.0:
+            raise ValueError("~planner_rate_hz must be > 0")
+        if self.trajectory_waypoint_rate_hz <= 0.0:
+            raise ValueError("~trajectory_waypoint_rate_hz must be > 0")
+        self.trajectory_waypoint_dt = 1.0 / self.trajectory_waypoint_rate_hz
+        self.ensembler_buffer_size = max(1, int(rospy.get_param("~ensembler_buffer_size", 3)))
+        self.ensembler_decay = float(rospy.get_param("~ensembler_decay", 1.0))
         self.plan_published = False
         self.is_committed = False
         self.fork_food_distance = float('inf')
         self.latest_cloud_gpu = None
-        self.ensembler = TemporalEnsembler(pred_horizon=cfg.get('pred_horizon', 16), buffer_size=3)
+        self.ensembler = TemporalEnsembler(
+            pred_horizon=self.pred_horizon,
+            buffer_size=self.ensembler_buffer_size,
+            waypoint_dt=self.trajectory_waypoint_dt,
+            decay=self.ensembler_decay,
+        )
         self.last_pose_source_log = 0.0
 
         
@@ -255,10 +279,15 @@ class CASFGenerativeNode:
         self.viz_traj_pub = rospy.Publisher('/viz/nominal_trajectory_3d', MarkerArray, queue_size=1, latch=True)
         self.pub_model_pcd = rospy.Publisher('/viz/model_input_pcd', PointCloud2, queue_size=1, latch=True)
         
-        # Control Loop at 3Hz (Planner rate)
-        self.rate_hz = 3.0
-        rospy.Timer(rospy.Duration(1.0/self.rate_hz), self.control_loop)
-        rospy.loginfo("🚀 Safe Generative Planner Node Initialized at 3Hz")
+        rospy.Timer(rospy.Duration(1.0 / self.planner_rate_hz), self.control_loop)
+        rospy.loginfo(
+            "🚀 Safe Generative Planner Node Initialized | planner=%.2fHz waypoint=%.2fHz "
+            "pred_horizon=%d commit_distance=%.3fm",
+            self.planner_rate_hz,
+            self.trajectory_waypoint_rate_hz,
+            self.pred_horizon,
+            self.commit_distance,
+        )
 
     def command_callback(self, msg):
         try:
@@ -408,9 +437,8 @@ class CASFGenerativeNode:
             A = self.generate_safe_trajectory(obs_dict, pos_fork, self.obstacle_pts_gpu, q_source)
             if A is not None and not (self.check_finite_debug and torch.isnan(A).any()):
                 # Check for Commit Mode
-                COMMIT_DISTANCE = 0.035 # 3.5 cm
                 use_ensembler = True
-                if self.fork_food_distance < COMMIT_DISTANCE:
+                if self.fork_food_distance < self.commit_distance:
                     rospy.loginfo(f"🔒 COMMIT MODE (d={self.fork_food_distance*1000:.1f}mm) — executing final strike open-loop")
                     self.is_committed = True
                     use_ensembler = False
@@ -428,10 +456,68 @@ class CASFGenerativeNode:
     def fork_se3_to_tcp_se3(self, T_world_fork):
         return T_world_fork @ self.T_tcp_fork_tip_inv
 
+    def cap_casf_obstacles_for_memory(self, P_obs, curr_pos, horizon):
+        """Keep the original CASF path, but avoid barrier allocations that cannot fit."""
+        if (
+            P_obs is None or P_obs.shape[0] == 0
+            or not torch.cuda.is_available()
+            or self.casf_barrier_memory_fraction <= 0.0
+        ):
+            return P_obs
+
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+        except Exception:
+            return P_obs
+
+        k_links = int(getattr(self.bernstein_core, "K", 1))
+        n_func = int(getattr(self.bernstein_core, "n_func", 1))
+        bytes_per_point = int(horizon) * k_links * (n_func ** 3) * P_obs.element_size()
+        if bytes_per_point <= 0:
+            return P_obs
+
+        budget_bytes = int(free_bytes * self.casf_barrier_memory_fraction)
+        max_points = budget_bytes // bytes_per_point
+        max_points = min(int(P_obs.shape[0]), max(self.casf_barrier_min_obstacles, int(max_points)))
+
+        if max_points >= int(P_obs.shape[0]):
+            return P_obs
+
+        dist_to_fork = torch.norm(P_obs - curr_pos, dim=1)
+        _, top_idx = torch.topk(dist_to_fork, k=max_points, largest=False, sorted=True)
+        rospy.logwarn_throttle(
+            2.0,
+            "CASF barrier capped obstacle points from %d to %d due to free VRAM budget",
+            int(P_obs.shape[0]),
+            int(max_points),
+        )
+        return P_obs[top_idx]
+
+    def evaluate_casf_barrier(self, q_batch, P_obs):
+        """Original combined CASF barrier with OOM backoff."""
+        P_eval = P_obs
+        while True:
+            q_eval = q_batch.detach().clone().requires_grad_(True)
+            try:
+                h_q, grad_h_q, _ = self.barrier(q_eval, P_eval)
+                return h_q.detach(), grad_h_q.detach()
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower() or int(P_eval.shape[0]) <= self.casf_barrier_min_obstacles:
+                    raise
+                torch.cuda.empty_cache()
+                new_count = max(self.casf_barrier_min_obstacles, int(P_eval.shape[0]) // 2)
+                rospy.logwarn_throttle(
+                    2.0,
+                    "CASF barrier OOM with %d obstacle points; retrying with %d",
+                    int(P_eval.shape[0]),
+                    int(new_count),
+                )
+                P_eval = P_eval[:new_count]
+
     def generate_safe_trajectory(self, obs_dict, curr_pos, P_obs, q_source, lam=1e-5):
         """PC-CASF: Prediction-Correction with CASF Metric Warping."""
         B = 1
-        H = 16
+        H = self.pred_horizon
         dev = self.device
         N_PRED = self.n_pred
         N_CORR = self.n_corr
@@ -510,8 +596,8 @@ class CASFGenerativeNode:
                     P_obs = P_obs[top_idx]
 
             # Step 1: Self-filter — remove depth-noise points on the robot arm body.
-            # Mirrors the CBF 150Hz self-filter: keep only points whose minimum SDF
-            # over body links (link0…panda_hand, indices 0:n_body_links) exceeds 5mm.
+            # Mirrors the CBF self-filter: keep only points whose minimum SDF
+            # over body links (link0…panda_hand) exceeds 5mm.
             # End-effector links are excluded so real obstacle points near the fork are kept.
             with torch.no_grad():
                 q9 = torch.cat([q_source.unsqueeze(0),
@@ -529,17 +615,19 @@ class CASFGenerativeNode:
                 not_self = sdf_body > -0.003
                 P_obs = P_obs[not_self]
 
-            # Step 2: Spatial filter — top-100 closest to fork tip (fast proxy for danger)
+            # Step 2: Spatial filter — closest points to fork tip (fast proxy for danger)
             if P_obs.shape[0] > 0:
                 dist_to_fork = torch.norm(P_obs - curr_pos, dim=1)
                 k_spatial = min(self.casf_spatial_max_obstacles, self.planner_cbf_max_obstacles)
                 if P_obs.shape[0] > k_spatial:
-                    _, top_idx = torch.topk(dist_to_fork, k=k_spatial, largest=False)
+                    _, top_idx = torch.topk(dist_to_fork, k=k_spatial, largest=False, sorted=True)
                     P_obs_filtered = P_obs[top_idx]
                 else:
                     P_obs_filtered = P_obs
             else:
                 P_obs_filtered = P_obs
+
+            P_obs_filtered = self.cap_casf_obstacles_for_memory(P_obs_filtered, curr_pos, H)
 
             if P_obs_filtered.shape[0] == 0:
                 rospy.logdebug_throttle(5.0, "CASF: all obstacle points removed by self-filter, skipping correction.")
@@ -592,15 +680,13 @@ class CASFGenerativeNode:
                 
                 # 4. Evaluate RDF and Apply CASF (Position Only)
                 t2 = time.perf_counter()
-                q_batch = torch.from_numpy(q_np[:, :7]).float().to(dev).requires_grad_(True)
+                q_batch = torch.from_numpy(q_np[:, :7]).float().to(dev)
                 
                 # J_full is [H, 6, 9]. We slice the first 3 rows for pos, and first 7 cols for arm joints.
                 J_full = torch.from_numpy(np.stack(Js_list)).float().to(dev) 
                 J_pos = J_full[:, :3, :7] # [H, 3, 7]
                 
-                h_q, grad_h_q, _ = self.barrier(q_batch, P_obs_filtered)
-                h_q = h_q.detach()
-                grad_h_q = grad_h_q.detach()
+                h_q, grad_h_q = self.evaluate_casf_barrier(q_batch, P_obs_filtered)
                 
                 with torch.no_grad():
                     # Pull back gradient: grad_h_pos = J_pos * (J_pos^T J_pos + lam I)^-1 * grad_h_q
@@ -655,7 +741,7 @@ class CASFGenerativeNode:
         return A
 
     def publish_joint_trajectory(self, A_norm, pos_fork, q_source, t_capture, use_ensembler=True):
-        """Publish full 16-point joint trajectory for the 150Hz Safety Shield."""
+        """Publish full joint trajectory for the safety shield."""
         current_time = rospy.get_time()
         
         A_unnorm = self.normalizer.unnormalize(A_norm)
@@ -668,14 +754,29 @@ class CASFGenerativeNode:
             # We add the prediction tagged with the time the point cloud was captured
             self.ensembler.add_prediction(A_world_np, t_capture)
             # We evaluate the ensembled trajectory at the CURRENT time
-            smoothed_traj_np = self.ensembler.get_ensembled_trajectory(num_steps=16, current_time=current_time)
-            if smoothed_traj_np is None:
+            smoothed_traj_np = self.ensembler.get_ensembled_trajectory(
+                num_steps=A_world_np.shape[0],
+                current_time=current_time,
+            )
+            if smoothed_traj_np is None or smoothed_traj_np.shape[0] == 0:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "Temporal ensembler has no valid current waypoint; using latest raw trajectory.")
                 smoothed_traj_np = A_world_np
         else:
             smoothed_traj_np = A_world_np
+
+        # Smoothly anchor the trajectory to start exactly at the current physical fork tip position.
+        # This prevents initial joint velocity jumps and safety holds.
+        current_fork_pos = pos_fork.detach().cpu().numpy()
+        start_offset = smoothed_traj_np[0, :3] - current_fork_pos
+        H_traj = smoothed_traj_np.shape[0]
+        for i in range(H_traj):
+            decay = 1.0 - float(i) / float(H_traj)
+            smoothed_traj_np[i, :3] -= start_offset * decay
             
-        # ================= NO INTERPOLATION (16 POINTS) =================
-        # We preserve the original 16-point trajectory to maintain the correct Cartesian lookahead distance
+        # ================= NO INTERPOLATION =================
+        # Preserve the model trajectory to maintain the learned Cartesian lookahead distance.
         num_interp_points = smoothed_traj_np.shape[0]
         interpolated_traj_np = smoothed_traj_np
 
@@ -824,13 +925,10 @@ class CASFGenerativeNode:
         msg.header.frame_id = "world"
         msg.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
         
-        # The ensembler has already aligned the trajectory to start exactly at current_time.
-        # We publish the 16 waypoints spaced by 0.1s.
-        dt_wp = 1.6 / 16.0
         for i in range(len(q_traj)):
             point = JointTrajectoryPoint()
             point.positions = q_traj[i][:7].tolist()
-            point.time_from_start = rospy.Duration(i * dt_wp)
+            point.time_from_start = rospy.Duration(i * self.trajectory_waypoint_dt)
             msg.points.append(point)
             
         self.traj_pub.publish(msg)

@@ -2,6 +2,7 @@
 
 import rospy
 import rospkg
+import os
 import sys
 import time
 import torch
@@ -9,12 +10,18 @@ import numpy as np
 import struct
 import xacro
 import tempfile
+import xml.etree.ElementTree as ET
 from std_msgs.msg import Float32MultiArray, Float64MultiArray, Header
 from sensor_msgs.msg import JointState, PointCloud2, PointField
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker, MarkerArray
 import sensor_msgs.point_cloud2 as pc2
+
+try:
+    import trimesh
+except ImportError:
+    trimesh = None
 
 rospack = rospkg.RosPack()
 pkg_path = rospack.get_path('vision_processing')
@@ -63,6 +70,7 @@ class CBFSafetyNode:
         # 2. On défini les links que l'on veut charger (correspondant aux links cinématiques dans l'ordre)
         # Pruning: We only protect the upper arm and wrist (Links 4-7 + Fork)
         link_names = ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7', 'panda_hand', 'panda_leftfinger', 'panda_rightfinger', 'fork_tip']
+        self.fork_link_index = link_names.index('fork_tip')
         weight_handler.add_models(link_names, robot_name='panda')
         self._log_cuda_memory("CBF after Bernstein weights")
         
@@ -79,7 +87,7 @@ class CBFSafetyNode:
         # Larger alpha blends the gradient over the k nearest points, giving a smooth,
         # stable correction direction at the cost of a larger bias.
         # Effective trigger clearance = d_safe + alpha*log(N).
-        # Recommended range: 0.003–0.005 for N=100 (trigger ≈ 18–28 mm).
+        # Tune with cbf_graph_points because the soft-min bias depends on N.
         barrier_alpha = float(rospy.get_param("~barrier_alpha", 0.005))
         self.barrier = BernsteinBarrier(self.bernstein_core, d_safe=self.d_safe, alpha=barrier_alpha)
         self._log_cuda_memory("CBF after Bernstein barrier")
@@ -90,8 +98,15 @@ class CBFSafetyNode:
         # Recommended: 1.0–3.0. Must be read BEFORE setup_cuda_graph (baked into graph).
         self.cbf_kappa = float(rospy.get_param("~cbf_kappa", 2.0))
 
+        self.cbf_graph_points = max(1, int(rospy.get_param("~cbf_graph_points", 100)))
+        preprocess_max_points = int(rospy.get_param("~preprocess_max_points", 512))
+        self.preprocess_max_points = (
+            max(self.cbf_graph_points, preprocess_max_points)
+            if preprocess_max_points > 0 else 0
+        )
+
         # Setup the new fast CUDA graph
-        self.setup_cuda_graph(batch_size=1, n_points=100)
+        self.setup_cuda_graph(batch_size=1, n_points=self.cbf_graph_points)
         self._log_cuda_memory("CBF after CUDA graph")
         
         self.joint_names = [
@@ -116,17 +131,26 @@ class CBFSafetyNode:
         self.tcp_filter_radius = float(rospy.get_param("~tcp_filter_radius", 0.40))
         self.fork_filter_radius = float(rospy.get_param("~fork_filter_radius", 0.15))
         self.nominal_hold_deadband = float(rospy.get_param("~nominal_hold_deadband", 1e-4))
+        self.cbf_selection_metric = str(rospy.get_param("~cbf_selection_metric", "fork_mesh")).lower()
+        if self.cbf_selection_metric not in ("distance", "sdf", "fork_sdf", "fork_mesh"):
+            raise ValueError("~cbf_selection_metric must be 'distance', 'sdf', 'fork_sdf', or 'fork_mesh'")
+        self.fork_mesh_selection_points = max(
+            1, int(rospy.get_param("~fork_mesh_selection_points", 512)))
+        self.fork_mesh_points_local = self._load_fork_mesh_points(urdf_path)
+        self.publish_yellow_points = bool(rospy.get_param("~publish_yellow_points", False))
+        self.selected_obstacle_hold_time = float(rospy.get_param("~selected_obstacle_hold_time", 0.5))
 
         self.eye4 = torch.eye(4, device=self.device).unsqueeze(0)
         self.q_pad2 = torch.zeros((1, 2), device=self.device)
-        self.dummy100 = torch.full((100, 3), 100.0, device=self.device)
+        self.dummy_obs = torch.full((self.cbf_graph_points, 3), 100.0, device=self.device)
         self.zero_dq = torch.zeros((1, 7), device=self.device)
 
-        self.selected_obs = self.dummy100.clone()
+        self.selected_obs = self.dummy_obs.clone()
         self.selected_pts_yellow = torch.empty((0, 3), dtype=torch.float32, device=self.device)
         self.selected_num_inside = 0
         self.selected_count = 0
         self.selected_min_obs_dist = float('inf')
+        self.selected_obs_stamp = rospy.get_time()
 
         self.last_q_safe = None
         self.q_safe_work = torch.zeros((1, 7), device=self.device)
@@ -134,6 +158,7 @@ class CBFSafetyNode:
         self._log_cuda_memory("CBF after runtime buffers")
 
         self.comp_times = []
+        self.preprocess_times = []
         rospy.Subscriber('/joint_states', JointState, self.joint_callback)
         rospy.Subscriber('/planner/nominal_joint_command', Float64MultiArray, self.nominal_command_callback)
         obs_topic = rospy.get_param("~obs_topic", "/perception/persistent_obstacles")
@@ -155,8 +180,9 @@ class CBFSafetyNode:
         self.pub_top100_red = rospy.Publisher('/viz/obs_top100_red', PointCloud2, queue_size=1)
         self.safe_traj_viz_pub = rospy.Publisher('/viz/safe_trajectory_3d', MarkerArray, queue_size=1)
         
-        # FRÉQUENCE STABLE À 150 Hz
-        self.rate_hz = 150
+        self.rate_hz = float(rospy.get_param("~rate_hz", 150.0))
+        if self.rate_hz <= 0.0:
+            raise ValueError("~rate_hz must be > 0")
         self.rate = rospy.Rate(self.rate_hz)
         self.last_time = rospy.get_time()
         rospy.Timer(rospy.Duration(1.0 / self.preprocess_rate_hz),
@@ -166,8 +192,12 @@ class CBFSafetyNode:
                         self.publish_visualization)
         rospy.loginfo(
             "Optimized CBF ready: control=%.1f Hz preprocess=%.1f Hz viz=%.1f Hz "
-            "debug=%s profile_sync=%s",
+            "graph_points=%d preprocess_max_points=%d selection=%s yellow=%s debug=%s profile_sync=%s",
             self.rate_hz, self.preprocess_rate_hz, self.viz_rate_hz,
+            self.cbf_graph_points,
+            self.preprocess_max_points,
+            self.cbf_selection_metric,
+            self.publish_yellow_points,
             self.publish_debug_topics, self.profile_sync)
 
     def _log_cuda_memory(self, label):
@@ -189,10 +219,93 @@ class CBFSafetyNode:
             self._last_cuda_memory_log = now
             self._log_cuda_memory(label)
 
+    def _resolve_mesh_path(self, mesh_uri):
+        if not mesh_uri:
+            return None
+        if mesh_uri.startswith('package://'):
+            relative = mesh_uri[len('package://'):]
+            package_name, _, path_in_package = relative.partition('/')
+            try:
+                return os.path.join(rospack.get_path(package_name), path_in_package)
+            except Exception as exc:
+                rospy.logwarn("Could not resolve mesh package '%s': %s", package_name, exc)
+                return None
+        return mesh_uri
+
+    def _origin_to_matrix(self, origin_elem):
+        T = np.eye(4, dtype=np.float64)
+        if origin_elem is None:
+            return T
+
+        xyz = np.fromstring(origin_elem.get('xyz', '0 0 0'), sep=' ', dtype=np.float64)
+        rpy = np.fromstring(origin_elem.get('rpy', '0 0 0'), sep=' ', dtype=np.float64)
+        if xyz.size != 3:
+            xyz = np.zeros(3, dtype=np.float64)
+        if rpy.size != 3:
+            rpy = np.zeros(3, dtype=np.float64)
+
+        r, p, y = rpy
+        Rx = np.array([[1.0, 0.0, 0.0],
+                       [0.0, np.cos(r), -np.sin(r)],
+                       [0.0, np.sin(r), np.cos(r)]], dtype=np.float64)
+        Ry = np.array([[np.cos(p), 0.0, np.sin(p)],
+                       [0.0, 1.0, 0.0],
+                       [-np.sin(p), 0.0, np.cos(p)]], dtype=np.float64)
+        Rz = np.array([[np.cos(y), -np.sin(y), 0.0],
+                       [np.sin(y), np.cos(y), 0.0],
+                       [0.0, 0.0, 1.0]], dtype=np.float64)
+        T[:3, :3] = Rz @ Ry @ Rx
+        T[:3, 3] = xyz
+        return T
+
+    def _load_fork_mesh_points(self, urdf_path):
+        empty = torch.empty((0, 3), dtype=torch.float32, device=self.device)
+        if self.cbf_selection_metric != "fork_mesh":
+            return empty
+        if trimesh is None:
+            rospy.logwarn("trimesh is unavailable; falling back from fork_mesh to distance selection.")
+            self.cbf_selection_metric = "distance"
+            return empty
+
+        try:
+            root = ET.parse(urdf_path).getroot()
+            fork_link = root.find("./link[@name='fork_tip']")
+            if fork_link is None:
+                raise ValueError("fork_tip link not found in URDF")
+
+            visual = fork_link.find('visual')
+            geometry = visual.find('geometry') if visual is not None else None
+            mesh_elem = geometry.find('mesh') if geometry is not None else None
+            if mesh_elem is None:
+                raise ValueError("fork_tip visual mesh not found in URDF")
+
+            mesh_path = self._resolve_mesh_path(mesh_elem.get('filename'))
+            if not mesh_path or not os.path.exists(mesh_path):
+                raise FileNotFoundError(mesh_path or mesh_elem.get('filename'))
+
+            mesh = trimesh.load(mesh_path, force='mesh')
+            scale = np.fromstring(mesh_elem.get('scale', '1 1 1'), sep=' ', dtype=np.float64)
+            if scale.size != 3:
+                scale = np.ones(3, dtype=np.float64)
+            mesh.apply_scale(scale)
+            mesh.apply_transform(self._origin_to_matrix(visual.find('origin')))
+
+            points = mesh.sample(self.fork_mesh_selection_points).astype(np.float32)
+            rospy.loginfo(
+                "Loaded %d fork mesh selection points from %s",
+                points.shape[0], mesh_path)
+            return torch.as_tensor(points, dtype=torch.float32, device=self.device)
+        except Exception as exc:
+            rospy.logwarn(
+                "Could not load fork mesh selection points (%s); falling back to distance selection.",
+                exc)
+            self.cbf_selection_metric = "distance"
+            return empty
+
     def setup_cuda_graph(self, batch_size=1, n_points=100):
         """
         Single unified CUDA graph:
-          Calculates whole-body safety over 100 points.
+          Calculates whole-body safety over n_points selected obstacle points.
           dq_safe = dq_nom + lam * grad_h.
         """
         print(f"⚡ Capture du graphe CUDA (QP {n_points} points)...")
@@ -217,14 +330,18 @@ class CBFSafetyNode:
             return dq_in + lam.unsqueeze(-1) * grad_h
 
         # ── Warmup ────────────────────────────────────────────────────────────
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                if self.static_q.grad is not None: self.static_q.grad.zero_()
-                h, g, _ = self.barrier(self.static_q, self.static_obs)
-                self.static_dq_safe.copy_(_qp_step(h, g, self.static_dq_nom))
-        torch.cuda.current_stream().wait_stream(s)
+        def _warmup():
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    if self.static_q.grad is not None: self.static_q.grad.zero_()
+                    h_w, g_w, _ = self.barrier(self.static_q, self.static_obs)
+                    self.static_dq_safe.copy_(_qp_step(h_w, g_w, self.static_dq_nom))
+            torch.cuda.current_stream().wait_stream(s)
+
+        _warmup()
+        torch.cuda.empty_cache()
 
         # ── Unified Graph ─────────────────────────────────────────────────────
         self.graph = torch.cuda.CUDAGraph()
@@ -289,7 +406,7 @@ class CBFSafetyNode:
         
         return msg
 
-    def get_fork_tip_pose(self, q7):
+    def get_link_pose(self, q7, link_name):
         if q7.dim() == 1:
             q7 = q7.unsqueeze(0)
         q_eval = q7
@@ -300,9 +417,12 @@ class CBFSafetyNode:
             ], dim=-1)
 
         link_poses = self.robot_layer._native_forward_kinematics(q_eval)
-        # Use fork_tine_tip (physical tine centroid) so the green marker
-        # appears at the actual tine tips, not the fork attachment point.
-        return link_poses.get('fork_tine_tip', link_poses.get('fork_tip', None))
+        return link_poses.get(link_name, None)
+
+    def get_fork_tip_pose(self, q7):
+        # Use fork_tip so that it aligns with nominal_trajectory_follower
+        # and the Flow Matching trajectory coordinates.
+        return self.get_link_pose(q7, 'fork_tip')
 
     def publish_safe_trajectory_marker(self, q_start, q_goal):
         q_start = q_start.detach()
@@ -359,73 +479,127 @@ class CBFSafetyNode:
         self.safe_traj_viz_pub.publish(marker_array)
 
     def _copy_fixed_obstacles(self, obs):
-        self.selected_obs.copy_(self.dummy100)
-        n = min(int(obs.shape[0]), 100)
+        self.selected_obs.copy_(self.dummy_obs)
+        n = min(int(obs.shape[0]), self.cbf_graph_points)
         if n > 0:
             self.selected_obs[:n].copy_(obs[:n])
+            self.selected_obs_stamp = rospy.get_time()
         self.selected_count = n
+
+    def _clear_or_hold_obstacles(self):
+        if (
+            self.selected_obstacle_hold_time > 0.0
+            and self.selected_count > 0
+            and rospy.get_time() - self.selected_obs_stamp < self.selected_obstacle_hold_time
+        ):
+            self.selected_pts_yellow = torch.empty((0, 3), dtype=torch.float32,
+                                                   device=self.device)
+            return
+
+        self._copy_fixed_obstacles(torch.empty((0, 3), device=self.device))
+        self.selected_pts_yellow = torch.empty((0, 3), dtype=torch.float32,
+                                               device=self.device)
+        self.selected_num_inside = 0
+        self.selected_min_obs_dist = float('inf')
 
     def preprocess_obstacles(self, event):
         if self.current_q is None:
             return
 
+        if self.profile_sync:
+            torch.cuda.synchronize()
+        t_start = time.perf_counter()
+
         pts = self.obs_points
         if pts is None or pts.shape[0] == 0:
-            self._copy_fixed_obstacles(torch.empty((0, 3), device=self.device))
-            self.selected_pts_yellow = torch.empty((0, 3), dtype=torch.float32,
-                                                   device=self.device)
-            self.selected_num_inside = 0
-            self.selected_min_obs_dist = float('inf')
+            self._clear_or_hold_obstacles()
             return
 
         try:
             with torch.no_grad():
-                T_fork_now = self.get_fork_tip_pose(self.current_q)
-                if T_fork_now is None:
+                T_tine_now = self.get_link_pose(self.current_q, 'fork_tine_tip')
+                if T_tine_now is None:
+                    T_tine_now = self.get_fork_tip_pose(self.current_q)
+                if T_tine_now is None:
                     rospy.logwarn_throttle(
-                        5, "CBF preprocessing cannot find fork_tine_tip/fork_tip in FK tree.")
+                        5, "CBF preprocessing cannot find fork_tine_tip or fork_tip in FK tree.")
                     return
 
-                x_now_pos = T_fork_now[:, :3, 3]
+                x_now_pos = T_tine_now[:, :3, 3]
                 dist_tcp = torch.norm(pts - x_now_pos, dim=1)
-                pts_inside = pts[dist_tcp < self.tcp_filter_radius]
+                inside_mask = dist_tcp < self.tcp_filter_radius
+                pts_inside = pts[inside_mask]
+                dist_inside = dist_tcp[inside_mask]
                 num_inside = int(pts_inside.shape[0])
 
                 if num_inside == 0:
-                    self._copy_fixed_obstacles(torch.empty((0, 3), device=self.device))
-                    self.selected_pts_yellow = torch.empty((0, 3), dtype=torch.float32,
-                                                           device=self.device)
-                    self.selected_num_inside = 0
-                    self.selected_min_obs_dist = float('inf')
+                    self._clear_or_hold_obstacles()
                     return
 
-                q9 = torch.cat([self.current_q.detach(), self.q_pad2], dim=1)
-                _, sdf_per_link = self.bernstein_core.get_whole_body_sdf_batch(
-                    pts_inside, self.eye4, q9, return_per_link=True)
+                if self.cbf_selection_metric in ("sdf", "fork_sdf", "fork_mesh"):
+                    if self.preprocess_max_points > 0 and num_inside > self.preprocess_max_points:
+                        _, pre_idx = torch.topk(
+                            dist_inside,
+                            k=self.preprocess_max_points,
+                            largest=False,
+                        )
+                        pts_inside = pts_inside[pre_idx]
+                        dist_inside = dist_inside[pre_idx]
+                        num_inside = int(pts_inside.shape[0])
 
-                # Pruned self-filter: indices 0:5 now correspond to [link4, link5, link6, link7, hand]
-                sdf_body = sdf_per_link[0, :5, :].min(dim=0).values
-                sdf_all = sdf_per_link[0].min(dim=0).values
-                not_self = sdf_body > -0.003
-                pts_inside = pts_inside[not_self]
-                sdf_filtered = sdf_all[not_self]
-                num_inside = int(pts_inside.shape[0])
+                if self.cbf_selection_metric == "fork_mesh":
+                    T_fork_now = self.get_fork_tip_pose(self.current_q)
+                    if T_fork_now is None or self.fork_mesh_points_local.shape[0] == 0:
+                        scores = dist_inside
+                    else:
+                        R_fork = T_fork_now[0, :3, :3]
+                        t_fork = T_fork_now[0, :3, 3]
+                        fork_mesh_world = (
+                            self.fork_mesh_points_local @ R_fork.transpose(0, 1)
+                        ) + t_fork
+                        mesh_dist = torch.cdist(
+                            pts_inside.unsqueeze(0),
+                            fork_mesh_world.unsqueeze(0),
+                        ).squeeze(0).min(dim=1).values
+                        scores = mesh_dist
+                    largest = False
+                elif self.cbf_selection_metric in ("sdf", "fork_sdf"):
+                    q9 = torch.cat([self.current_q.detach(), self.q_pad2], dim=1)
+                    _, sdf_per_link = self.bernstein_core.get_whole_body_sdf_batch(
+                        pts_inside, self.eye4, q9, return_per_link=True)
+
+                    # Pruned self-filter: indices 0:5 now correspond to [link4, link5, link6, link7, hand]
+                    sdf_body = sdf_per_link[0, :5, :].min(dim=0).values
+                    sdf_all = sdf_per_link[0].min(dim=0).values
+                    sdf_fork = sdf_per_link[0, self.fork_link_index, :]
+                    not_self = sdf_body > -0.003
+                    pts_inside = pts_inside[not_self]
+                    dist_inside = dist_inside[not_self]
+                    if self.cbf_selection_metric == "fork_sdf":
+                        scores = sdf_fork[not_self]
+                    else:
+                        scores = sdf_all[not_self]
+                    largest = False
+                    num_inside = int(pts_inside.shape[0])
+                else:
+                    scores = dist_inside
+                    largest = False
 
                 if num_inside == 0:
-                    self._copy_fixed_obstacles(torch.empty((0, 3), device=self.device))
-                    self.selected_pts_yellow = torch.empty((0, 3), dtype=torch.float32,
-                                                           device=self.device)
-                    self.selected_num_inside = 0
-                    self.selected_min_obs_dist = float('inf')
+                    self._clear_or_hold_obstacles()
                     return
 
-                if num_inside >= 100:
-                    _, top_idx = torch.topk(sdf_filtered, k=100, largest=False)
+                if num_inside > self.cbf_graph_points:
+                    _, top_idx = torch.topk(scores, k=self.cbf_graph_points, largest=largest)
                     obs = pts_inside[top_idx]
-                    top_mask = torch.zeros(num_inside, dtype=torch.bool,
-                                           device=self.device)
-                    top_mask[top_idx] = True
-                    pts_yellow = pts_inside[~top_mask]
+                    if self.publish_yellow_points:
+                        top_mask = torch.zeros(num_inside, dtype=torch.bool,
+                                               device=self.device)
+                        top_mask[top_idx] = True
+                        pts_yellow = pts_inside[~top_mask]
+                    else:
+                        pts_yellow = torch.empty((0, 3), dtype=torch.float32,
+                                                 device=self.device)
                 else:
                     obs = pts_inside
                     pts_yellow = torch.empty((0, 3), dtype=torch.float32,
@@ -436,6 +610,23 @@ class CBFSafetyNode:
                 self.selected_pts_yellow = pts_yellow.detach()
                 self.selected_num_inside = num_inside
                 self.selected_min_obs_dist = float(dist_tip.min().item())
+
+                if self.profile_sync:
+                    torch.cuda.synchronize()
+                self.preprocess_times.append(time.perf_counter() - t_start)
+                if len(self.preprocess_times) >= 20:
+                    avg_t = sum(self.preprocess_times) / len(self.preprocess_times)
+                    rospy.loginfo_throttle(
+                        5.0,
+                        "⏱️ [TIMING] CBF red points: %.3f ms | "
+                        "selection=%s candidates=%d selected=%d graph_points=%d",
+                        avg_t * 1000.0,
+                        self.cbf_selection_metric,
+                        self.selected_num_inside,
+                        self.selected_count,
+                        self.cbf_graph_points,
+                    )
+                    self.preprocess_times.clear()
         except Exception as e:
             rospy.logerr_throttle(5.0, f"Error in CBF obstacle preprocessing: {e}")
 
@@ -531,8 +722,11 @@ class CBFSafetyNode:
                         denom = torch.norm(dq_nom_torch, dim=1) * torch.norm(self.dq_safe_work, dim=1)
                         alignment = torch.where(denom > 1e-8, dot / denom, torch.ones_like(dot))
 
-                        reverse = (alignment < 0.0).view(1, 1)
-                        self.dq_safe_work.copy_(torch.where(reverse, self.zero_dq, self.dq_safe_work))
+                        # We no longer override dq_safe_work to zero on negative alignment,
+                        # as the QP's corrective velocity (pushing away from obstacles)
+                        # must be allowed to ensure safety.
+                        # reverse = (alignment < 0.0).view(1, 1)
+                        # self.dq_safe_work.copy_(torch.where(reverse, self.zero_dq, self.dq_safe_work))
                         self.dq_safe_work.clamp_(min=-self.max_joint_velocity,
                                                  max=self.max_joint_velocity)
 

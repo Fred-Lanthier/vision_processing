@@ -10,6 +10,7 @@ A monotone guard prevents backward jumps within a trajectory.
 """
 import rospy
 import numpy as np
+import threading
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
 from std_msgs.msg import Float64MultiArray
@@ -38,6 +39,7 @@ class TrajectoryExecutor:
         self._holding_logged = False
         self._logged_first_traj = False
         self._logged_first_publish = False
+        self._state_lock = threading.Lock()
 
         rospy.Subscriber('/planner/nominal_trajectory', JointTrajectory,
                          self._traj_cb, queue_size=1)
@@ -56,9 +58,11 @@ class TrajectoryExecutor:
         pos = {n: p for n, p in zip(msg.name, msg.position)}
         q = [pos.get(j) for j in JOINT_NAMES]
         if None not in q:
-            self.q_current = np.array(q, dtype=np.float64)
-            if self.q_hold is None:
-                self.q_hold = self.q_current.copy()
+            q_current = np.array(q, dtype=np.float64)
+            with self._state_lock:
+                self.q_current = q_current
+                if self.q_hold is None:
+                    self.q_hold = q_current.copy()
 
     def _traj_cb(self, msg):
         if not msg.points:
@@ -67,26 +71,32 @@ class TrajectoryExecutor:
                 np.array(p.positions[:7], dtype=np.float64))
                for p in msg.points]
         pts.sort(key=lambda x: x[0])
-        self.traj_pts = pts
-        self._min_t   = 0.0   # new trajectory resets the monotone guard
+
+        with self._state_lock:
+            q_current = None if self.q_current is None else self.q_current.copy()
 
         # Compensate for planning latency: find the waypoint closest to the
         # current robot state and start interpolation from there. If the planner
         # took 200ms to compute, the robot has already advanced ~2 waypoints
         # past wps[0] by the time this trajectory arrives.  Resetting t_start=now
         # would command wps[0] (stale) and pull the robot backward.
-        if self.q_current is not None:
+        if q_current is not None:
             qs = np.array([q for _, q in pts])
-            dists = np.linalg.norm(qs - self.q_current, axis=1)
+            dists = np.linalg.norm(qs - q_current, axis=1)
             closest_idx = int(np.argmin(dists))
             closest_t = pts[closest_idx][0]
-            self.t_start = rospy.Time.now() - rospy.Duration(closest_t)
+            t_start = rospy.Time.now() - rospy.Duration(closest_t)
             closest_err = float(dists[closest_idx])
         else:
-            self.t_start = rospy.Time.now()
+            t_start = rospy.Time.now()
             closest_idx = -1
             closest_t = 0.0
             closest_err = float('nan')
+
+        with self._state_lock:
+            self.t_start = t_start
+            self.traj_pts = pts
+            self._min_t = 0.0   # new trajectory resets the monotone guard
 
         if not self._logged_first_traj:
             rospy.loginfo(
@@ -97,8 +107,7 @@ class TrajectoryExecutor:
 
     # ── interpolation ──────────────────────────────────────────────────────
 
-    def _interpolate(self, t):
-        pts = self.traj_pts
+    def _interpolate(self, t, pts):
         if t <= pts[0][0]:
             return pts[0][1]
         if t >= pts[-1][0]:
@@ -114,29 +123,38 @@ class TrajectoryExecutor:
     # ── control loop ───────────────────────────────────────────────────────
 
     def _control_loop(self, event):
-        if self.q_current is None or self.q_hold is None:
+        with self._state_lock:
+            q_current = None if self.q_current is None else self.q_current.copy()
+            q_hold = None if self.q_hold is None else self.q_hold.copy()
+            traj_pts = self.traj_pts
+            t_start = self.t_start
+            min_t = self._min_t
+
+        if q_current is None or q_hold is None:
             return
 
-        if self.traj_pts is None:
+        if traj_pts is None or t_start is None:
             if self.hold_current_until_trajectory:
-                self.pub.publish(Float64MultiArray(data=self.q_hold.tolist()))
+                self.pub.publish(Float64MultiArray(data=q_hold.tolist()))
                 if not self._holding_logged:
                     rospy.logdebug(
                         'trajectory_executor holding latched joints until first trajectory')
                     self._holding_logged = True
             return
 
-        t = (rospy.Time.now() - self.t_start).to_sec()
+        t = (rospy.Time.now() - t_start).to_sec()
 
         # Monotone guard: never go backward in the trajectory.
         # Protects against the closest-waypoint search landing on a later section
         # of a new trajectory that briefly passes near the current joint config.
-        t = max(t, self._min_t)
-        self._min_t = t
+        t = max(t, min_t)
+        with self._state_lock:
+            if traj_pts is self.traj_pts:
+                self._min_t = t
 
-        q_des = self._interpolate(t)
+        q_des = self._interpolate(t, traj_pts)
         if not self._logged_first_publish:
-            err = float(np.linalg.norm(q_des - self.q_current))
+            err = float(np.linalg.norm(q_des - q_current))
             rospy.loginfo(
                 'trajectory_executor publishing first nominal command | '
                 't=%.3fs err_to_current=%.4f rad topic=%s',
