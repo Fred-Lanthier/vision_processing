@@ -2,11 +2,13 @@
 <launch>
   <arg name="arm_id" default="panda"/>
   <arg name="paused" default="false"/>
+  <arg name="gui" default="true"/>
+  <arg name="use_direct_group_position_controller" default="false"/>
 
   <include file="$(find gazebo_ros)/launch/empty_world.launch">
     <arg name="world_name" value="$(find vision_processing)/worlds/feeding.world"/>
     <arg name="paused" value="$(arg paused)"/>
-    <arg name="gui" value="true"/>
+    <arg name="gui" value="$(arg gui)"/>
     <arg name="use_sim_time" value="true"/>
   </include>
 
@@ -76,17 +78,25 @@
 
   <rosparam file="$(find franka_gazebo)/config/franka_hw_sim.yaml" command="load" subst_value="true"/>
   <rosparam file="$(find franka_gazebo)/config/sim_controllers.yaml" command="load" subst_value="true"/>
+  <rosparam if="$(arg use_direct_group_position_controller)"
+            file="$(find vision_processing)/config/simple_controllers.yaml"
+            command="load"/>
 
   <node name="controller_spawner" pkg="controller_manager" type="spawner"
+        unless="$(arg use_direct_group_position_controller)"
         respawn="false" output="screen"
         args="franka_state_controller position_joint_trajectory_controller"/>
+  <node name="controller_spawner_direct" pkg="controller_manager" type="spawner"
+        if="$(arg use_direct_group_position_controller)"
+        respawn="false" output="screen"
+        args="franka_state_controller joint_group_position_controller"/>
 
   <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"
         respawn="true" output="screen"/>
 
   <node name="joint_state_publisher" type="joint_state_publisher" pkg="joint_state_publisher">
     <rosparam param="source_list">[franka_state_controller/joint_states, /fake_finger_joint_states]</rosparam>
-    <param name="rate" value="30"/>
+    <param name="rate" value="60"/>
   </node>
 
   <node name="franka_state_camera_reader"
@@ -95,12 +105,24 @@
 
   <node name="publish_homing_hold"
         pkg="vision_processing" type="publish_homing_hold.py"
-        output="screen">
+        output="screen"
+        unless="$(arg use_direct_group_position_controller)">
     <param name="controller_name" value="position_joint_trajectory_controller"/>
     <param name="command_topic" value="/position_joint_trajectory_controller/command"/>
     <rosparam param="homing_position">[-0.000059, -0.125928, 0.000117, -2.193312, -0.000251, 2.064780, 0.785511]</rosparam>
     <param name="lead_time" value="0.10"/>
     <param name="hold_duration" value="2.0"/>
+    <param name="publish_repeats" value="20"/>
+    <param name="publish_period" value="0.05"/>
+  </node>
+  <node name="publish_group_homing_hold"
+        pkg="vision_processing" type="publish_homing_hold.py"
+        output="screen"
+        if="$(arg use_direct_group_position_controller)">
+    <param name="controller_name" value="joint_group_position_controller"/>
+    <param name="command_topic" value="/joint_group_position_controller/command"/>
+    <param name="command_type" value="group_position"/>
+    <rosparam param="homing_position">[-0.000059, -0.125928, 0.000117, -2.193312, -0.000251, 2.064780, 0.785511]</rosparam>
     <param name="publish_repeats" value="20"/>
     <param name="publish_period" value="0.05"/>
   </node>

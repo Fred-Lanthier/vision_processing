@@ -16,6 +16,8 @@ class FastIK {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+    double k_null;
+
     FastIK(const std::string &urdf_path, const std::string &ee_name) {
         // Chargement du modèle Panda
         pinocchio::urdf::buildModel(urdf_path, model);
@@ -34,6 +36,13 @@ public:
         J.setZero();
         v.resize(model.nv);
         v.setZero();
+
+        // Initialisation de la tâche secondaire (null space projection)
+        k_null = 0.2;
+        w.resize(model.nv);
+        w.setZero();
+        Jt_temp.resize(model.nv);
+        Jt_temp.setZero();
     }
 
     Eigen::VectorXd get_random_q() {
@@ -111,10 +120,30 @@ public:
             JJt.noalias() = J * J.transpose();
             JJt.diagonal().array() += damp;
             
+            // Tâche principale (suivi de la pose cartésienne)
             v.noalias() = -J.transpose() * JJt.ldlt().solve(err_vec);
             
+            // Tâche secondaire en espace nul (maintien de la configuration q_start)
+            w.noalias() = -k_null * (q - q_start);
+            Eigen::Matrix<double, 6, 1> Jw;
+            Jw.noalias() = J * w;
+            Eigen::Matrix<double, 6, 1> temp = JJt.ldlt().solve(Jw);
+            Jt_temp.noalias() = J.transpose() * temp;
+            
+            v.noalias() += w - Jt_temp;
+            
             // 5. Intégration
-            q = pinocchio::integrate(model, q, v);
+            double v_norm = v.norm();
+            double max_step = 0.2; // Maximum joint increment per iteration (rad)
+            if (v_norm > max_step) {
+                v *= (max_step / v_norm);
+            }
+            
+            Eigen::VectorXd q_next = pinocchio::integrate(model, q, v);
+            if (!q_next.allFinite()) {
+                break;
+            }
+            q = q_next;
         }
         
         pinocchio::forwardKinematics(model, data, q);
@@ -201,11 +230,14 @@ private:
     pinocchio::FrameIndex ee_frame_id;
     pinocchio::Data::Matrix6x J;
     Eigen::VectorXd v;
+    Eigen::VectorXd w;
+    Eigen::VectorXd Jt_temp;
 };
 
 PYBIND11_MODULE(fast_ik_module, m) {
     py::class_<FastIK>(m, "FastIK")
         .def(py::init<const std::string &, const std::string &>())
+        .def_readwrite("k_null", &FastIK::k_null)
         .def("get_random_q", &FastIK::get_random_q)
         .def("get_nq", &FastIK::get_nq)
         .def("get_nv", &FastIK::get_nv)

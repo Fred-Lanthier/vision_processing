@@ -30,6 +30,8 @@ class PointCloudProjectorNode:
         self.obstacle_sample_multiplier = float(rospy.get_param("~obstacle_sample_multiplier", 3.0))
         self.tf_timeout = float(rospy.get_param("~tf_timeout", 0.01))
         self.run_3d_fork_filter_backup = bool(rospy.get_param("~run_3d_fork_filter_backup", False))
+        self.log_timing = bool(rospy.get_param("~log_timing", True))
+        self.log_events = bool(rospy.get_param("~log_events", True))
         self.rng = np.random.default_rng()
 
         # SAM3 fork mask params
@@ -87,10 +89,12 @@ class PointCloudProjectorNode:
             # sam3_server registers the ROS service BEFORE loading weights, so
             # wait_for_service() returning does NOT mean the model is ready.
             rospy.Timer(rospy.Duration(15.0), self._try_sam3_mask, oneshot=True)
-            rospy.loginfo("✅ Point Cloud Projector ready. SAM3 fork mask scheduled in 15 s.")
+            if self.log_events:
+                rospy.loginfo("✅ Point Cloud Projector ready. SAM3 fork mask scheduled in 15 s.")
         else:
             self._geometric_mask_pending = True
-            rospy.loginfo("✅ Point Cloud Projector ready. Geometric fork mask pending CameraInfo.")
+            if self.log_events:
+                rospy.loginfo("✅ Point Cloud Projector ready. Geometric fork mask pending CameraInfo.")
 
     # ── Incoming data caches ───────────────────────────────────────────────────
 
@@ -102,7 +106,8 @@ class PointCloudProjectorNode:
         if self._geometric_mask_pending and not self._mask_ready:
             self._use_geometric_fallback()
             self._geometric_mask_pending = False
-            rospy.loginfo("✅ Geometric fork mask initialized from CameraInfo.")
+            if self.log_events:
+                rospy.loginfo("✅ Geometric fork mask initialized from CameraInfo.")
 
     def _rgb_cb(self, msg):
         self._latest_rgb = msg   # always keep the freshest frame for SAM3
@@ -117,13 +122,15 @@ class PointCloudProjectorNode:
             return
 
         self._sam3_attempts += 1
-        rospy.loginfo(
-            f"[fork_filter] SAM3 mask attempt {self._sam3_attempts}/{self._max_sam3_attempts} …"
-        )
+        if self.log_events:
+            rospy.loginfo(
+                f"[fork_filter] SAM3 mask attempt {self._sam3_attempts}/{self._max_sam3_attempts} …"
+            )
 
         # Prerequisites: need intrinsics + at least one RGB frame
         if self.fx is None or self._latest_rgb is None:
-            rospy.logwarn("[fork_filter] Camera not ready yet, retrying in 10 s.")
+            if self.log_events:
+                rospy.logwarn("[fork_filter] Camera not ready yet, retrying in 10 s.")
             rospy.Timer(rospy.Duration(10.0), self._try_sam3_mask, oneshot=True)
             return
 
@@ -146,30 +153,34 @@ class PointCloudProjectorNode:
                 self.fork_filter.pixel_mask = dilated.astype(bool)
                 self._mask_ready = True
                 self._publish_mask_debug(dilated)
-                rospy.loginfo(
-                    f"[fork_filter] ✅ SAM3 fork mask ready — "
-                    f"confidence={resp.confidence:.3f}  "
-                    f"{100*dilated.astype(bool).mean():.1f}% of image masked"
-                )
+                if self.log_events:
+                    rospy.loginfo(
+                        f"[fork_filter] ✅ SAM3 fork mask ready — "
+                        f"confidence={resp.confidence:.3f}  "
+                        f"{100*dilated.astype(bool).mean():.1f}% of image masked"
+                    )
                 return
 
-            rospy.logwarn(
-                f"[fork_filter] SAM3 not ready yet "
-                f"(success={resp.success}, confidence={resp.confidence:.3f}). "
-                f"Retrying in 10 s."
-            )
+            if self.log_events:
+                rospy.logwarn(
+                    f"[fork_filter] SAM3 not ready yet "
+                    f"(success={resp.success}, confidence={resp.confidence:.3f}). "
+                    f"Retrying in 10 s."
+                )
 
         except Exception as e:
-            rospy.logwarn(f"[fork_filter] SAM3 call failed ({e}). Retrying in 10 s.")
+            if self.log_events:
+                rospy.logwarn(f"[fork_filter] SAM3 call failed ({e}). Retrying in 10 s.")
 
         # Schedule next attempt or give up and use geometric fallback
         if self._sam3_attempts < self._max_sam3_attempts:
             rospy.Timer(rospy.Duration(10.0), self._try_sam3_mask, oneshot=True)
         else:
-            rospy.logwarn(
-                "[fork_filter] SAM3 unreachable after max attempts. "
-                "Switching to geometric capsule mask."
-            )
+            if self.log_events:
+                rospy.logwarn(
+                    "[fork_filter] SAM3 unreachable after max attempts. "
+                    "Switching to geometric capsule mask."
+                )
             self._use_geometric_fallback()
 
     def _use_geometric_fallback(self):
@@ -179,10 +190,11 @@ class PointCloudProjectorNode:
         self._mask_ready = True
         self._publish_capsule_marker()
         self._publish_mask_debug((mask * 255).astype(np.uint8))
-        rospy.loginfo(
-            f"[fork_filter] Geometric mask active — "
-            f"P1={self.fork_filter.P1.round(3)} P2={self.fork_filter.P2.round(3)}"
-        )
+        if self.log_events:
+            rospy.loginfo(
+                f"[fork_filter] Geometric mask active — "
+                f"P1={self.fork_filter.P1.round(3)} P2={self.fork_filter.P2.round(3)}"
+            )
 
     # ── Debug publishers ────────────────────────────────────────────────────────
 
@@ -298,6 +310,8 @@ class PointCloudProjectorNode:
         return (newer - older) * 1000.0
 
     def _log_timing(self, total_start, stages, obs_in, obs_pub, target_pub):
+        if not self.log_timing:
+            return
         rospy.loginfo_throttle(
             5.0,
             "⏱️ [TIMING] PointCloud Projector: "

@@ -134,6 +134,7 @@ catkin_install_python(PROGRAMS
   scripts/nominal_fork_pose_follower.py
   scripts/nominal_trajectory_follower.py
   scripts/perception_processing_node.py
+  scripts/sdf_trajectory_projector.py
   scripts/trajectory_executor.py
   scripts/trajectory_controller_bridge.py
   scripts/circle_trajectory_publisher.py
@@ -141,6 +142,7 @@ catkin_install_python(PROGRAMS
   scripts/fake_finger_publisher.py
   scripts/sam3_server.py
   test_novelty/cbf_safety_node_Bernstein.py
+  test_novelty/cbf_safety_node_Bernstein_multicbf.py
   test_novelty/sam3_sam2_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

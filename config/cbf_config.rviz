@@ -411,6 +411,14 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /viz/cbf_velocity_arrows
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -435,17 +443,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 0.4323558509349823
-        Y: 0.1162077784538269
-        Z: -0.0911121591925621
+        X: 0.41244515776634216
+        Y: 0.12679725885391235
+        Z: 0.07770641893148422
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.3653999865055084
+      Pitch: 0.5653998255729675
       Target Frame: <Fixed Frame>
-      Yaw: 4.538604736328125
+      Yaw: 4.948606967926025
     Saved: ~
 Window Geometry:
   Displays:
@@ -457,5 +465,5 @@ Window Geometry:
     collapsed: false
   QMainWindow State: 000000ff00000000fd000000010000000000000185000002c6fc0200000002fb000000100044006900730070006c006100790073010000003d000002c6000000c900fffffffb0000000a0049006d006100670065000000020d000000f60000001600ffffff00000325000002c600000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Width: 1200
-  X: 2542
-  Y: 27
+  X: 2476
+  Y: 122

@@ -3,6 +3,7 @@ import time
 
 import rospy
 from controller_manager_msgs.srv import ListControllers
+from std_msgs.msg import Float64MultiArray
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
@@ -14,6 +15,7 @@ class HomingHoldPublisher:
             "~controller_name", "position_joint_trajectory_controller")
         self.command_topic = rospy.get_param(
             "~command_topic", f"/{self.controller_name}/command")
+        self.command_type = rospy.get_param("~command_type", "trajectory")
         self.wait_timeout = float(rospy.get_param("~wait_timeout", 20.0))
         self.publish_repeats = int(rospy.get_param("~publish_repeats", 20))
         self.publish_period = float(rospy.get_param("~publish_period", 0.05))
@@ -38,7 +40,13 @@ class HomingHoldPublisher:
             0.785511,
         ])
 
-        self.pub = rospy.Publisher(self.command_topic, JointTrajectory, queue_size=1)
+        if self.command_type == "trajectory":
+            msg_type = JointTrajectory
+        elif self.command_type == "group_position":
+            msg_type = Float64MultiArray
+        else:
+            raise ValueError(f"Unsupported homing command_type: {self.command_type}")
+        self.pub = rospy.Publisher(self.command_topic, msg_type, queue_size=1)
 
     def wait_for_controller(self):
         rospy.wait_for_service("/controller_manager/list_controllers", timeout=self.wait_timeout)
@@ -55,6 +63,9 @@ class HomingHoldPublisher:
         return False
 
     def hold_message(self):
+        if self.command_type == "group_position":
+            return Float64MultiArray(data=list(self.homing_position))
+
         msg = JointTrajectory()
         msg.header.stamp = rospy.Time.now() + rospy.Duration(self.lead_time)
         msg.joint_names = list(self.joint_names)

@@ -28,6 +28,7 @@ class PerceptionProcessingNode:
 
         self.crop_min = rospy.get_param("~crop_min", [0.0, -0.6, 0.0])
         self.crop_max = rospy.get_param("~crop_max", [0.8, 0.6, 1.0])
+        self.log_timing = bool(rospy.get_param("~log_timing", True))
 
         self.raw_obstacles = None
 
@@ -68,7 +69,8 @@ class PerceptionProcessingNode:
 
                     header = Header(stamp=rospy.Time.now(), frame_id="world")
                     self.cleaned_pub.publish(pc2.create_cloud_xyz32(header, pts_filtered_np.tolist()))
-                    rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] Perception Filter (Crop + ROR): {(time.perf_counter() - t0)*1000:.2f} ms")
+                    if self.log_timing:
+                        rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] Perception Filter (Crop + ROR): {(time.perf_counter() - t0)*1000:.2f} ms")
                 except Exception as e:
                     rospy.logerr_throttle(5.0, f"Error in perception run loop: {e}")
 

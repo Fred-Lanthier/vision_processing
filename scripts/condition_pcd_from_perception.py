@@ -31,7 +31,12 @@ class ConditionPcdFromPerception:
         self.num_points = rospy.get_param("~num_points", 1024)
         self.target_cloud = None
         self.target_stamp = None
-        self.target_timeout = rospy.get_param("~target_timeout", 2.0)
+        self.target_timeout = float(rospy.get_param("~target_timeout", 2.0))
+        self.target_hold_max_age = float(rospy.get_param("~target_hold_max_age", 0.0))
+        hold_last_target = rospy.get_param("~hold_last_target_on_loss", False)
+        if isinstance(hold_last_target, str):
+            hold_last_target = hold_last_target.lower() in ("1", "true", "yes", "on")
+        self.hold_last_target_on_loss = bool(hold_last_target)
         self.fork_cloud_cache = None
         self.last_joint_hash = None
 
@@ -57,6 +62,24 @@ class ConditionPcdFromPerception:
         self.rate = rospy.Rate(30)
         rospy.loginfo("🚀 Condition PCD from Perception Node PRÊT")
 
+    def stable_sample(self, points, count):
+        """Deterministic spatial sampling to avoid planner jitter from RNG."""
+        if points is None or points.shape[0] == 0 or count <= 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.shape[0] > count:
+            order = np.lexsort((pts[:, 2], pts[:, 1], pts[:, 0]))
+            ordered = pts[order]
+            idx = np.linspace(0, ordered.shape[0] - 1, count, dtype=np.int64)
+            return ordered[idx]
+
+        if pts.shape[0] < count:
+            idx = np.arange(count, dtype=np.int64) % pts.shape[0]
+            return pts[idx]
+
+        return pts
+
     def target_callback(self, msg):
         try:
             points = np.frombuffer(msg.data, dtype=np.float32).reshape(-1, int(msg.point_step/4))
@@ -65,7 +88,7 @@ class ConditionPcdFromPerception:
                 self.target_cloud = pts_3d
                 self.target_stamp = rospy.get_time()
             # If the cloud is empty, we do not immediately clear it.
-            # We allow the run() loop's target_timeout to handle expiration.
+            # The run() loop applies the configured loss policy.
         except Exception as e:
             rospy.logerr_throttle(5, f"Error reading target cloud: {e}")
 
@@ -104,23 +127,47 @@ class ConditionPcdFromPerception:
         pts_per_object = self.num_points // 2
         
         while not rospy.is_shutdown():
-            # Expire stale target so a lost SAM2 mask doesn't keep guiding the planner
-            if self.target_stamp is not None and (rospy.get_time() - self.target_stamp) > self.target_timeout:
-                self.target_cloud = None
-                self.target_stamp = None
-                rospy.logwarn_throttle(5.0, "Target cloud expired (no update for %.1fs) — waiting for detection." % self.target_timeout)
+            # Expire stale target unless the launch explicitly asks to keep using
+            # the last valid target cloud while SAM2/SAM3 tracking is lost.
+            if self.target_stamp is not None and self.target_timeout > 0.0:
+                target_age = rospy.get_time() - self.target_stamp
+                if target_age > self.target_timeout:
+                    hold_allowed = (
+                        self.hold_last_target_on_loss
+                        and (
+                            self.target_hold_max_age <= 0.0
+                            or target_age <= self.target_hold_max_age
+                        )
+                    )
+                    if hold_allowed:
+                        rospy.logwarn_throttle(
+                            5.0,
+                            "Target detection stale for %.1fs; continuing with last valid target cloud.",
+                            target_age,
+                        )
+                    elif self.hold_last_target_on_loss:
+                        self.target_cloud = None
+                        self.target_stamp = None
+                        rospy.logwarn_throttle(
+                            5.0,
+                            "Target hold expired after %.1fs; waiting for detection.",
+                            target_age,
+                        )
+                    else:
+                        self.target_cloud = None
+                        self.target_stamp = None
+                        rospy.logwarn_throttle(
+                            5.0,
+                            "Target cloud expired (no update for %.1fs); waiting for detection.",
+                            self.target_timeout,
+                        )
 
             # Only proceed if we have BOTH the fork component AND the target detection
             if self.fork_cloud_cache is not None and self.target_cloud is not None:
                 merged = []
                 
                 # 1. Robot points (Fork)
-                pts = self.fork_cloud_cache
-                if pts.shape[0] > pts_per_object:
-                    idx = np.random.choice(pts.shape[0], pts_per_object, replace=False)
-                    merged.append(pts[idx])
-                else:
-                    merged.append(pts)
+                merged.append(self.stable_sample(self.fork_cloud_cache, pts_per_object))
                 
                 # 2. Target points (Cube)
                 # PUBLISH DISTANCE
@@ -128,23 +175,13 @@ class ConditionPcdFromPerception:
                 min_dist = np.min(dists)
                 self.pub_dist.publish(Float32(data=min_dist))
 
-                pts = self.target_cloud
-                if pts.shape[0] > pts_per_object:
-                    idx = np.random.choice(pts.shape[0], pts_per_object, replace=False)
-                    merged.append(pts[idx])
-                else:
-                    merged.append(pts)
+                merged.append(self.stable_sample(self.target_cloud, pts_per_object))
                 
                 # 3. Assemble and Pad/Sample
                 if len(merged) > 0:
                     full_cloud = np.vstack(merged)
                     
-                    if full_cloud.shape[0] > self.num_points:
-                        idx = np.random.choice(full_cloud.shape[0], self.num_points, replace=False)
-                        full_cloud = full_cloud[idx]
-                    elif full_cloud.shape[0] < self.num_points and full_cloud.shape[0] > 0:
-                        extra_idx = np.random.choice(full_cloud.shape[0], self.num_points - full_cloud.shape[0], replace=True)
-                        full_cloud = np.vstack([full_cloud, full_cloud[extra_idx]])
+                    full_cloud = self.stable_sample(full_cloud, self.num_points)
                     
                     self.publish_cloud(full_cloud)
             elif self.fork_cloud_cache is None:

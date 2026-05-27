@@ -33,14 +33,17 @@ class TrajectoryControllerBridge:
         self.rate_hz      = float(rospy.get_param('~rate_hz',       20.0))
         self.out_topic    = rospy.get_param('~out_topic',
                                             '/position_joint_trajectory_controller/command')
-        self.horizon_points = max(int(rospy.get_param('~horizon_points', 3)), 2)
+        self.horizon_points = max(int(rospy.get_param('~horizon_points', 3)), 1)
         self.point_dt     = float(rospy.get_param('~point_dt',      0.05))
         self.lead_time    = float(rospy.get_param('~lead_time',     0.06))
         self.command_timeout = float(rospy.get_param('~command_timeout', 0.5))
+        self.publish_velocities = bool(rospy.get_param('~publish_velocities', True))
+        self.max_velocity = float(rospy.get_param('~max_velocity', 1.0))
         self.hold_current_until_command = bool(rospy.get_param(
             '~hold_current_until_command', True))
         self.hold_when_stale = bool(rospy.get_param('~hold_when_stale', True))
         self.hold_duration = float(rospy.get_param('~hold_duration', 0.25))
+        self.log_events = bool(rospy.get_param('~log_events', True))
 
         self.q_current  = None   # latest robot state from /joint_states
         self.q_safe     = None   # latest CBF-safe target from /planner/safe_joint_command
@@ -59,13 +62,15 @@ class TrajectoryControllerBridge:
         self.pub = rospy.Publisher(self.out_topic, JointTrajectory, queue_size=1)
         rospy.Timer(rospy.Duration(1.0 / self.rate_hz), self._loop)
 
-        rospy.loginfo(
-            'trajectory_controller_bridge ready: %s -> %s at %.1f Hz '
-            'horizon=%d point_dt=%.3fs lead_time=%.3fs timeout=%.2fs '
-            'startup_hold=%s stale_hold=%s',
-            self.in_topic, self.out_topic, self.rate_hz, self.horizon_points,
-            self.point_dt, self.lead_time, self.command_timeout,
-            self.hold_current_until_command, self.hold_when_stale)
+        if self.log_events:
+            rospy.loginfo(
+                'trajectory_controller_bridge ready: %s -> %s at %.1f Hz '
+                'horizon=%d point_dt=%.3fs lead_time=%.3fs timeout=%.2fs '
+                'velocities=%s max_vel=%.2f startup_hold=%s stale_hold=%s',
+                self.in_topic, self.out_topic, self.rate_hz, self.horizon_points,
+                self.point_dt, self.lead_time, self.command_timeout,
+                self.publish_velocities, self.max_velocity,
+                self.hold_current_until_command, self.hold_when_stale)
 
     def _joint_cb(self, msg):
         pos = {n: p for n, p in zip(msg.name, msg.position)}
@@ -80,7 +85,7 @@ class TrajectoryControllerBridge:
             self.q_safe = np.array(msg.data[:7], dtype=np.float64)
             self.t_safe = rospy.Time.now()
             self._stale_logged = False
-            if not self._logged_first_safe:
+            if self.log_events and not self._logged_first_safe:
                 if self.q_current is None:
                     err = float('nan')
                 else:
@@ -103,7 +108,7 @@ class TrajectoryControllerBridge:
         if self.t_safe is not None:
             age = (rospy.Time.now() - self.t_safe).to_sec()
             if age > self.command_timeout:
-                if not self._stale_logged:
+                if self.log_events and not self._stale_logged:
                     rospy.logwarn(
                         'trajectory_controller_bridge stopping: last safe command is %.3fs old',
                         age)
@@ -113,27 +118,41 @@ class TrajectoryControllerBridge:
                 return
 
         msg = JointTrajectory()
-        msg.header.stamp = rospy.Time.now() + rospy.Duration(self.lead_time)
+        if self.lead_time > 0.0:
+            msg.header.stamp = rospy.Time.now() + rospy.Duration(self.lead_time)
+        else:
+            # A zero stamp asks JointTrajectoryController to start immediately.
+            # Re-stamping a rolling command in the future at high rate can keep
+            # pushing the trajectory start ahead of the controller.
+            msg.header.stamp = rospy.Time(0)
         msg.joint_names  = JOINT_NAMES
 
-        # Point 0 is scheduled in the near future, avoiding "point occurs before
-        # current time" drops while keeping the controller anchored at the
-        # measured state.
+        # Anchor the rolling trajectory at the measured state.
         p0 = JointTrajectoryPoint()
         p0.positions       = self.q_current.tolist()
         p0.time_from_start = rospy.Duration(0.0)
-        msg.points.append(p0)
 
         # Points 1..horizon: linearly interpolate from current state to CBF target.
         # Spreading the motion over horizon_points * point_dt seconds gives the
         # controller a smooth path rather than a single hard step.
         q0 = self.q_current
         q1 = self.q_safe
+        horizon_duration = max(self.horizon_points * self.point_dt, 1e-6)
+        qdot = (q1 - q0) / horizon_duration
+        qdot_norm = float(np.linalg.norm(qdot))
+        if self.max_velocity > 0.0 and qdot_norm > self.max_velocity:
+            qdot *= self.max_velocity / (qdot_norm + 1e-9)
+        if self.publish_velocities:
+            p0.velocities = qdot.tolist()
+        msg.points.append(p0)
+
         for i in range(1, self.horizon_points + 1):
             alpha = i / self.horizon_points
             pt = JointTrajectoryPoint()
             pt.positions       = (q0 + alpha * (q1 - q0)).tolist()
             pt.time_from_start = rospy.Duration(i * self.point_dt)
+            if self.publish_velocities:
+                pt.velocities = qdot.tolist()
             msg.points.append(pt)
 
         self.pub.publish(msg)
@@ -148,16 +167,23 @@ class TrajectoryControllerBridge:
 
     def _publish_hold(self, reason):
         msg = JointTrajectory()
-        msg.header.stamp = rospy.Time.now() + rospy.Duration(self.lead_time)
+        if self.lead_time > 0.0:
+            msg.header.stamp = rospy.Time.now() + rospy.Duration(self.lead_time)
+        else:
+            msg.header.stamp = rospy.Time(0)
         msg.joint_names = JOINT_NAMES
 
         p0 = JointTrajectoryPoint()
         p0.positions = self.q_hold.tolist()
+        if self.publish_velocities:
+            p0.velocities = [0.0] * len(JOINT_NAMES)
         p0.time_from_start = rospy.Duration(0.0)
         msg.points.append(p0)
 
         p1 = JointTrajectoryPoint()
         p1.positions = self.q_hold.tolist()
+        if self.publish_velocities:
+            p1.velocities = [0.0] * len(JOINT_NAMES)
         p1.time_from_start = rospy.Duration(self.hold_duration)
         msg.points.append(p1)
 

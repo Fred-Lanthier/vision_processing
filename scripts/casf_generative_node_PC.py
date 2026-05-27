@@ -15,10 +15,37 @@ from sensor_msgs.msg import JointState, PointCloud2
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, Pose, PoseArray
-from std_msgs.msg import Header, Float64MultiArray
+from std_msgs.msg import Bool, Header, Float64MultiArray
 import sensor_msgs.point_cloud2 as pc2
 from scipy.spatial.transform import Rotation as R
 from scipy.interpolate import interp1d
+
+
+def _bool_param(name, default=False):
+    value = rospy.get_param(name, default)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def stable_numpy_sample(points, count):
+    """Deterministic point selection/padding for stable planner inputs."""
+    if points is None or len(points) == 0 or count <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    n_pts = len(points)
+    if n_pts > count:
+        score = points[:, 0] * 1.0e6 + points[:, 1] * 1.0e3 + points[:, 2]
+        order = np.argsort(score, kind="mergesort")
+        take = np.linspace(0, n_pts - 1, count, dtype=np.int64)
+        return points[order[take]]
+
+    if n_pts < count:
+        idx = np.arange(count, dtype=np.int64) % n_pts
+        return points[idx]
+
+    return points
+
 
 # ==============================================================
 # TEMPORAL ENSEMBLER
@@ -232,11 +259,12 @@ class CASFGenerativeNode:
         self.casf_spatial_max_obstacles = int(rospy.get_param("~casf_spatial_max_obstacles", 100))
         self.check_finite_debug = bool(rospy.get_param("~check_finite_debug", False))
         self.merged_cloud_contains_fork = rospy.get_param("~merged_cloud_contains_fork", True)
-        self.single_shot = rospy.get_param("~single_shot", True)
+        self.single_shot = _bool_param("~single_shot", True)
         self.tcp_frame = rospy.get_param("~tcp_frame", "panda_TCP")
         # CASF ODE parameters (improvement #1: read once, not per-iteration)
         self.casf_kappa = float(rospy.get_param("~casf_kappa", 50.0))
         self.casf_alpha = float(rospy.get_param("~casf_alpha", 5.0))
+        self.enable_casf_correction = _bool_param("~enable_casf_correction", True)
         # Improvement #3: correction / prediction step counts exposed as params
         self.n_pred = int(rospy.get_param("~n_pred", 5))
         self.n_corr = int(rospy.get_param("~n_corr", 5))
@@ -253,6 +281,14 @@ class CASFGenerativeNode:
         self.trajectory_waypoint_dt = 1.0 / self.trajectory_waypoint_rate_hz
         self.ensembler_buffer_size = max(1, int(rospy.get_param("~ensembler_buffer_size", 3)))
         self.ensembler_decay = float(rospy.get_param("~ensembler_decay", 1.0))
+        self.use_temporal_ensembler = _bool_param("~use_temporal_ensembler", False)
+        self.anchor_cartesian_start = _bool_param("~anchor_cartesian_start", False)
+        self.log_planner_cartesian_debug = _bool_param("~log_planner_cartesian_debug", False)
+        self.fm_noise_seed = int(rospy.get_param("~fm_noise_seed", 7))
+        self.log_trajectory_timing = _bool_param("~log_trajectory_timing", True)
+        self.wait_for_cbf_ready = _bool_param("~wait_for_cbf_ready", True)
+        self.cbf_ready = not self.wait_for_cbf_ready
+        self.plan_seq = 0
         self.plan_published = False
         self.is_committed = False
         self.fork_food_distance = float('inf')
@@ -269,8 +305,9 @@ class CASFGenerativeNode:
         # 5. Subscribers & Publishers
         rospy.Subscriber('/joint_states', JointState, self.joint_callback)
         rospy.Subscriber('/joint_group_position_controller/command', Float64MultiArray, self.command_callback)
-        rospy.Subscriber('/perception/cleaned_obstacles', PointCloud2, self.obstacle_callback)
+        rospy.Subscriber('/perception/persistent_obstacles', PointCloud2, self.obstacle_callback)
         rospy.Subscriber('/vision/merged_cloud', PointCloud2, self.cloud_callback)
+        rospy.Subscriber('/cbf_safety/ready', Bool, self.cbf_ready_callback)
         from std_msgs.msg import Float32
         rospy.Subscriber('/vision/fork_food_distance', Float32, self.dist_callback)
         
@@ -282,12 +319,55 @@ class CASFGenerativeNode:
         rospy.Timer(rospy.Duration(1.0 / self.planner_rate_hz), self.control_loop)
         rospy.loginfo(
             "🚀 Safe Generative Planner Node Initialized | planner=%.2fHz waypoint=%.2fHz "
-            "pred_horizon=%d commit_distance=%.3fm",
+            "pred_horizon=%d commit_distance=%.3fm casf_correction=%s",
             self.planner_rate_hz,
             self.trajectory_waypoint_rate_hz,
             self.pred_horizon,
             self.commit_distance,
+            self.enable_casf_correction,
         )
+
+    def cbf_ready_callback(self, msg):
+        if msg.data and not self.cbf_ready:
+            rospy.loginfo("[TRAJ TIMING] CBF ready received; planner may publish trajectories.")
+        self.cbf_ready = bool(msg.data)
+
+    def stable_torch_sample(self, points, count):
+        """Deterministic point selection/padding for stable FM conditioning."""
+        if points is None or int(points.shape[0]) == 0 or count <= 0:
+            return torch.empty((0, 3), dtype=torch.float32, device=self.device)
+
+        pts = points
+        n_pts = int(pts.shape[0])
+        if n_pts > count:
+            # Deterministic pseudo-lexicographic order. This is intentionally
+            # simple and cheap; the upstream point cloud is already spatially
+            # filtered and approximately uniform.
+            score = pts[:, 0] * 1.0e6 + pts[:, 1] * 1.0e3 + pts[:, 2]
+            order = torch.argsort(score)
+            take = torch.linspace(
+                0, n_pts - 1, count, device=pts.device, dtype=torch.float32
+            ).long()
+            return pts[order[take]]
+
+        if n_pts < count:
+            idx = torch.arange(count, device=pts.device, dtype=torch.long) % n_pts
+            return pts[idx]
+
+        return pts
+
+    def initial_fm_noise(self, batch_size, horizon, action_dim):
+        if self.fm_noise_seed < 0:
+            return torch.randn(batch_size, horizon, action_dim, device=self.device)
+
+        cuda_devices = []
+        if self.device.type == "cuda":
+            cuda_devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()]
+        with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+            torch.manual_seed(self.fm_noise_seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed_all(self.fm_noise_seed)
+            return torch.randn(batch_size, horizon, action_dim, device=self.device)
 
     def command_callback(self, msg):
         try:
@@ -321,8 +401,7 @@ class CASFGenerativeNode:
             points = np.frombuffer(msg.data, dtype=np.float32).reshape(-1, int(msg.point_step/4))
             points = points[:, :3] # Take only X, Y, Z
             if len(points) > self.obstacle_pre_sample_max:
-                idx = np.random.choice(len(points), self.obstacle_pre_sample_max, replace=False)
-                points = points[idx]
+                points = stable_numpy_sample(points, self.obstacle_pre_sample_max)
             self.obstacle_pts_gpu = torch.from_numpy(points.copy()).float().to(self.device)
         except Exception as e:
             rospy.logerr_throttle(5.0, f"Error unpacking obstacles: {e}")
@@ -338,12 +417,7 @@ class CASFGenerativeNode:
                 self.latest_cloud_gpu = None
                 return
                 
-            if len(points) > self.num_points_pcd:
-                idx = np.random.choice(len(points), self.num_points_pcd, replace=False)
-                points = points[idx]
-            elif len(points) < self.num_points_pcd and len(points) > 0:
-                extra = np.random.choice(len(points), self.num_points_pcd - len(points), replace=True)
-                points = np.concatenate([points, points[extra]], axis=0)
+            points = stable_numpy_sample(points, self.num_points_pcd)
             
             if len(points) > 0:
                 self.latest_cloud_gpu = torch.from_numpy(points.copy()).float().to(self.device)
@@ -358,6 +432,12 @@ class CASFGenerativeNode:
             
         if self.is_committed:
             # We already published the open-loop strike, do not replan.
+            return
+
+        if not self.cbf_ready:
+            rospy.loginfo_throttle(
+                2.0,
+                "Waiting for CBF ready before publishing planner trajectory...")
             return
 
         if self.current_q is None or self.latest_cloud_gpu is None:
@@ -409,14 +489,10 @@ class CASFGenerativeNode:
         if not self.merged_cloud_contains_fork:
             pcd_merged_centered = torch.cat([pcd_merged_centered, self.fork_pts_local], dim=0)
         
-        # Sample / Pad to fixed size
-        num_pts = pcd_merged_centered.shape[0]
-        if num_pts > self.num_points_pcd:
-            idx = torch.randperm(num_pts, device=self.device)[:self.num_points_pcd]
-            pcd_final_centered = pcd_merged_centered[idx]
-        else:
-            pad_idx = torch.randint(0, num_pts, (self.num_points_pcd - num_pts,), device=self.device)
-            pcd_final_centered = torch.cat([pcd_merged_centered, pcd_merged_centered[pad_idx]], dim=0)
+        # Sample / pad deterministically. Random point resampling changes the
+        # model input enough to make a receding-horizon FM policy flip modes.
+        pcd_final_centered = self.stable_torch_sample(
+            pcd_merged_centered, self.num_points_pcd)
         
         obs_dict = {
             'point_cloud': pcd_final_centered.unsqueeze(0),
@@ -437,7 +513,7 @@ class CASFGenerativeNode:
             A = self.generate_safe_trajectory(obs_dict, pos_fork, self.obstacle_pts_gpu, q_source)
             if A is not None and not (self.check_finite_debug and torch.isnan(A).any()):
                 # Check for Commit Mode
-                use_ensembler = True
+                use_ensembler = self.use_temporal_ensembler
                 if self.fork_food_distance < self.commit_distance:
                     rospy.loginfo(f"🔒 COMMIT MODE (d={self.fork_food_distance*1000:.1f}mm) — executing final strike open-loop")
                     self.is_committed = True
@@ -538,8 +614,10 @@ class CASFGenerativeNode:
         # ---------------------------------------------------------
         # PHASE 1: PREDICTION (Pure Denoising)
         # ---------------------------------------------------------
-        # Start from pure noise
-        A = torch.randn(B, H, self.action_dim, device=dev)
+        # Start from pure noise. In servo mode the noise is fixed by default so
+        # repeated replans do not choose different left/right modes for the same
+        # scene.
+        A = self.initial_fm_noise(B, H, self.action_dim)
         dt_pred = 1.0 / N_PRED
         
         t_start = time.perf_counter()
@@ -584,7 +662,7 @@ class CASFGenerativeNode:
         t_ik_total = 0.0
         t_casf_total = 0.0
         
-        if P_obs is not None and P_obs.shape[0] > 0:
+        if self.enable_casf_correction and P_obs is not None and P_obs.shape[0] > 0:
             if P_obs.shape[0] > self.planner_cbf_max_obstacles:
                 with torch.no_grad():
                     dist_to_fork = torch.norm(P_obs - curr_pos, dim=1)
@@ -737,11 +815,13 @@ class CASFGenerativeNode:
         self._q_warm = q_warm
 
         t_total = time.perf_counter() - t_start
-        rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] PC-CASF Plan generated in {t_total*1000:.2f}ms | FM Encode={t_fm_encode*1000:.2f}ms, Pred FM={t_fm_pred*1000:.2f}ms, Corr FM={t_fm_corr*1000:.2f}ms, IK={t_ik_total*1000:.2f}ms, CASF={t_casf_total*1000:.2f}ms")
+        plan_label = "PC-CASF" if self.enable_casf_correction else "PC-FM"
+        rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] {plan_label} Plan generated in {t_total*1000:.2f}ms | FM Encode={t_fm_encode*1000:.2f}ms, Pred FM={t_fm_pred*1000:.2f}ms, Corr FM={t_fm_corr*1000:.2f}ms, IK={t_ik_total*1000:.2f}ms, CASF={t_casf_total*1000:.2f}ms")
         return A
 
     def publish_joint_trajectory(self, A_norm, pos_fork, q_source, t_capture, use_ensembler=True):
         """Publish full joint trajectory for the safety shield."""
+        t_build_start = time.perf_counter()
         current_time = rospy.get_time()
         
         A_unnorm = self.normalizer.unnormalize(A_norm)
@@ -749,6 +829,7 @@ class CASFGenerativeNode:
         # pos_fork is already a torch tensor from control_loop
         A_world[..., :3] += pos_fork
         A_world_np = A_world.squeeze(0).detach().cpu().numpy()
+        raw_traj_np = A_world_np.copy()
         
         if use_ensembler:
             # We add the prediction tagged with the time the point cloud was captured
@@ -765,15 +846,37 @@ class CASFGenerativeNode:
                 smoothed_traj_np = A_world_np
         else:
             smoothed_traj_np = A_world_np
+        ensembled_traj_np = smoothed_traj_np.copy()
 
-        # Smoothly anchor the trajectory to start exactly at the current physical fork tip position.
-        # This prevents initial joint velocity jumps and safety holds.
         current_fork_pos = pos_fork.detach().cpu().numpy()
-        start_offset = smoothed_traj_np[0, :3] - current_fork_pos
-        H_traj = smoothed_traj_np.shape[0]
-        for i in range(H_traj):
-            decay = 1.0 - float(i) / float(H_traj)
-            smoothed_traj_np[i, :3] -= start_offset * decay
+        if self.anchor_cartesian_start:
+            # Optional legacy behavior. It removes Cartesian start error, but
+            # it also bends the model path. Keep it off when diagnosing FM
+            # trajectory geometry.
+            start_offset = smoothed_traj_np[0, :3] - current_fork_pos
+            H_traj = smoothed_traj_np.shape[0]
+            for i in range(H_traj):
+                decay = 1.0 - float(i) / float(H_traj)
+                smoothed_traj_np[i, :3] -= start_offset * decay
+        anchored_traj_np = smoothed_traj_np.copy()
+
+        if self.log_planner_cartesian_debug:
+            rospy.loginfo_throttle(
+                0.5,
+                "FM CART DEBUG | use_ens=%s cart_anchor=%s fork=[%.3f %.3f %.3f] "
+                "raw0=[%.3f %.3f %.3f] rawN=[%.3f %.3f %.3f] "
+                "ens0=[%.3f %.3f %.3f] ensN=[%.3f %.3f %.3f] "
+                "anch0=[%.3f %.3f %.3f] anchN=[%.3f %.3f %.3f]",
+                use_ensembler,
+                self.anchor_cartesian_start,
+                current_fork_pos[0], current_fork_pos[1], current_fork_pos[2],
+                raw_traj_np[0, 0], raw_traj_np[0, 1], raw_traj_np[0, 2],
+                raw_traj_np[-1, 0], raw_traj_np[-1, 1], raw_traj_np[-1, 2],
+                ensembled_traj_np[0, 0], ensembled_traj_np[0, 1], ensembled_traj_np[0, 2],
+                ensembled_traj_np[-1, 0], ensembled_traj_np[-1, 1], ensembled_traj_np[-1, 2],
+                anchored_traj_np[0, 0], anchored_traj_np[0, 1], anchored_traj_np[0, 2],
+                anchored_traj_np[-1, 0], anchored_traj_np[-1, 1], anchored_traj_np[-1, 2],
+            )
             
         # ================= NO INTERPOLATION =================
         # Preserve the model trajectory to maintain the learned Cartesian lookahead distance.
@@ -812,7 +915,11 @@ class CASFGenerativeNode:
         current_fork_pos = pos_fork.detach().cpu().numpy()
         first_pos_err = np.linalg.norm(se3_fork_list[0][:3, 3] - current_fork_pos)
         last_pos_err = np.linalg.norm(se3_fork_list[-1][:3, 3] - current_fork_pos)
-        log_fn = rospy.logwarn if first_pos_err > 0.01 else rospy.logdebug
+        log_fn = (
+            rospy.logwarn
+            if self.anchor_cartesian_start and first_pos_err > 0.01
+            else rospy.logdebug
+        )
         log_fn(
             "PUBLISHED NOMINAL START | first_from_current=%.4f m last_from_current=%.4f m "
             "current=[%.3f %.3f %.3f] first=[%.3f %.3f %.3f] last=[%.3f %.3f %.3f]",
@@ -834,7 +941,9 @@ class CASFGenerativeNode:
         if len(q_init) == 7:
             q_init = np.concatenate([q_init, [0.0, 0.0]])
             
+        t_ik_start = time.perf_counter()
         q_traj = self.ik_solver.solve_batch(se3_tcp_list, q_init)
+        t_publish_ik = time.perf_counter() - t_ik_start
         
         if len(q_traj) == 0: return
         
@@ -845,6 +954,10 @@ class CASFGenerativeNode:
             # Wrap diff to [-pi, pi]
             diff = (diff + np.pi) % (2 * np.pi) - np.pi
             q_traj[i] = prev + diff
+
+        # Publish the measured current joints as waypoint 0 so every nominal
+        # trajectory starts continuously without warping the Cartesian FM path.
+        q_traj[0][:7] = q_init[:7]
 
         first_joint_err = np.linalg.norm(q_traj[0][:7] - q_init[:7])
         log_fn = rospy.logwarn if first_joint_err > 0.1 else rospy.logdebug
@@ -921,6 +1034,8 @@ class CASFGenerativeNode:
         self.fork_pose_traj_pub.publish(pose_array)
         
         msg = JointTrajectory()
+        self.plan_seq += 1
+        msg.header.seq = self.plan_seq
         msg.header.stamp = rospy.Time.now()
         msg.header.frame_id = "world"
         msg.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
@@ -932,6 +1047,36 @@ class CASFGenerativeNode:
             msg.points.append(point)
             
         self.traj_pub.publish(msg)
+        if self.log_trajectory_timing:
+            if len(q_traj) > 1:
+                q_arm = np.asarray(q_traj)[:, :7]
+                segment_lengths = np.linalg.norm(np.diff(q_arm, axis=0), axis=1)
+                joint_path = float(np.sum(segment_lengths))
+                first_step = float(segment_lengths[0])
+                max_step = float(np.max(segment_lengths))
+            else:
+                joint_path = 0.0
+                first_step = 0.0
+                max_step = 0.0
+            expected_duration = (
+                msg.points[-1].time_from_start.to_sec()
+                if msg.points else 0.0
+            )
+            rospy.loginfo(
+                "[TRAJ TIMING] published id=%d points=%d expected_duration=%.3fs "
+                "waypoint_dt=%.3fs capture_to_publish=%.3fs build=%.1fms "
+                "publish_ik=%.1fms joint_path=%.3frad first_step=%.3frad max_step=%.3frad",
+                self.plan_seq,
+                len(msg.points),
+                expected_duration,
+                self.trajectory_waypoint_dt,
+                rospy.get_time() - t_capture,
+                (time.perf_counter() - t_build_start) * 1000.0,
+                t_publish_ik * 1000.0,
+                joint_path,
+                first_step,
+                max_step,
+            )
 
     def run(self):
         rospy.spin()

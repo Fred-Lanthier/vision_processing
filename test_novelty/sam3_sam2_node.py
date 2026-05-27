@@ -51,6 +51,7 @@ class Sam3Sam2Node:
         self.obstacle_prompt = rospy.get_param("~obstacle_prompt", "person")
         self.tracking_rate_hz = float(rospy.get_param("~tracking_rate_hz", 5.0))
         self.sam2_max_side_length = rospy.get_param("~sam2_max_side_length", None)
+        self.log_timing = bool(rospy.get_param("~log_timing", True))
         
         self.target_frame = rospy.get_param("~target_frame", "world")
         self.camera_frame = rospy.get_param("~camera_frame", "camera_wrist_optical_frame")
@@ -202,7 +203,8 @@ class Sam3Sam2Node:
                         self.pub_debug.publish(msg_out)
                 
                 self.frame_idx += 1
-                rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] SAM2 Tracking: {(time.perf_counter() - t0)*1000:.2f} ms")
+                if self.log_timing:
+                    rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] SAM2 Tracking: {(time.perf_counter() - t0)*1000:.2f} ms")
             except Exception as e:
                 rospy.logerr_throttle(1.0, f"Erreur AI: {e}")
             rate.sleep()

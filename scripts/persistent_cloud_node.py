@@ -27,7 +27,7 @@ from scipy.spatial.transform import Rotation
 from cv_bridge import CvBridge
 
 sys.path.insert(0, os.path.dirname(__file__))
-from PersistentCloud import WorldCloud
+from PersistentCloud import WorldCloud, _to_hashes
 
 
 # ── Shared helper ─────────────────────────────────────────────────────────────
@@ -129,6 +129,7 @@ class PersistentCloudNode:
         self.obs_max_pts       = obs_max_voxels
         self.camera_frame      = rospy.get_param("~camera_frame", "camera_wrist_optical_frame")
         self.world_frame       = rospy.get_param("~world_frame",  "world")
+        self.log_counts        = bool(rospy.get_param("~log_counts", True))
 
         # ── Robot self-filter ─────────────────────────────────────────────────
         # Removes depth-projected points on robot body links before integration.
@@ -137,7 +138,38 @@ class PersistentCloudNode:
             'panda_link0', 'panda_link1', 'panda_link2', 'panda_link3',
             'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7'
         ]
-        self.robot_body_radius = float(rospy.get_param("~robot_body_radius", 0.07))
+        # Reduced from 0.07 — cleaned_obstacles already has accurate SDF self-filter;
+        # this sphere catch-all at 3 cm only removes residual self-projections on the
+        # arm links, without erasing bowl-rim points near link7 during close approach.
+        self.robot_body_radius = float(rospy.get_param("~robot_body_radius", 0.03))
+        # Publish dilation: add 6 face-adjacent voxel-center offsets at publish time.
+        # Fills gaps between observed surface samples without bloating stored state.
+        self.dilate_published_cloud = bool(rospy.get_param("~dilate_published_cloud", True))
+        # Target exclusion sphere: any obs_world point within this radius of the
+        # target centroid is treated as target, not obstacle.  Applied at:
+        #   1. integration time (never stored in obs_world)
+        #   2. target-update time (evict already-stored contaminated voxels)
+        #   3. publish time (O(N) centroid-sphere guard, replaces O(N×M) pairwise)
+        # Minimum exclusion sphere radius (hard floor — never go below this).
+        # The actual radius used at runtime is the 95th-percentile distance from
+        # the target centroid to its own point cloud, plus one voxel of margin.
+        # This adapts automatically to the target's physical size so neither the
+        # cube surface nor the close bowl rim are treated as obstacles.
+        self.target_exclusion_radius_min = float(rospy.get_param("~target_exclusion_radius", 0.005))
+        self._tgt_exclusion_radius = self.target_exclusion_radius_min  # updated each target frame
+        self._tgt_centroid = None   # latest target centroid in world frame
+
+        # Synthetic floor under the target: fills the depth-occluded region
+        # below the food so the CBF cannot drive the fork too deep.
+        # Height is inferred from obstacle ring points just outside the exclusion
+        # sphere at the base of the target.  Points are added only to the
+        # published cloud — obs_world is never modified.
+        self.generate_synthetic_floor  = bool(rospy.get_param("~generate_synthetic_floor", True))
+        self.floor_sample_radius       = float(rospy.get_param("~floor_sample_radius",    0.12))
+        self.floor_grid_radius         = float(rospy.get_param("~floor_grid_radius",      0.05))
+        self.floor_grid_resolution     = float(rospy.get_param("~floor_grid_resolution",  obs_voxel_size))
+        self.floor_height_percentile   = float(rospy.get_param("~floor_height_percentile", 15.0))
+
         self._body_link_pos    = None   # [K, 3], updated each depth frame
 
         # ── Obstacle accumulator ──────────────────────────────────────────────
@@ -172,6 +204,13 @@ class PersistentCloudNode:
 
         self.pub        = rospy.Publisher('/perception/persistent_obstacles', PointCloud2, queue_size=1)
         self.target_pub = rospy.Publisher('/perception/persistent_target',    PointCloud2, queue_size=1)
+
+        # Publish the current map state at a fixed rate, independent of the
+        # obstacle-cloud input rate (which is capped at the SAM2 tracking rate,
+        # ~5 Hz, and can stall for seconds on detection failures).
+        pub_rate_hz = float(rospy.get_param("~publish_rate_hz", 30.0))
+        self._last_pub_stamp = None
+        rospy.Timer(rospy.Duration(1.0 / pub_rate_hz), self._timer_pub_cb)
 
         rospy.loginfo(
             "Persistent Cloud Node ready | "
@@ -246,10 +285,17 @@ class PersistentCloudNode:
                 pts[:, None, :] - self._body_link_pos[None, :, :], axis=-1)  # [N, K]
             pts = pts[dists.min(axis=1) > self.robot_body_radius]
 
+        # Integration-time target exclusion: never store target-region points in
+        # obs_world.  The freespace eviction cannot remove them once committed
+        # because the target itself keeps the depth value occupied.
+        if len(pts) > 0 and self._tgt_centroid is not None:
+            dists = np.linalg.norm(pts - self._tgt_centroid, axis=1)
+            pts = pts[dists > self._tgt_exclusion_radius]
+
         self._live_obs = pts
         if len(pts) > 0:
             self.obs_world.integrate(pts)
-        self._publish(msg.header.stamp)
+        self._last_pub_stamp = msg.header.stamp
 
     def _target_cb(self, msg):
         try:
@@ -262,7 +308,39 @@ class PersistentCloudNode:
         self._live_target = pts
         if len(pts) > 0:
             self._tgt_world.integrate(pts)
-        self._publish_target(msg.header.stamp)
+            new_centroid = pts.mean(axis=0).astype(np.float32)
+
+            # Dynamic exclusion radius: 95th-percentile distance from centroid to
+            # target cloud points, plus one voxel.  Covers the full target surface
+            # regardless of object size without hardcoding the cube dimensions.
+            # Using a percentile (not max) keeps SAM2 mask outliers from bloating
+            # the radius and accidentally excluding close bowl-rim points.
+            dists_tgt = np.linalg.norm(pts - new_centroid, axis=1)
+            dynamic_r = float(np.percentile(dists_tgt, 95)) + self.obs_voxel_size
+            self._tgt_exclusion_radius = max(dynamic_r, self.target_exclusion_radius_min)
+
+            # Evict any obs_world voxels inside the exclusion sphere.  Necessary
+            # on first target acquisition and whenever the target shifts.
+            if self._tgt_centroid is None or \
+                    np.linalg.norm(new_centroid - self._tgt_centroid) > self.obs_voxel_size:
+                self._evict_target_region(new_centroid)
+            self._tgt_centroid = new_centroid
+        self._last_pub_stamp = msg.header.stamp
+
+    def _evict_target_region(self, centroid):
+        """Remove obs_world voxels within _tgt_exclusion_radius of centroid."""
+        pts, hashes = self.obs_world.get_points_and_hashes(min_confidence=1)
+        if pts is None:
+            return
+        dists = np.linalg.norm(pts - centroid, axis=1)
+        contaminated = hashes[dists < self._tgt_exclusion_radius]
+        if len(contaminated) > 0:
+            self.obs_world.evict_hashes(np.sort(contaminated))
+
+    def _timer_pub_cb(self, event):
+        stamp = self._last_pub_stamp if self._last_pub_stamp is not None else rospy.Time.now()
+        self._publish(stamp)
+        self._publish_target(stamp)
 
     # ── TF helper ─────────────────────────────────────────────────────────────
 
@@ -280,6 +358,50 @@ class PersistentCloudNode:
             rospy.logwarn_throttle(5, f"TF {self.camera_frame}←{self.world_frame} failed: {e}")
             return None, None
 
+    # ── Synthetic floor ───────────────────────────────────────────────────────
+
+    def _generate_floor_patch(self, obs_pts):
+        """
+        Return a [N,3] float32 grid of synthetic floor points below the target.
+
+        Algorithm:
+          1. Collect obstacle ring points within floor_sample_radius (horizontal)
+             of the target centroid that are below the centroid.
+          2. Estimate floor height as the floor_height_percentile of their Z.
+          3. Fill a circular grid at that height under the target footprint.
+
+        Returns None when there is insufficient ring data to infer the floor.
+        """
+        if not self.generate_synthetic_floor:
+            return None
+        if self._tgt_centroid is None or obs_pts is None or len(obs_pts) == 0:
+            return None
+
+        cx, cy, cz = self._tgt_centroid
+        dx = obs_pts[:, 0] - cx
+        dy = obs_pts[:, 1] - cy
+        horiz_sq = dx * dx + dy * dy
+        ring_mask = (horiz_sq < self.floor_sample_radius ** 2) & (obs_pts[:, 2] < cz)
+
+        if ring_mask.sum() < 5:
+            return None
+
+        floor_z = float(np.percentile(obs_pts[ring_mask, 2], self.floor_height_percentile))
+
+        # Regular grid at floor_z covering the target footprint
+        res = self.floor_grid_resolution
+        r   = self.floor_grid_radius
+        xs  = np.arange(cx - r, cx + r + res * 0.5, res, dtype=np.float32)
+        ys  = np.arange(cy - r, cy + r + res * 0.5, res, dtype=np.float32)
+        xx, yy = np.meshgrid(xs, ys)
+        xx = xx.ravel()
+        yy = yy.ravel()
+        in_circle = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+        xx = xx[in_circle]
+        yy = yy[in_circle]
+        zz = np.full(len(xx), floor_z, dtype=np.float32)
+        return np.column_stack([xx, yy, zz])
+
     # ── Publishing ────────────────────────────────────────────────────────────
 
     def _publish(self, stamp):
@@ -293,13 +415,38 @@ class PersistentCloudNode:
         if obs_pts is None:
             obs_pts = self._live_obs
 
-        # Carve target region out of obstacle cloud
-        if obs_pts is not None and len(obs_pts) > 0 \
-                and tgt_pts is not None and len(tgt_pts) > 0:
-            excl  = self.obs_voxel_size + self.tgt_voxel_size
-            dists = np.linalg.norm(
-                obs_pts[:, None, :] - tgt_pts[None, :, :], axis=-1)
-            obs_pts = obs_pts[dists.min(axis=1) >= excl]
+        # Publish-time target exclusion: O(N) centroid-sphere guard.
+        # Belt-and-suspenders on top of the integration-time filter — catches
+        # any live_obs fallback points and handles centroid drift between evictions.
+        if obs_pts is not None and len(obs_pts) > 0 and self._tgt_centroid is not None:
+            dists = np.linalg.norm(obs_pts - self._tgt_centroid, axis=1)
+            obs_pts = obs_pts[dists >= self._tgt_exclusion_radius]
+
+        # Synthetic floor: infer floor height from ring obstacle points and fill
+        # the depth-occluded region below the target so the CBF cannot drive the
+        # fork through the bottom of the bowl.  Added after carving so the
+        # floor patch is never zeroed by the exclusion sphere.
+        floor_patch = self._generate_floor_patch(obs_pts)
+        if floor_patch is not None and len(floor_patch) > 0:
+            obs_pts = np.vstack([obs_pts, floor_patch]) \
+                if obs_pts is not None and len(obs_pts) > 0 else floor_patch
+
+        # Surface dilation: add 6 face-adjacent neighbor centers at publish time.
+        # Fills per-scan-line gaps (up to 2×voxel_size wide) so the CBF sees a
+        # continuous surface rather than isolated points with void between them.
+        # Storage is unchanged — dilation is purely for the downstream CBF consumer.
+        if obs_pts is not None and len(obs_pts) > 0 and self.dilate_published_cloud:
+            vs = self.obs_voxel_size
+            offsets = np.array([
+                [vs, 0, 0], [-vs, 0, 0],
+                [0, vs, 0], [0, -vs, 0],
+                [0, 0, vs], [0, 0, -vs],
+            ], dtype=np.float32)
+            dilated = (obs_pts[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
+            all_pts = np.vstack([obs_pts, dilated])
+            h_all = _to_hashes(all_pts, vs)
+            _, unique_idx = np.unique(h_all, return_index=True)
+            obs_pts = all_pts[unique_idx].astype(np.float32)
 
         if obs_pts is not None and len(obs_pts) > self.obs_max_pts:
             obs_pts = obs_pts[:self.obs_max_pts]
@@ -307,9 +454,10 @@ class PersistentCloudNode:
         if obs_pts is not None and len(obs_pts) > 0:
             self.pub.publish(_make_cloud_msg(header, obs_pts))
 
-        rospy.loginfo_throttle(5.0,
-            "Obs committed: %d | Target committed: %d",
-            self.obs_world.count(), self._tgt_world.count())
+        if self.log_counts:
+            rospy.loginfo_throttle(5.0,
+                "Obs committed: %d | Target committed: %d",
+                self.obs_world.count(), self._tgt_world.count())
 
     def _publish_target(self, stamp):
         header  = Header(stamp=stamp, frame_id=self.world_frame)

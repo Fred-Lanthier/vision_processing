@@ -49,6 +49,8 @@ class CBFSafetyNode:
     def __init__(self):
         rospy.init_node('cbf_safety_node')
         self.device = torch.device('cuda')
+        self._logged_first_nominal = False
+        self._logged_first_safe_publish = False
 
         urdf_path_raw = pkg_path + '/urdf/panda_camera.xacro' 
 
@@ -106,15 +108,69 @@ class CBFSafetyNode:
         self.cbf_kappa = float(rospy.get_param("~cbf_kappa", 2.0))
         self.cbf_recovery_kappa = float(rospy.get_param("~cbf_recovery_kappa", 3.0))
         self.cbf_constraint_margin = float(rospy.get_param("~cbf_constraint_margin", 0.0))
-        # setup_cuda_graph captures this attribute verbatim. Keeping it at
-        # infinity disables the old hard recovery override without exposing the
-        # removed cbf_recovery_switch_margin ROS parameter.
-        self.cbf_recovery_switch_margin = float('inf')
+        self.cbf_recovery_switch_margin = float(rospy.get_param(
+            "~cbf_recovery_switch_margin", 0.004))
+        self.cbf_solver_mode = str(rospy.get_param(
+            "~cbf_solver_mode", "fast_tangent")).lower()
+        if self.cbf_solver_mode not in ("fast_tangent", "multi_projected"):
+            raise ValueError("~cbf_solver_mode must be 'fast_tangent' or 'multi_projected'")
+        self.cbf_active_constraints = max(1, int(rospy.get_param(
+            "~cbf_active_constraints", 4)))
+        self.cbf_h_activate = float(rospy.get_param("~cbf_h_activate", 0.006))
+        self.cbf_max_inward_speed = float(rospy.get_param(
+            "~cbf_max_inward_speed", 0.20))
+        self.cbf_recovery_speed = float(rospy.get_param(
+            "~cbf_recovery_speed", 0.0))
+        self.cbf_recovery_depth = float(rospy.get_param(
+            "~cbf_recovery_depth", 0.01))
+        self.cbf_max_correction_speed = float(rospy.get_param(
+            "~cbf_max_correction_speed", 0.35))
+        self.cbf_projection_iters = max(1, int(rospy.get_param(
+            "~cbf_projection_iters", 3)))
+        self.cbf_projection_relaxation = float(rospy.get_param(
+            "~cbf_projection_relaxation", 1.0))
+        self.cbf_enforce_final_constraint = _bool_param("~cbf_enforce_final_constraint", True)
+        self.cbf_integrate_from_current = _bool_param("~cbf_integrate_from_current", True)
+        self.cbf_command_dt = float(rospy.get_param("~cbf_command_dt", 0.0))
+        self.cbf_passthrough_when_inactive = _bool_param(
+            "~cbf_passthrough_when_inactive", True)
+        self.cbf_stateful_position_command = _bool_param("~cbf_stateful_position_command", True)
+        self.cbf_direct_position_mode = str(rospy.get_param(
+            "~cbf_direct_position_mode", "nominal_correction")).lower()
+        if self.cbf_direct_position_mode not in ("integrated", "nominal_correction"):
+            raise ValueError("~cbf_direct_position_mode must be 'integrated' or 'nominal_correction'")
+        self.cbf_direct_feedback_when_reactive = _bool_param(
+            "~cbf_direct_feedback_when_reactive", True)
+        self.cbf_tracking_feedback_mode = str(rospy.get_param(
+            "~cbf_tracking_feedback_mode", "tangent_near")).lower()
+        if self.cbf_tracking_feedback_mode not in ("full", "none", "tangent", "tangent_near"):
+            raise ValueError(
+                "~cbf_tracking_feedback_mode must be 'full', 'none', 'tangent', or 'tangent_near'")
+        self.cbf_tangent_feedback_min_speed = float(rospy.get_param(
+            "~cbf_tangent_feedback_min_speed", 0.02))
+        self.cbf_position_correction_dt = float(rospy.get_param(
+            "~cbf_position_correction_dt", 0.02))
+        self.cbf_position_correction_filter_tau = float(rospy.get_param(
+            "~cbf_position_correction_filter_tau", 0.08))
+        self.cbf_max_position_correction = float(rospy.get_param(
+            "~cbf_max_position_correction", 0.025))
+        self.cbf_use_reactive_position_step = _bool_param(
+            "~cbf_use_reactive_position_step", True)
+        self.cbf_reactive_position_dt = float(rospy.get_param(
+            "~cbf_reactive_position_dt", 0.04))
+        self.cbf_max_command_lead = float(rospy.get_param("~cbf_max_command_lead", 0.08))
         self.cbf_gradient_check_period = float(rospy.get_param("~cbf_gradient_check_period", 1.0))
         self.cbf_gradient_check_eps = float(rospy.get_param("~cbf_gradient_check_eps", 1e-3))
         self.log_cbf_events = _bool_param("~log_cbf_events", False)
         self.log_cbf_command_timing = _bool_param("~log_cbf_command_timing", True)
+        self.log_trajectory_timing = _bool_param("~log_trajectory_timing", True)
+        self.active_plan_id = 0
+        self.active_plan_stamp = None
+        self.active_plan_duration = 0.0
+        self._cbf_first_nominal_for_plan = False
+        self._cbf_first_safe_for_plan = False
         self._last_gradient_check = 0.0
+        self.last_cbf_position_delta = None
 
         self.cbf_graph_points = max(1, int(rospy.get_param("~cbf_graph_points", 100)))
         preprocess_max_points = int(rospy.get_param("~preprocess_max_points", 512))
@@ -133,11 +189,19 @@ class CBFSafetyNode:
         ]
         self.current_q = None
         self.nominal_q = None
-        self._last_q_safe = None
+        self.target_x = None
         self.obs_points = torch.empty((0, 3), dtype=torch.float32, device=self.device)
 
         self.max_joint_velocity = float(rospy.get_param("~max_joint_velocity", 0.7))
         self.cbf_kp = float(rospy.get_param("~cbf_kp", 10.0))
+        self.cbf_feedback_coupling = float(rospy.get_param("~cbf_feedback_coupling", 0.1))
+        self.max_feedback_velocity = float(rospy.get_param("~max_feedback_velocity", 0.05))
+        self.cbf_filter_tau = float(rospy.get_param("~cbf_filter_tau", 0.05))
+        self.real_velocity_filter_tau = float(rospy.get_param("~real_velocity_filter_tau", 0.08))
+        self.last_nominal_q = None
+        self.dq_nom_filtered = None
+        self.last_nominal_tangent_dir = None
+        self.last_h_value_for_feedback = float("inf")
 
         self.enable_cbf = _bool_param("~enable_cbf", True)
         self.publish_controller_command = _bool_param("~publish_controller_command", False)
@@ -151,10 +215,6 @@ class CBFSafetyNode:
         self.tcp_filter_radius = float(rospy.get_param("~tcp_filter_radius", 0.40))
         self.fork_filter_radius = float(rospy.get_param("~fork_filter_radius", 0.15))
         self.nominal_hold_deadband = float(rospy.get_param("~nominal_hold_deadband", 1e-4))
-        # EMA smoothing on dq_safe output to reduce gradient-jump jitter from
-        # changing obstacle selections. alpha=new-sample weight; lower = smoother.
-        self.cbf_ema_alpha = float(rospy.get_param("~cbf_ema_alpha", 0.15))
-        self._dq_safe_ema = None
         self.cbf_candidate_filter = str(rospy.get_param("~cbf_candidate_filter", "sphere")).lower()
         if self.cbf_candidate_filter not in ("sphere", "sdf"):
             raise ValueError("~cbf_candidate_filter must be 'sphere' or 'sdf'")
@@ -175,7 +235,6 @@ class CBFSafetyNode:
         self.fork_mesh_points_local = self._load_fork_mesh_points(urdf_path)
         self.publish_yellow_points = _bool_param("~publish_yellow_points", False)
         self.selected_obstacle_hold_time = float(rospy.get_param("~selected_obstacle_hold_time", 0.5))
-        self.cbf_command_dt = float(rospy.get_param("~cbf_command_dt", 0.10))
 
         self.eye4 = torch.eye(4, device=self.device).unsqueeze(0)
         self.q_pad2 = torch.zeros((1, 2), device=self.device)
@@ -193,10 +252,12 @@ class CBFSafetyNode:
         self.debug_tip_min = None
         self.debug_filter_center = None
 
-        # Kept for unchanged visualization helpers.
         self.last_q_safe = None
         self.q_safe_work = torch.zeros((1, 7), device=self.device)
         self.dq_safe_work = torch.zeros((1, 7), device=self.device)
+        self.last_joint_q_for_velocity = None
+        self.last_joint_stamp_for_velocity = None
+        self.dq_real_measured = torch.zeros((1, 7), device=self.device)
         self.last_current_q_debug = None
         self._viz_q = None
         self._viz_dq_nom = None
@@ -208,7 +269,8 @@ class CBFSafetyNode:
         self.comp_times = []
         self.preprocess_times = []
         rospy.Subscriber('/joint_states', JointState, self.joint_callback)
-        rospy.Subscriber('/planner/nominal_joint_command', Float64MultiArray, self._nominal_cb)
+        rospy.Subscriber('/planner/nominal_trajectory', JointTrajectory, self.trajectory_timing_callback)
+        rospy.Subscriber('/planner/nominal_joint_command', Float64MultiArray, self.nominal_command_callback)
         obs_topic = rospy.get_param("~obs_topic", "/perception/persistent_obstacles")
         rospy.Subscriber(obs_topic, PointCloud2, self.obs_callback)
         
@@ -243,15 +305,23 @@ class CBFSafetyNode:
             rospy.Timer(rospy.Duration(1.0 / self.viz_rate_hz),
                         self.publish_visualization)
         rospy.loginfo(
-            "Optimized CBF ready: control=%.1f Hz preprocess=%.1f Hz viz=%.1f Hz "
-            "graph_points=%d preprocess_max_points=%d candidate_filter=%s selection=%s "
-            "cluster=%s yellow=%s debug=%s profile_sync=%s",
+            "Multi-constraint CBF ready: control=%.1f Hz preprocess=%.1f Hz viz=%.1f Hz "
+            "graph_points=%d active_constraints=%d h_activate=%.3fm max_inward=%.3fm/s "
+            "recovery=%.3fm/s candidate_filter=%s selection=%s cluster=%s "
+            "integrate_from_current=%s command_dt=%.3fs passthrough_inactive=%s "
+            "yellow=%s debug=%s profile_sync=%s",
             self.rate_hz, self.preprocess_rate_hz, self.viz_rate_hz,
             self.cbf_graph_points,
-            self.preprocess_max_points,
+            self.cbf_active_constraints,
+            self.cbf_h_activate,
+            self.cbf_max_inward_speed,
+            self.cbf_recovery_speed,
             self.cbf_candidate_filter,
             self.cbf_selection_metric,
             self.cbf_cluster_mode,
+            self.cbf_integrate_from_current,
+            self.cbf_command_dt,
+            self.cbf_passthrough_when_inactive,
             self.publish_yellow_points,
             self.publish_debug_topics, self.profile_sync)
         self.ready_pub.publish(Bool(data=True))
@@ -423,7 +493,7 @@ class CBFSafetyNode:
           Calculates whole-body safety over n_points selected obstacle points.
           dq_safe = dq_nom + lam * grad_h.
         """
-        print(f"⚡ Capture du graphe CUDA (QP {n_points} points)...")
+        print(f"⚡ Initialisation Multi-CBF ({n_points} selected points)...")
         torch.cuda.empty_cache()
 
         self.static_q      = torch.zeros((batch_size, 7), device=self.device, requires_grad=True)
@@ -433,51 +503,50 @@ class CBFSafetyNode:
         self.static_h      = torch.zeros((batch_size,), device=self.device)
         self.static_constr = torch.zeros((batch_size,), device=self.device)
         self.static_grad_h = torch.zeros((batch_size, 7), device=self.device)
+        self.graph = None
+        if self.cbf_solver_mode != "fast_tangent":
+            self._log_cuda_memory("Multi-CBF runtime buffers ready")
+            return
 
         # Capture scalars as Python floats so the CUDA graph bakes in the params.
-        kappa = self.cbf_kappa
-        recovery_kappa = self.cbf_recovery_kappa
         constraint_margin = self.cbf_constraint_margin
-        recovery_switch_h = -max(0.0, self.cbf_recovery_switch_margin)
+        h_activate = max(self.cbf_h_activate, 1e-6)
+        max_inward_speed = max(0.0, self.cbf_max_inward_speed)
+        recovery_speed = max(0.0, self.cbf_recovery_speed)
+        recovery_depth = max(self.cbf_recovery_depth, 1e-6)
+        max_correction_speed = max(0.0, self.cbf_max_correction_speed)
 
         def _qp_step(h, grad_h, dq_in):
             self.static_h.copy_(h)
-            kappa_eff = torch.where(
-                h < 0.0,
-                torch.full_like(h, recovery_kappa),
-                torch.full_like(h, kappa),
-            )
-            constr = (grad_h * dq_in).sum(dim=-1) + kappa_eff * h - constraint_margin
+            # Tangent-preserving fast CBF:
+            # - outside activation: no correction
+            # - near boundary: limit inward normal velocity only
+            # - inside: request a bounded outward recovery speed
+            active = h <= h_activate
+            outside_bound = -max_inward_speed * torch.clamp(
+                h / h_activate, min=0.0, max=1.0)
+            inside_bound = recovery_speed * torch.clamp(
+                (-h) / recovery_depth, min=0.0, max=1.0)
+            bound = torch.where(h > 0.0, outside_bound, inside_bound)
+            bound = bound + constraint_margin
+            gdq = (grad_h * dq_in).sum(dim=-1)
+            constr = torch.where(active, gdq - bound, torch.ones_like(gdq))
             self.static_constr.copy_(constr)
             denom  = (grad_h ** 2).sum(dim=-1)
-            lam_uncapped = -constr / (denom + 1e-4)
-            # In the safe region (h >= 0) cap the correction to nom_speed to
-            # prevent a massive normal push from overwhelming tangential exit
-            # motion in bowl-shaped cavities.  In recovery (h < 0) the robot is
-            # already in violation — allow the full uncapped correction so the
-            # constraint is actually satisfied rather than silently truncated.
-            nom_speed = torch.norm(dq_in, dim=-1)
-            lam_max_safe = nom_speed / (torch.sqrt(denom) + 1e-6)
-            lam_max = torch.where(h < 0.0, torch.full_like(lam_max_safe, 1e6), lam_max_safe)
-            lam = torch.clamp(lam_uncapped, max=lam_max)
-            dq_projected = dq_in + lam.unsqueeze(-1) * grad_h
-
-            # Hard recovery is useful only once we are meaningfully inside the
-            # boundary. Near h=0, keep tangential nominal motion and project only
-            # the unsafe normal component; otherwise the controller snaps at
-            # d_safe due to tiny SDF/point-cloud noise.
-            dot_nom_grad = (grad_h * dq_in).sum(dim=-1)
-            nom_speed = torch.norm(dq_in, dim=-1)
-            grad_h_unit = grad_h / (torch.sqrt(denom).unsqueeze(-1) + 1e-6)
-            dq_recovery = nom_speed.unsqueeze(-1) * grad_h_unit
-            use_recovery = (h < recovery_switch_h) & (dot_nom_grad < 0.0)
+            correction = torch.clamp(bound - gdq, min=0.0)
+            dq_delta = correction.unsqueeze(-1) * grad_h / (denom.unsqueeze(-1) + 1e-4)
+            if max_correction_speed > 0.0:
+                delta_norm = torch.norm(dq_delta, dim=-1, keepdim=True)
+                scale = torch.clamp(max_correction_speed / (delta_norm + 1e-6), max=1.0)
+                dq_delta = dq_delta * scale
+            dq_projected = dq_in + dq_delta
 
             dq_safe = torch.where(
-                constr.unsqueeze(-1) < 0,
+                (active & (constr < 0.0) & (denom > 1e-8)).unsqueeze(-1),
                 torch.where(
                     denom.unsqueeze(-1) < 1e-6,
                     torch.zeros_like(dq_in),
-                    torch.where(use_recovery.unsqueeze(-1), dq_recovery, dq_projected),
+                    dq_projected,
                 ),
                 dq_in
             )
@@ -509,6 +578,128 @@ class CBFSafetyNode:
         print(f"✅ Graphe CUDA capturé ({n_points} points) !")
         self._log_cuda_memory("CBF setup_cuda_graph captured")
 
+    def solve_multicbf_projection(self, current_q, obs_points, dq_nom):
+        """
+        Tangent-preserving multi-constraint CBF.
+
+        Each active obstacle point contributes one half-space:
+            grad_h_i · dq >= bound_i(h_i)
+        The sequential projection keeps dq as close as possible to dq_nom while
+        removing only the unsafe inward normal component.
+        """
+        valid_count = min(
+            int(self.selected_count),
+            int(obs_points.shape[0]),
+            int(self.preprocess_max_points) if self.preprocess_max_points > 0 else int(obs_points.shape[0]),
+        )
+        if valid_count <= 0:
+            self.static_h.fill_(1.0)
+            self.static_constr.zero_()
+            self.static_grad_h.zero_()
+            return dq_nom
+
+        obs_eval = obs_points[:valid_count]
+        with torch.no_grad():
+            q_probe = current_q.detach()
+            pose_probe = self.eye4.expand(q_probe.shape[0], 4, 4)
+            sdf_probe = self.bernstein_core.get_whole_body_sdf_batch(
+                obs_eval, pose_probe, q_probe, return_per_link=False)
+            h_probe = sdf_probe[0] - self.d_safe
+
+        active_window = min(valid_count, max(self.cbf_active_constraints * 3, self.cbf_active_constraints))
+        _, near_idx = torch.topk(h_probe, k=active_window, largest=False, sorted=True)
+        h_near = h_probe[near_idx]
+        active_mask = h_near <= self.cbf_h_activate
+        if not torch.any(active_mask):
+            h_min = h_probe.min().view(1)
+            self.static_h.copy_(h_min)
+            self.static_constr.copy_(torch.zeros_like(h_min))
+            self.static_grad_h.zero_()
+            return dq_nom
+
+        active_idx = near_idx[active_mask][:self.cbf_active_constraints]
+        obs_active = obs_eval[active_idx]
+
+        prev_grad_enabled = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+        q_eval = current_q.detach().clone().requires_grad_(True)
+        pose = self.eye4.expand(q_eval.shape[0], 4, 4)
+        sdf_active = self.bernstein_core.get_whole_body_sdf_batch(
+            obs_active, pose, q_eval, return_per_link=False)
+        h_active = sdf_active[0] - self.d_safe
+
+        if int(h_active.numel()) <= 0:
+            self.static_h.copy_(h_probe.min().view(1))
+            self.static_constr.zero_()
+            self.static_grad_h.zero_()
+            torch.set_grad_enabled(prev_grad_enabled)
+            return dq_nom
+
+        # One batched vector-Jacobian product is much cheaper than K separate
+        # backward passes. Fall back only for older PyTorch versions.
+        try:
+            grad_outputs = torch.eye(
+                int(h_active.numel()), device=self.device, dtype=h_active.dtype)
+            grad_batch = torch.autograd.grad(
+                outputs=h_active,
+                inputs=q_eval,
+                grad_outputs=grad_outputs,
+                is_grads_batched=True,
+                retain_graph=False,
+                create_graph=False,
+                only_inputs=True,
+            )[0]
+            G = grad_batch[:, 0, :]
+        except TypeError:
+            grads = []
+            for j, h_j in enumerate(h_active):
+                grad_j = torch.autograd.grad(
+                    outputs=h_j,
+                    inputs=q_eval,
+                    grad_outputs=torch.ones_like(h_j),
+                    retain_graph=(j < int(h_active.numel()) - 1),
+                    create_graph=False,
+                    only_inputs=True,
+                )[0]
+                grads.append(grad_j.squeeze(0))
+            G = torch.stack(grads, dim=0)
+        h_det = h_active.detach()
+
+        h_activate = max(self.cbf_h_activate, 1e-6)
+        recovery_depth = max(self.cbf_recovery_depth, 1e-6)
+        outside_bound = -self.cbf_max_inward_speed * torch.clamp(
+            h_det / h_activate, min=0.0, max=1.0)
+        inside_bound = self.cbf_recovery_speed * torch.clamp(
+            (-h_det) / recovery_depth, min=0.0, max=1.0)
+        bounds = torch.where(h_det > 0.0, outside_bound, inside_bound)
+        bounds = bounds + self.cbf_constraint_margin
+
+        dq = dq_nom.detach().clone()
+        for _ in range(self.cbf_projection_iters):
+            gdq = torch.matmul(G, dq.squeeze(0))
+            violations = bounds - gdq
+            for i in range(int(G.shape[0])):
+                violation = violations[i]
+                if bool(violation > 0.0):
+                    g = G[i]
+                    denom = torch.dot(g, g) + 1e-6
+                    dq = dq + (
+                        self.cbf_projection_relaxation
+                        * violation
+                        * g.view(1, 7)
+                        / denom
+                    )
+                    dq.clamp_(min=-self.max_joint_velocity, max=self.max_joint_velocity)
+
+        gdq_final = torch.matmul(G, dq.squeeze(0))
+        constr = gdq_final - bounds
+        min_idx = torch.argmin(h_det)
+        self.static_h.copy_(h_det[min_idx].view(1))
+        self.static_constr.copy_(constr.min().view(1))
+        self.static_grad_h.copy_(G[min_idx].view(1, 7))
+        torch.set_grad_enabled(prev_grad_enabled)
+        return dq
+
     def joint_callback(self, msg):
         try:
             pos_dict = {n: p for n, p in zip(msg.name, msg.position)}
@@ -518,15 +709,100 @@ class CBFSafetyNode:
                     q_list.append(pos_dict[jn])
                 else:
                     return # Ignore message if arm joints are missing
-            self.current_q = torch.tensor(q_list, dtype=torch.float32, device=self.device).unsqueeze(0)
+            q_now = torch.tensor(q_list, dtype=torch.float32, device=self.device).unsqueeze(0)
+            stamp = msg.header.stamp.to_sec() if msg.header.stamp.to_sec() > 0.0 else rospy.get_time()
+            if self.last_joint_q_for_velocity is not None and self.last_joint_stamp_for_velocity is not None:
+                dt = stamp - self.last_joint_stamp_for_velocity
+                if 1e-4 < dt < 0.5:
+                    dq_real_raw = (q_now - self.last_joint_q_for_velocity) / dt
+                    gamma = dt / (dt + self.real_velocity_filter_tau)
+                    self.dq_real_measured = (
+                        (1.0 - gamma) * self.dq_real_measured
+                        + gamma * dq_real_raw
+                    )
+            self.last_joint_q_for_velocity = q_now.detach().clone()
+            self.last_joint_stamp_for_velocity = stamp
+            self.current_q = q_now
             if self.last_q_safe is None:
                 self.last_q_safe = self.current_q.detach().clone()
         except Exception as e:
             rospy.logerr_throttle(5.0, f"Error in CBF joint_callback: {e}")
 
-    def _nominal_cb(self, msg):
-        q = torch.tensor(msg.data[:7], dtype=torch.float32, device=self.device).unsqueeze(0)
-        self.nominal_q = q
+    def nominal_command_callback(self, msg):
+        if len(msg.data) >= 7:
+            self.nominal_q = torch.tensor(msg.data[:7], dtype=torch.float32,
+                                          device=self.device).unsqueeze(0)
+            if (
+                self.log_trajectory_timing
+                and self.active_plan_stamp is not None
+                and not self._cbf_first_nominal_for_plan
+            ):
+                if self.current_q is None:
+                    err = float('nan')
+                else:
+                    err = float(torch.norm(self.nominal_q - self.current_q).item())
+                now = rospy.Time.now()
+                rospy.loginfo(
+                    "[TRAJ TIMING] cbf_first_nominal id=%d "
+                    "publish_to_cbf_nominal=%.3fs expected_duration=%.3fs "
+                    "err_to_current=%.4frad",
+                    self.active_plan_id,
+                    (now - self.active_plan_stamp).to_sec(),
+                    self.active_plan_duration,
+                    err,
+                )
+                self._cbf_first_nominal_for_plan = True
+            if not self._logged_first_nominal:
+                if self.current_q is None:
+                    err = float('nan')
+                else:
+                    err = float(torch.norm(self.nominal_q - self.current_q).item())
+                rospy.loginfo(
+                    "CBF received first nominal joint command | err_to_current=%.4f rad",
+                    err)
+                self._logged_first_nominal = True
+
+    def trajectory_timing_callback(self, msg):
+        if not msg.points:
+            return
+        plan_stamp = msg.header.stamp
+        if plan_stamp.to_sec() <= 0.0:
+            plan_stamp = rospy.Time.now()
+        plan_id = int(getattr(msg.header, 'seq', 0))
+        if plan_id <= 0:
+            self.active_plan_id += 1
+        else:
+            self.active_plan_id = plan_id
+        self.active_plan_stamp = plan_stamp
+        self.active_plan_duration = msg.points[-1].time_from_start.to_sec()
+        self._cbf_first_nominal_for_plan = False
+        self._cbf_first_safe_for_plan = False
+        if self.nominal_q is not None:
+            self.last_nominal_q = self.nominal_q.detach().clone()
+        if self.dq_nom_filtered is not None:
+            self.dq_nom_filtered.zero_()
+        self.last_nominal_tangent_dir = None
+
+    def _shape_tracking_feedback(self, dq_nom_pure, dq_fb):
+        mode = self.cbf_tracking_feedback_mode
+        if mode == "full":
+            return dq_fb
+        if mode == "none":
+            return torch.zeros_like(dq_fb)
+        if mode == "tangent_near" and self.last_h_value_for_feedback > self.cbf_h_activate:
+            return dq_fb
+
+        tangent_speed = torch.norm(dq_nom_pure, dim=1, keepdim=True)
+        if bool(torch.all(tangent_speed > self.cbf_tangent_feedback_min_speed)):
+            tangent_dir = dq_nom_pure / (tangent_speed + 1e-6)
+            self.last_nominal_tangent_dir = tangent_dir.detach().clone()
+        elif self.last_nominal_tangent_dir is not None:
+            tangent_dir = self.last_nominal_tangent_dir
+        else:
+            return torch.zeros_like(dq_fb)
+
+        forward_speed = (dq_fb * tangent_dir).sum(dim=1, keepdim=True).clamp(min=0.0)
+        return forward_speed * tangent_dir
 
     def obs_callback(self, msg):
         try:
@@ -831,12 +1107,13 @@ class CBFSafetyNode:
             sdf_body = sdf_per_link[0, :5, :].min(dim=0).values
             sdf_all = sdf_per_link[0].min(dim=0).values
             sdf_fork = sdf_per_link[0, self.fork_link_index, :]
+            sdf_self_filter = sdf_all if self.cbf_sdf_self_filter_all_links else sdf_body
 
             # Keep points close to any protected link, while dropping points
-            # clearly inside the robot body mesh.
+            # clearly inside already-observed robot geometry.
             keep_mask = (
                 (sdf_all <= self.cbf_sdf_candidate_max_dist)
-                & (sdf_body > self.cbf_sdf_self_filter_margin)
+                & (sdf_self_filter > self.cbf_sdf_self_filter_margin)
             )
             if torch.any(keep_mask):
                 kept_pts.append(pts_chunk[keep_mask])
@@ -957,7 +1234,9 @@ class CBFSafetyNode:
                         sdf_body = sdf_per_link[0, :5, :].min(dim=0).values
                         sdf_all = sdf_per_link[0].min(dim=0).values
                         sdf_fork = sdf_per_link[0, self.fork_link_index, :]
-                        not_self = sdf_body > self.cbf_sdf_self_filter_margin
+                        sdf_self_filter = (
+                            sdf_all if self.cbf_sdf_self_filter_all_links else sdf_body)
+                        not_self = sdf_self_filter > self.cbf_sdf_self_filter_margin
                         pts_inside = pts_inside[not_self]
                         dist_inside = dist_inside[not_self]
                         if self.cbf_selection_metric == "fork_sdf":
@@ -1063,110 +1342,457 @@ class CBFSafetyNode:
             rospy.logerr_throttle(5.0, f"Error publishing CBF visualization: {e}")
 
     def run(self):
+        # print(f"🛡️  CBF NODE : Bouclier actif à {self.rate_hz}Hz. Sécurités activées.")
         dt_fixed = 1.0 / self.rate_hz
-        last_time = rospy.get_time()
 
         while not rospy.is_shutdown():
-            now = rospy.get_time()
-            dt = now - last_time
-            last_time = now
+            current_time = rospy.get_time()
+            dt = current_time - self.last_time
+            self.last_time = current_time
+            dt_measured = dt
 
-            if dt < 1e-4:
+            if dt <= 0.001: 
                 self.rate.sleep()
                 continue
-            dt = min(dt, 3.0 * dt_fixed)
+                
+            # Prevent massive jumps on initialization or lag spikes
+            if dt > 3.0 * dt_fixed:
+                dt = dt_fixed
 
-            if self.current_q is None or self.nominal_q is None:
-                self.rate.sleep()
-                continue
+            if self.current_q is not None and self.nominal_q is not None:
+                with torch.no_grad():
+                    current_q = self.current_q.detach()
+                    nominal_q = self.nominal_q.detach()
+                    direct_nominal_position = (
+                        self.publish_controller_command
+                        and self.cbf_direct_position_mode == "nominal_correction"
+                    )
+                    stateful_position_command = (
+                        self.publish_controller_command
+                        and self.cbf_stateful_position_command
+                        and not direct_nominal_position
+                    )
+                    if self.last_q_safe is None:
+                        self.last_q_safe = current_q.clone()
+                    elif not stateful_position_command:
+                        self.last_q_safe = (1.0 - self.cbf_feedback_coupling) * self.last_q_safe + self.cbf_feedback_coupling * current_q
 
-            with torch.no_grad():
-                q_cur = self.current_q.detach()
-                q_nom = self.nominal_q.detach()
+                    # 1. Feedforward nominal velocity
+                    last_nominal_q = self.last_nominal_q
+                    if last_nominal_q is None:
+                        last_nominal_q = nominal_q.clone()
+                    dq_nom_pure = (nominal_q - last_nominal_q) / dt
+                    self.last_nominal_q = nominal_q.clone()
 
-                dq_nom = torch.clamp(
-                    self.cbf_kp * (q_nom - q_cur),
-                    min=-self.max_joint_velocity,
-                    max=self.max_joint_velocity,
-                )
-
-                if torch.norm(dq_nom) < self.nominal_hold_deadband:
-                    dq_nom.zero_()
-
-                if self.enable_cbf:
-                    local_obs = self.selected_obs
-                    self.static_q.copy_(q_cur)
-                    self.static_obs.copy_(local_obs)
-                    self.static_dq_nom.copy_(dq_nom)
-                    self.graph.replay()
-                    dq_safe = self.static_dq_safe.detach().clone()
-                    self._maybe_check_gradient_direction(
-                        q_cur, local_obs, self.static_h.detach(),
-                        self.static_grad_h.detach())
-                    # EMA smoothing: reduces dq_safe jitter from 30 Hz gradient-
-                    # direction jumps due to changing obstacle point selection.
-                    # Only smooth near the boundary (|h| < 0.005); bypass and
-                    # reset EMA when deeply negative so recovery corrections are
-                    # not delayed by the filter's time constant (~90 ms).
-                    h_val_ema = float(self.static_h.item())
-                    if self._dq_safe_ema is None or h_val_ema > 0.02 or h_val_ema < -0.005:
-                        # Safe region, first iteration, or deep recovery: no smoothing.
-                        self._dq_safe_ema = dq_safe.clone()
+                    if direct_nominal_position:
+                        # In direct position-controller mode, the trajectory
+                        # executor already gives us the timed position command.
+                        # The controller output remains the timed nominal
+                        # position while the CBF is inactive. The velocity fed
+                        # to the QP still needs bounded pursuit, otherwise a
+                        # robot held back by safety sees nearly zero nominal
+                        # velocity once the timed trajectory has run ahead.
+                        if self.cbf_direct_feedback_when_reactive:
+                            dq_fb = self.cbf_kp * (nominal_q - current_q)
+                            dq_fb = torch.clamp(
+                                dq_fb,
+                                min=-self.max_feedback_velocity,
+                                max=self.max_feedback_velocity)
+                            dq_fb = self._shape_tracking_feedback(dq_nom_pure, dq_fb)
+                            dq_nom_raw = dq_nom_pure + dq_fb
+                        else:
+                            dq_nom_raw = dq_nom_pure
                     else:
-                        self._dq_safe_ema = (
-                            self.cbf_ema_alpha * dq_safe
-                            + (1.0 - self.cbf_ema_alpha) * self._dq_safe_ema
+                        # Bounded tracking error feedback for velocity/integrated
+                        # command modes.
+                        tracking_q = current_q if self.cbf_integrate_from_current else self.last_q_safe
+                        dq_fb = self.cbf_kp * (nominal_q - tracking_q)
+                        dq_fb = torch.clamp(dq_fb, min=-self.max_feedback_velocity, max=self.max_feedback_velocity)
+                        dq_fb = self._shape_tracking_feedback(dq_nom_pure, dq_fb)
+                        dq_nom_raw = dq_nom_pure + dq_fb
+
+                    # 4. Low-pass filter to eliminate derivative jerk from piecewise-linear interpolation
+                    if self.dq_nom_filtered is None:
+                        self.dq_nom_filtered = dq_nom_raw.clone()
+                    gamma = dt / (dt + self.cbf_filter_tau)
+                    self.dq_nom_filtered = (1.0 - gamma) * self.dq_nom_filtered + gamma * dq_nom_raw
+
+                    # 5. Final nominal velocity command fed to the QP solver
+                    dq_nom_torch = torch.clamp(self.dq_nom_filtered, min=-self.max_joint_velocity, max=self.max_joint_velocity)
+
+                    nominal_is_hold = torch.norm(dq_nom_torch) < self.nominal_hold_deadband
+                    if nominal_is_hold:
+                        dq_nom_torch = torch.zeros_like(dq_nom_torch)
+                        if self.dq_nom_filtered is not None:
+                            self.dq_nom_filtered.zero_()
+
+                if self.profile_sync:
+                    torch.cuda.synchronize()
+                t_start = time.perf_counter()
+
+                with torch.no_grad():
+                    if self.enable_cbf:
+                        local_obs = self.selected_obs # Read reference atomically
+                        self.static_q.copy_(current_q)
+                        self.static_obs.copy_(local_obs)
+                        self.static_dq_nom.copy_(dq_nom_torch)
+                        if self.cbf_solver_mode == "fast_tangent":
+                            self.graph.replay()
+                            self.dq_safe_work.copy_(self.static_dq_safe.detach())
+                        else:
+                            self.dq_safe_work.copy_(self.solve_multicbf_projection(
+                                current_q, local_obs, dq_nom_torch).detach())
+                    else:
+                        self.dq_safe_work.copy_(dq_nom_torch)
+
+                    self._viz_q = current_q.detach().clone()
+                    self._viz_dq_nom = dq_nom_torch.detach().clone()
+                    self._viz_dq_safe = self.dq_safe_work.detach().clone()
+
+                    dot = torch.sum(dq_nom_torch * self.dq_safe_work, dim=1)
+                    denom = torch.norm(dq_nom_torch, dim=1) * torch.norm(self.dq_safe_work, dim=1)
+                    alignment = torch.where(denom > 1e-8, dot / denom, torch.ones_like(dot))
+
+                    self.dq_safe_work.clamp_(min=-self.max_joint_velocity,
+                                             max=self.max_joint_velocity)
+
+                    if self.enable_cbf and self.cbf_enforce_final_constraint:
+                        # Component-wise velocity limits can invalidate the QP
+                        # half-space projection. If that happens, project the
+                        # already-filtered command again so tangential/nominal
+                        # motion is preserved instead of braking to zero.
+                        grad_h = self.static_grad_h.detach()
+                        grad_norm_sq = (grad_h ** 2).sum(dim=1, keepdim=True)
+                        kappa_eff = torch.where(
+                            self.static_h.detach() < 0.0,
+                            torch.full_like(self.static_h.detach(), self.cbf_recovery_kappa),
+                            torch.full_like(self.static_h.detach(), self.cbf_kappa),
                         )
-                        dq_safe = self._dq_safe_ema.clone()
-                else:
-                    dq_safe = dq_nom.clone()
-                    self._dq_safe_ema = None
+                        final_constr = (
+                            (grad_h * self.dq_safe_work).sum(dim=1)
+                            + kappa_eff * self.static_h.detach()
+                            - self.cbf_constraint_margin
+                        )
+                        final_active = self.static_h.detach() <= self.cbf_h_activate
+                        needs_repair = (
+                            final_active
+                            & (final_constr < 0.0)
+                            & (grad_norm_sq.squeeze(1) > 1e-8)
+                        ).view(-1, 1)
+                        repair_step = torch.where(
+                            final_active,
+                            (-final_constr).clamp(min=0.0),
+                            torch.zeros_like(final_constr),
+                        ).view(-1, 1)
+                        dq_repaired = (
+                            self.dq_safe_work
+                            + repair_step * grad_h / (grad_norm_sq + 1e-6)
+                        )
+                        dq_repaired.clamp_(min=-self.max_joint_velocity, max=self.max_joint_velocity)
+                        self.dq_safe_work.copy_(torch.where(needs_repair, dq_repaired, self.dq_safe_work))
+                        final_constr = (
+                            (grad_h * self.dq_safe_work).sum(dim=1)
+                            + kappa_eff * self.static_h.detach()
+                            - self.cbf_constraint_margin
+                        )
+                        self.static_constr.copy_(torch.where(
+                            final_active,
+                            final_constr,
+                            torch.ones_like(final_constr),
+                        ))
 
-                dq_safe = torch.clamp(
-                    dq_safe,
-                    min=-self.max_joint_velocity,
-                    max=self.max_joint_velocity,
+                    cbf_delta_vel_for_command = self.dq_safe_work - dq_nom_torch
+                    cbf_modified_mask = (
+                        torch.norm(cbf_delta_vel_for_command)
+                        > self.nominal_hold_deadband
+                    )
+                    if self.enable_cbf:
+                        cbf_active_mask_for_command = (
+                            self.static_h.detach() <= self.cbf_h_activate
+                        )
+                    else:
+                        cbf_active_mask_for_command = torch.zeros(
+                            (1,), device=self.device, dtype=torch.bool)
+
+                    if self.enable_cbf:
+                        h_now = self.static_h.detach()
+                        grad_h_dbg = self.static_grad_h.detach()
+                        self._maybe_check_gradient_direction(
+                            current_q, local_obs, h_now, grad_h_dbg)
+                        kappa_dbg = torch.where(
+                            h_now < 0.0,
+                            torch.full_like(h_now, self.cbf_recovery_kappa),
+                            torch.full_like(h_now, self.cbf_kappa),
+                        )
+
+                        dq_real = self.dq_real_measured.detach()
+
+                        if self.last_h_debug is None:
+                            h_rate = torch.zeros_like(h_now)
+                        else:
+                            h_rate = (h_now - self.last_h_debug) / max(dt_measured, 1e-6)
+                        if self.last_h_debug is None:
+                            self.last_h_debug = h_now.clone()
+                        else:
+                            self.last_h_debug.copy_(h_now)
+
+                        cmd_hdot = (grad_h_dbg * self.dq_safe_work).sum(dim=1)
+                        real_hdot = (grad_h_dbg * dq_real).sum(dim=1)
+                        real_constr = (
+                            real_hdot
+                            + kappa_dbg * h_now
+                            - self.cbf_constraint_margin
+                        )
+                        norm_dq_real = torch.norm(dq_real)
+                    else:
+                        cmd_hdot = torch.zeros((1,), device=self.device)
+                        real_hdot = torch.zeros((1,), device=self.device)
+                        real_constr = torch.zeros((1,), device=self.device)
+                        norm_dq_real = torch.zeros((), device=self.device)
+                        h_rate = torch.zeros((1,), device=self.device)
+
+                    direct_nominal_position = (
+                        self.publish_controller_command
+                        and self.cbf_direct_position_mode == "nominal_correction"
+                    )
+                    stateful_position_command = (
+                        self.publish_controller_command
+                        and self.cbf_stateful_position_command
+                        and not direct_nominal_position
+                    )
+                    if direct_nominal_position:
+                        # Publish the timed nominal position exactly when the
+                        # QP does not need to change it. If the CBF changes the
+                        # velocity, apply only that correction as a small
+                        # position offset. This preserves trajectory timing and
+                        # makes CBF a local modifier instead of a full follower.
+                        correction_dt = (
+                            self.cbf_position_correction_dt
+                            if self.cbf_position_correction_dt > 0.0
+                            else dt
+                        )
+                        cbf_delta_vel = self.dq_safe_work - dq_nom_torch
+                        cbf_delta_speed = torch.norm(cbf_delta_vel)
+                        use_reactive_step = (
+                            self.cbf_use_reactive_position_step
+                            and self.enable_cbf
+                            and bool(cbf_delta_speed > self.nominal_hold_deadband)
+                        )
+                        if use_reactive_step:
+                            # When the QP is active, command a local safe step
+                            # from the measured state. Adding a tiny correction
+                            # to an already unsafe nominal setpoint can still
+                            # let the position controller drive through the
+                            # obstacle.
+                            reactive_dt = (
+                                self.cbf_reactive_position_dt
+                                if self.cbf_reactive_position_dt > 0.0
+                                else correction_dt
+                            )
+                            torch.add(current_q, self.dq_safe_work,
+                                      alpha=reactive_dt, out=self.q_safe_work)
+                            if self.cbf_max_command_lead > 0.0:
+                                q_lead = self.q_safe_work - current_q
+                                q_lead.clamp_(min=-self.cbf_max_command_lead,
+                                              max=self.cbf_max_command_lead)
+                                self.q_safe_work.copy_(current_q + q_lead)
+                            if self.last_cbf_position_delta is not None:
+                                self.last_cbf_position_delta.zero_()
+                        else:
+                            cbf_delta = cbf_delta_vel * correction_dt
+                            if self.cbf_max_position_correction > 0.0:
+                                delta_norm = torch.norm(cbf_delta)
+                                if bool(delta_norm > self.cbf_max_position_correction):
+                                    cbf_delta = cbf_delta * (
+                                        self.cbf_max_position_correction / (delta_norm + 1e-6)
+                                    )
+                            if self.last_cbf_position_delta is None:
+                                self.last_cbf_position_delta = torch.zeros_like(cbf_delta)
+                            if self.cbf_position_correction_filter_tau > 0.0:
+                                gamma_delta = dt / (dt + self.cbf_position_correction_filter_tau)
+                                self.last_cbf_position_delta = (
+                                    (1.0 - gamma_delta) * self.last_cbf_position_delta
+                                    + gamma_delta * cbf_delta
+                                )
+                                cbf_delta = self.last_cbf_position_delta
+                            else:
+                                self.last_cbf_position_delta = cbf_delta
+                            torch.add(nominal_q, cbf_delta, out=self.q_safe_work)
+                    elif stateful_position_command:
+                        # Direct JointGroupPositionController mode: integrate
+                        # the velocity command into a persistent position
+                        # setpoint. Rebuilding q_safe from q_current every tick
+                        # can collapse the requested velocity into tiny one-step
+                        # targets that the position controller never realizes.
+                        integration_base = self.last_q_safe
+                        integration_dt = self.cbf_command_dt if self.cbf_command_dt > 0.0 else dt
+                    else:
+                        integration_base = (
+                            current_q if self.cbf_integrate_from_current
+                            else self.last_q_safe
+                        )
+                        integration_dt = (
+                            self.cbf_command_dt
+                            if self.cbf_integrate_from_current and self.cbf_command_dt > 0.0
+                            else dt
+                        )
+                    if not direct_nominal_position:
+                        torch.add(integration_base, self.dq_safe_work, alpha=integration_dt,
+                                  out=self.q_safe_work)
+                        if stateful_position_command and self.cbf_max_command_lead > 0.0:
+                            q_lead = self.q_safe_work - current_q
+                            q_lead.clamp_(min=-self.cbf_max_command_lead,
+                                          max=self.cbf_max_command_lead)
+                            self.q_safe_work.copy_(current_q + q_lead)
+                        if self.cbf_passthrough_when_inactive:
+                            # When the QP leaves the nominal velocity unchanged,
+                            # publish the timed nominal waypoint itself. The
+                            # integrated velocity target is only for local CBF
+                            # corrections, otherwise it makes free-space motion
+                            # feel delayed and weak.
+                            passthrough_mask = (
+                                (~cbf_modified_mask)
+                                & (~cbf_active_mask_for_command)
+                            ).view(1, 1)
+                            self.q_safe_work.copy_(torch.where(
+                                passthrough_mask,
+                                nominal_q,
+                                self.q_safe_work,
+                            ))
+                    self.last_q_safe.copy_(self.q_safe_work)
+                    q_lead_norm = torch.norm(self.q_safe_work - current_q)
+
+                    if self.cbf_integrate_from_current:
+                        dq_pub = self.dq_safe_work
+                    else:
+                        dq_pub = (self.q_safe_work - current_q) / dt
+
+                    # Fill CUDA transfer buffer
+                    self.transfer_buffer[0:7].copy_(dq_pub.squeeze(0))
+                    self.transfer_buffer[7:14].copy_(self.q_safe_work.squeeze(0))
+                    if self.enable_cbf:
+                        self.transfer_buffer[14].copy_(self.static_h.squeeze(0))
+                        self.transfer_buffer[15].copy_(self.static_constr.squeeze(0))
+                    else:
+                        self.transfer_buffer[14] = 1.0
+                        self.transfer_buffer[15] = 0.0
+                    self.transfer_buffer[16].copy_(alignment.squeeze(0))
+                    self.transfer_buffer[17].copy_(torch.norm(dq_nom_torch))
+                    self.transfer_buffer[18].copy_(torch.norm(self.dq_safe_work))
+                    self.transfer_buffer[19:26].copy_(nominal_q.squeeze(0))
+                    self.transfer_buffer[26:33].copy_(dq_nom_torch.squeeze(0))
+                    self.transfer_buffer[33].copy_(cmd_hdot.squeeze(0))
+                    self.transfer_buffer[34].copy_(real_hdot.squeeze(0))
+                    self.transfer_buffer[35].copy_(real_constr.squeeze(0))
+                    self.transfer_buffer[36].copy_(norm_dq_real)
+                    self.transfer_buffer[37].copy_(h_rate.squeeze(0))
+                    self.transfer_buffer[38].copy_(q_lead_norm)
+
+                # Single sync transfer to CPU
+                cpu_buffer = self.transfer_buffer.cpu().numpy()
+                dq_pub_cpu = cpu_buffer[0:7].tolist()
+                q_safe_work_cpu = cpu_buffer[7:14].tolist()
+                h_val = float(cpu_buffer[14])
+                self.last_h_value_for_feedback = h_val
+                clearance_val = h_val + self.d_safe
+                constr_val = float(cpu_buffer[15])
+                alignment_val = float(cpu_buffer[16])
+                norm_dq_nom_val = float(cpu_buffer[17])
+                norm_dq_safe_val = float(cpu_buffer[18])
+                nominal_q_cpu = cpu_buffer[19:26].tolist()
+                dq_nom_torch_cpu = cpu_buffer[26:33].tolist()
+                cmd_hdot_val = float(cpu_buffer[33])
+                real_hdot_val = float(cpu_buffer[34])
+                real_constr_val = float(cpu_buffer[35])
+                norm_dq_real_val = float(cpu_buffer[36])
+                h_rate_val = float(cpu_buffer[37])
+                q_lead_val = float(cpu_buffer[38])
+                cbf_delta_speed_val = float(
+                    np.linalg.norm(
+                        np.array(dq_pub_cpu, dtype=np.float32)
+                        - np.array(dq_nom_torch_cpu, dtype=np.float32)
+                    )
                 )
 
-                q_cmd = q_cur + dq_safe * self.cbf_command_dt
-                self.q_safe_work.copy_(q_cmd)
-                self.dq_safe_work.copy_(dq_safe)
-                self._last_q_safe = q_cmd.clone()
-                if self.last_q_safe is None:
-                    self.last_q_safe = q_cmd.clone()
-                else:
-                    self.last_q_safe.copy_(q_cmd)
+                if self.enable_cbf and self.log_cbf_events:
+                    if h_val < 0:
+                        rospy.logwarn_throttle(0.5, f"💥 CBF COLLISION: Margin breached! (h = {h_val:.4f} < 0)")
+                    elif constr_val < 0:
+                        rospy.loginfo_throttle(0.5, f"🛡️ CBF REACTIVE: Correcting trajectory (h = {h_val:.4f})")
 
-                self._viz_q = q_cur.detach().clone()
-                self._viz_dq_nom = dq_nom.detach().clone()
-                self._viz_dq_safe = dq_safe.detach().clone()
+                self.cmd_pub.publish(Float32MultiArray(data=dq_pub_cpu))
 
-            q_cmd_cpu = q_cmd.squeeze(0).cpu().numpy().tolist()
-            pos_msg = Float64MultiArray(data=q_cmd_cpu)
-            if self.pos_cmd_pub is not None:
-                self.pos_cmd_pub.publish(pos_msg)
-            self.safe_cmd_pub.publish(pos_msg)
+                pos_msg = Float64MultiArray(data=q_safe_work_cpu)
+                if self.log_cbf_events and not self._logged_first_safe_publish:
+                    # Allow this one-time logging to compute on CPU array
+                    safe_err = float(np.linalg.norm(np.array(q_safe_work_cpu) - current_q.squeeze(0).cpu().numpy()))
+                    nominal_err = float(np.linalg.norm(np.array(nominal_q_cpu) - current_q.squeeze(0).cpu().numpy()))
+                    rospy.loginfo(
+                        "CBF publishing first safe joint command | "
+                        "safe_err_to_current=%.4f rad nominal_err_to_current=%.4f rad",
+                        safe_err, nominal_err)
+                    self._logged_first_safe_publish = True
+                if (
+                    self.log_trajectory_timing
+                    and self.active_plan_stamp is not None
+                    and not self._cbf_first_safe_for_plan
+                ):
+                    safe_err = float(np.linalg.norm(
+                        np.array(q_safe_work_cpu)
+                        - current_q.squeeze(0).cpu().numpy()
+                    ))
+                    now = rospy.Time.now()
+                    rospy.loginfo(
+                        "[TRAJ TIMING] cbf_first_safe id=%d "
+                        "publish_to_cbf_safe=%.3fs expected_duration=%.3fs "
+                        "safe_err=%.4frad q_lead=%.4frad dq_nom=%.3frad/s "
+                        "dq_safe=%.3frad/s align=%.2f",
+                        self.active_plan_id,
+                        (now - self.active_plan_stamp).to_sec(),
+                        self.active_plan_duration,
+                        safe_err,
+                        q_lead_val,
+                        norm_dq_nom_val,
+                        norm_dq_safe_val,
+                        alignment_val,
+                    )
+                    self._cbf_first_safe_for_plan = True
+                self.safe_cmd_pub.publish(pos_msg)
 
-            if self.publish_debug_topics:
-                self.debug_input_pub.publish(
-                    Float64MultiArray(data=q_nom.squeeze(0).cpu().numpy().tolist()))
-                self.debug_input_vel_pub.publish(
-                    Float32MultiArray(data=dq_nom.squeeze(0).cpu().numpy().tolist()))
-                self.debug_output_pub.publish(pos_msg)
-                self.debug_output_vel_pub.publish(
-                    Float32MultiArray(data=dq_safe.squeeze(0).cpu().numpy().tolist()))
+                if self.profile_sync:
+                    torch.cuda.synchronize()
+                if self.log_cbf_command_timing:
+                    self.comp_times.append(time.perf_counter() - t_start)
+                    self._log_cuda_memory_throttle("CBF runtime")
+                    if len(self.comp_times) >= 20:
+                        avg_t = sum(self.comp_times) / len(self.comp_times)
+                        rospy.loginfo_throttle(
+                            5.0,
+                            f"⏱️ [TIMING] CBF command: {avg_t*1000:.3f} ms | "
+                            f"candidates={self.selected_num_inside} selected={self.selected_count} "
+                            f"h={h_val:.4f} clearance={clearance_val:.4f} constr={constr_val:.4f} "
+                            f"dq_nom={norm_dq_nom_val:.3f} dq_safe={norm_dq_safe_val:.3f} "
+                            f"dq_delta={cbf_delta_speed_val:.3f} "
+                            f"dq_real={norm_dq_real_val:.3f} q_lead={q_lead_val:.3f} "
+                            f"align={alignment_val:.2f} "
+                            f"hdot_cmd={cmd_hdot_val:.4f} hdot_real={real_hdot_val:.4f} "
+                            f"h_rate={h_rate_val:.4f} real_constr={real_constr_val:.4f}")
+                        self.comp_times.clear()
 
-            if self.enable_cbf and self.log_cbf_command_timing:
-                h_val = float(self.static_h.cpu().item())
-                rospy.loginfo_throttle(
-                    1.0,
-                    "[CBF] h=%.4f |dq_nom|=%.3f |dq_safe|=%.3f",
-                    h_val,
-                    float(torch.norm(dq_nom).cpu()),
-                    float(torch.norm(dq_safe).cpu()),
-                )
-                self._log_cuda_memory_throttle("CBF runtime")
+                if self.publish_debug_topics:
+                    self.debug_input_pub.publish(Float64MultiArray(data=nominal_q_cpu))
+                    self.debug_input_vel_pub.publish(Float32MultiArray(data=dq_nom_torch_cpu))
+                    self.debug_output_pub.publish(pos_msg)
+                    self.debug_output_vel_pub.publish(Float32MultiArray(data=dq_pub_cpu))
+                    self.debug_alignment_pub.publish(Float32MultiArray(data=[
+                        alignment_val,
+                        norm_dq_nom_val,
+                        norm_dq_safe_val
+                    ]))
 
+                if self.pos_cmd_pub is not None:
+                    self.pos_cmd_pub.publish(pos_msg)
+                
             self.rate.sleep()
 
 if __name__ == '__main__':
