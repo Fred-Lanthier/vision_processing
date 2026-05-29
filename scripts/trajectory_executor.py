@@ -13,7 +13,7 @@ import numpy as np
 import threading
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Float32MultiArray
 
 JOINT_NAMES = [f'panda_joint{i}' for i in range(1, 8)]
 
@@ -47,6 +47,8 @@ class TrajectoryExecutor:
         # or to /joint_group_position_controller/command to bypass it.
         self.out_topic    = rospy.get_param('~out_topic',
                                             '/joint_group_position_controller/command')
+        self.velocity_out_topic = rospy.get_param(
+            '~velocity_out_topic', '/planner/nominal_joint_velocity')
 
         self.traj_pts  = None   # list of (t_sec, q_7d)
         self.t_start   = None
@@ -64,19 +66,33 @@ class TrajectoryExecutor:
         self._last_control_stamp = None
         self._state_lock = threading.Lock()
 
+        # CBF h-value freeze: when h < cbf_hold_threshold, freeze the progress
+        # clock regardless of lag error so the nominal does not race ahead while
+        # the CBF is recovering from a constraint violation.
+        self.cbf_hold_threshold = float(rospy.get_param('~cbf_hold_threshold', 0.0))
+        self._cbf_h_value = float('inf')  # safe default until first message
+
         rospy.Subscriber('/planner/nominal_trajectory', JointTrajectory,
                          self._traj_cb, queue_size=1)
         rospy.Subscriber('/joint_states', JointState,
                          self._joint_cb, queue_size=1)
+        rospy.Subscriber('/cbf_safety/h_value', Float32MultiArray,
+                         self._cbf_h_cb, queue_size=1)
 
         self.pub = rospy.Publisher(self.out_topic, Float64MultiArray, queue_size=1)
+        self.vel_pub = rospy.Publisher(
+            self.velocity_out_topic, Float64MultiArray, queue_size=1)
         rospy.Timer(rospy.Duration(1.0 / self.rate_hz), self._control_loop)
 
         if self.log_events:
-            rospy.loginfo('trajectory_executor ready → %s at %.0f Hz',
-                          self.out_topic, self.rate_hz)
+            rospy.loginfo('trajectory_executor ready → %s and %s at %.0f Hz',
+                          self.out_topic, self.velocity_out_topic, self.rate_hz)
 
     # ── callbacks ──────────────────────────────────────────────────────────
+
+    def _cbf_h_cb(self, msg):
+        if msg.data:
+            self._cbf_h_value = float(msg.data[0])
 
     def _joint_cb(self, msg):
         now = rospy.Time.now()
@@ -255,6 +271,20 @@ class TrajectoryExecutor:
                 return q0 + alpha * (q1 - q0)
         return pts[-1][1]
 
+    def _velocity_at(self, t, pts):
+        if len(pts) < 2 or t >= pts[-1][0]:
+            return np.zeros(7, dtype=np.float64)
+        if t <= pts[0][0]:
+            t0, q0 = pts[0]
+            t1, q1 = pts[1]
+            return (q1 - q0) / max(t1 - t0, 1e-9)
+        for i in range(len(pts) - 1):
+            t0, q0 = pts[i]
+            t1, q1 = pts[i + 1]
+            if t0 <= t <= t1:
+                return (q1 - q0) / max(t1 - t0, 1e-9)
+        return np.zeros(7, dtype=np.float64)
+
     # ── control loop ───────────────────────────────────────────────────────
 
     def _control_loop(self, event):
@@ -273,6 +303,7 @@ class TrajectoryExecutor:
         if traj_pts is None or t_start is None:
             if self.hold_current_until_trajectory:
                 self.pub.publish(Float64MultiArray(data=q_hold.tolist()))
+                self.vel_pub.publish(Float64MultiArray(data=[0.0] * 7))
                 if not self._holding_logged:
                     rospy.logdebug(
                         'trajectory_executor holding latched joints until first trajectory')
@@ -289,12 +320,14 @@ class TrajectoryExecutor:
 
             q_progress = self._interpolate(exec_t, traj_pts)
             lag_err = float(np.linalg.norm(q_progress - q_current))
-            if lag_err <= self.progress_lag_limit_rad:
+            cbf_hold = self._cbf_h_value < self.cbf_hold_threshold
+            if lag_err <= self.progress_lag_limit_rad and not cbf_hold:
                 t = min(exec_t + dt_exec, traj_pts[-1][0])
             else:
                 t = exec_t
             t_cmd = min(t + self.command_lookahead_time, traj_pts[-1][0])
             q_des = self._interpolate(t_cmd, traj_pts)
+            dq_des = self._velocity_at(t_cmd, traj_pts)
             with self._state_lock:
                 if traj_pts is self.traj_pts:
                     self._exec_t = t
@@ -313,6 +346,7 @@ class TrajectoryExecutor:
                     self._min_t = t
             t_cmd = min(t + self.command_lookahead_time, traj_pts[-1][0])
             q_des = self._interpolate(t_cmd, traj_pts)
+            dq_des = self._velocity_at(t_cmd, traj_pts)
 
         active = None
         if self.log_timing:
@@ -362,6 +396,7 @@ class TrajectoryExecutor:
                 t, t_cmd, err, self.out_topic)
             self._logged_first_publish = True
         self.pub.publish(Float64MultiArray(data=q_des.tolist()))
+        self.vel_pub.publish(Float64MultiArray(data=dq_des.tolist()))
 
     def run(self):
         rospy.spin()

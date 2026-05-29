@@ -11,21 +11,21 @@
   <arg name="casf_model_name" default="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
-  <arg name="planner_rate_hz" default="5.0" />
-  <arg name="trajectory_waypoint_rate_hz" default="15.0" />
-  <arg name="control_rate_hz" default="100.0" />
+  <arg name="planner_rate_hz" default="2.5" />
+  <arg name="trajectory_waypoint_rate_hz" default="10.0" />
+  <arg name="control_rate_hz" default="60.0" />
   <arg name="cbf_preprocess_rate_hz" default="30.0" />
   <arg name="viz_rate_hz" default="5.0" />
   <arg name="bridge_rate_hz" default="60.0" />
   <arg name="bridge_horizon_points" default="1" />
   <arg name="bridge_point_dt" default="0.02" />
   <arg name="bridge_lead_time" default="0.01" />
-  <arg name="cbf_graph_points" default="50" />
+  <arg name="cbf_graph_points" default="100" />
   <arg name="cbf_preprocess_max_points" default="512" />
   <arg name="cbf_candidate_filter" default="sdf" />
   <arg name="cbf_sdf_candidate_max_dist" default="0.15" />
-  <arg name="cbf_sdf_prune_chunk_size" default="4096" />
-  <arg name="cbf_sdf_self_filter_margin" default="-0.05" />
+  <arg name="cbf_sdf_prune_chunk_size" default="2048" />
+  <arg name="cbf_sdf_self_filter_margin" default="-0.003" />
   <arg name="cbf_sdf_prefilter_radius" default="0.35" />
   <arg name="cbf_sdf_prefilter_max_points" default="1000" />
   <arg name="cbf_selection_metric" default="sdf" />
@@ -51,8 +51,8 @@
   <arg name="n_corr" default="5" />
   <arg name="alpha_corr" default="2.0" />
   <arg name="commit_distance" default="0.00" />
-  <arg name="cbf_kappa" default="1.0" />
-  <arg name="cbf_recovery_kappa" default="2.0" />
+  <arg name="cbf_kappa" default="5.0" />
+  <arg name="cbf_recovery_kappa" default="8.0" />
   <arg name="cbf_constraint_margin" default="0.005" />
   <arg name="cbf_recovery_switch_margin" default="0.000" />
   <arg name="cbf_enforce_final_constraint" default="true" />
@@ -64,11 +64,23 @@
   <arg name="cbf_max_command_lead" default="0.01" />
   <arg name="cbf_gradient_check_period" default="0.0" />
   <arg name="cbf_gradient_check_eps" default="0.001" />
-  <arg name="barrier_alpha" default="0.005" />
-  <arg name="d_safe" default="0.005" />
+  <arg name="barrier_alpha" default="0.001" />
+  <arg name="d_safe" default="0.01" />
   <arg name="cbf_kp" default="5.0" />
   <arg name="max_feedback_velocity" default="0.5" />
   <arg name="cbf_filter_tau" default="0.05" />
+  <arg name="cbf_use_nominal_velocity_topic" default="true" />
+  <arg name="cbf_nominal_velocity_timeout" default="0.25" />
+  <arg name="cbf_nominal_feedforward_gain" default="1.0" />
+  <arg name="cbf_escape_enabled" default="true" />
+  <arg name="cbf_escape_h_trigger" default="0.006" />
+  <arg name="cbf_escape_h_release" default="0.012" />
+  <arg name="cbf_escape_use_bias_corrected_h" default="true" />
+  <arg name="cbf_escape_activation_cycles" default="2" />
+  <arg name="cbf_escape_min_cbf_delta" default="0.02" />
+  <arg name="cbf_escape_tangent_gain" default="1.5" />
+  <arg name="cbf_escape_normal_gain" default="0.04" />
+  <arg name="cbf_escape_max_velocity" default="0.2" />
   <arg name="sam_tracking_rate_hz" default="5.0" />
   <arg name="sam2_max_side_length" default="512" />
   <arg name="projector_max_points" default="5000" />
@@ -78,11 +90,11 @@
   <arg name="fork_sam3_prompt" default="4 fork tips" />
   <arg name="fork_mask_dilation_px" default="5" />
   <arg name="run_3d_fork_filter_backup" default="false" />
-  <arg name="persistent_voxel_size" default="0.005" />
+  <arg name="persistent_voxel_size" default="0.01" />
   <arg name="persistent_commit_threshold" default="1" />
   <arg name="persistent_max_voxels" default="100000" />
   <arg name="persistent_robot_body_radius" default="0.03" />
-  <arg name="persistent_dilate_cloud" default="true" />
+  <arg name="persistent_dilate_cloud" default="false" />
   <arg name="persistent_publish_rate_hz" default="30.0" />
   <arg name="persistent_target_exclusion_radius" default="0.005" />
   <arg name="persistent_generate_synthetic_floor" default="true" />
@@ -93,7 +105,9 @@
   <arg name="condition_num_points" default="256" />
   <arg name="condition_target_timeout" default="5.0" />
   <arg name="condition_hold_last_target_on_loss" default="true" />
-  <arg name="condition_target_hold_max_age" default="10.0" />
+  <arg name="condition_target_hold_max_age" default="0.0" />
+  <arg name="planner_hold_last_condition_on_loss" default="true" />
+  <arg name="planner_condition_hold_max_age" default="0.0" />
   <arg name="max_joint_velocity" default="0.2" />
   <arg name="tcp_filter_radius" default="0.40" />
   <arg name="fork_filter_radius" default="0.3" />
@@ -114,6 +128,27 @@
   <arg name="log_bridge_events" default="false" />
   <arg name="trajectory_use_progress_clock" default="true" />
   <arg name="trajectory_progress_lag_limit_rad" default="0.25" />
+  <arg name="trajectory_cbf_hold_threshold" default="-1000.0" />
+  <arg name="trajectory_anchor_mode" default="start" />
+  <arg name="trajectory_command_lookahead_time" default="0.10" />
+  <arg name="trajectory_velocity_out_topic" default="/planner/nominal_joint_velocity" />
+  <arg name="enable_trajectory_projection" default="false" />
+  <arg name="trajectory_projection_iters" default="3" />
+  <arg name="trajectory_projection_margin" default="0.001" />
+  <arg name="trajectory_projection_points" default="24" />
+  <arg name="trajectory_projection_prefilter_radius" default="0.30" />
+  <arg name="trajectory_projection_prefilter_points" default="96" />
+  <arg name="trajectory_projection_check_waypoints" default="10" />
+  <arg name="trajectory_projection_active_waypoints" default="4" />
+  <arg name="trajectory_projection_candidate_margin" default="0.08" />
+  <arg name="trajectory_projection_smooth" default="0.20" />
+  <arg name="trajectory_projection_tracking" default="0.05" />
+  <arg name="trajectory_projection_max_step" default="0.15" />
+  <arg name="trajectory_projection_skip_first_waypoint" default="true" />
+  <arg name="trajectory_projection_line_search_steps" default="2" />
+  <arg name="trajectory_projection_monotonic_tolerance" default="0.0001" />
+  <arg name="trajectory_projection_max_age_ms" default="350.0" />
+  <arg name="log_trajectory_projection_timing" default="true" />
   
   <!-- 2. SAM3 Server is already included in feeding_simulation_position_controller.launch -->
   
@@ -203,6 +238,7 @@
   <!-- Generates nominal trajectories using Riemannian Metric Warping -->
   <node name="safe_generative_planner" pkg="vision_processing" type="casf_generative_node_PC.py" output="screen" cwd="node">
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
+        <remap from="/planner/nominal_trajectory" to="/planner/raw_nominal_trajectory" />
         <param name="model_name" value="$(arg casf_model_name)" />
         <!-- Woodbury metric warp gains -->
         <param name="casf_kappa" value="$(arg casf_kappa)" />
@@ -211,6 +247,8 @@
         <param name="fm_noise_seed" value="$(arg fm_noise_seed)" />
         <param name="use_temporal_ensembler" value="$(arg use_temporal_ensembler)" />
         <param name="wait_for_cbf_ready" value="$(arg planner_wait_for_cbf_ready)" />
+        <param name="hold_last_condition_on_loss" value="$(arg planner_hold_last_condition_on_loss)" />
+        <param name="condition_hold_max_age" value="$(arg planner_condition_hold_max_age)" />
         <param name="ensembler_buffer_size" value="$(arg ensembler_buffer_size)" />
         <param name="ensembler_decay" value="$(arg ensembler_decay)" />
         <param name="log_trajectory_timing" value="$(arg log_trajectory_timing)" />
@@ -235,15 +273,51 @@
         <param name="tcp_frame" value="panda_TCP" />
   </node>
 
+  <!-- 6.5. SDF Trajectory Projector -->
+  <!-- Reshapes the full FM joint trajectory before the time executor follows it.
+       This gives the CBF a nominal path that already leaves the bowl/obstacle
+       margin, instead of asking the online CBF to perform the whole bypass. -->
+  <node name="sdf_trajectory_projector" pkg="vision_processing" type="sdf_trajectory_projector.py" output="screen" cwd="node">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
+        <param name="enabled" value="$(arg enable_trajectory_projection)" />
+        <param name="input_topic" value="/planner/raw_nominal_trajectory" />
+        <param name="output_topic" value="/planner/nominal_trajectory" />
+        <param name="obs_topic" value="/perception/persistent_obstacles" />
+        <param name="d_safe" value="$(arg d_safe)" />
+        <param name="barrier_alpha" value="$(arg barrier_alpha)" />
+        <param name="projection_iters" value="$(arg trajectory_projection_iters)" />
+        <param name="projection_margin" value="$(arg trajectory_projection_margin)" />
+        <param name="projection_max_points" value="$(arg trajectory_projection_points)" />
+        <param name="prefilter_radius" value="$(arg trajectory_projection_prefilter_radius)" />
+        <param name="prefilter_max_points" value="$(arg trajectory_projection_prefilter_points)" />
+        <param name="check_waypoints" value="$(arg trajectory_projection_check_waypoints)" />
+        <param name="active_waypoints" value="$(arg trajectory_projection_active_waypoints)" />
+        <param name="sdf_candidate_margin" value="$(arg trajectory_projection_candidate_margin)" />
+        <param name="smooth_relaxation" value="$(arg trajectory_projection_smooth)" />
+        <param name="tracking_relaxation" value="$(arg trajectory_projection_tracking)" />
+        <param name="max_joint_step_per_iter" value="$(arg trajectory_projection_max_step)" />
+        <param name="max_joint_velocity" value="$(arg max_joint_velocity)" />
+        <param name="skip_first_waypoint" value="$(arg trajectory_projection_skip_first_waypoint)" />
+        <param name="line_search_steps" value="$(arg trajectory_projection_line_search_steps)" />
+        <param name="monotonic_tolerance" value="$(arg trajectory_projection_monotonic_tolerance)" />
+        <param name="projection_max_age_ms" value="$(arg trajectory_projection_max_age_ms)" />
+        <param name="log_timing" value="$(arg log_trajectory_projection_timing)" />
+        <param name="publish_viz" value="$(arg launch_rviz)" />
+  </node>
+
   <!-- 7. Trajectory Executor -->
   <!-- Interpolates the CASF JointTrajectory at the control rate and feeds the CBF. -->
   <node name="trajectory_executor" pkg="vision_processing" type="trajectory_executor.py" output="screen">
         <param name="rate_hz"   value="$(arg control_rate_hz)" />
         <param name="out_topic" value="/planner/nominal_joint_command" />
+        <param name="velocity_out_topic" value="$(arg trajectory_velocity_out_topic)" />
         <param name="hold_current_until_trajectory" value="true" />
         <param name="log_timing" value="$(arg log_trajectory_timing)" />
         <param name="use_progress_clock" value="$(arg trajectory_use_progress_clock)" />
         <param name="progress_lag_limit_rad" value="$(arg trajectory_progress_lag_limit_rad)" />
+        <param name="cbf_hold_threshold" value="$(arg trajectory_cbf_hold_threshold)" />
+        <param name="anchor_mode" value="$(arg trajectory_anchor_mode)" />
+        <param name="command_lookahead_time" value="$(arg trajectory_command_lookahead_time)" />
         <param name="log_events" value="$(arg log_trajectory_executor_events)" />
   </node>
 
@@ -294,6 +368,19 @@
         <param name="cbf_kp"                   value="$(arg cbf_kp)" />
         <param name="max_feedback_velocity"    value="$(arg max_feedback_velocity)" />
         <param name="cbf_filter_tau"           value="$(arg cbf_filter_tau)" />
+        <param name="use_nominal_velocity_topic" value="$(arg cbf_use_nominal_velocity_topic)" />
+        <param name="nominal_velocity_topic" value="$(arg trajectory_velocity_out_topic)" />
+        <param name="nominal_velocity_timeout" value="$(arg cbf_nominal_velocity_timeout)" />
+        <param name="nominal_feedforward_gain" value="$(arg cbf_nominal_feedforward_gain)" />
+        <param name="cbf_escape_enabled"       value="$(arg cbf_escape_enabled)" />
+        <param name="cbf_escape_h_trigger"     value="$(arg cbf_escape_h_trigger)" />
+        <param name="cbf_escape_h_release"     value="$(arg cbf_escape_h_release)" />
+        <param name="cbf_escape_use_bias_corrected_h" value="$(arg cbf_escape_use_bias_corrected_h)" />
+        <param name="cbf_escape_activation_cycles" value="$(arg cbf_escape_activation_cycles)" />
+        <param name="cbf_escape_min_cbf_delta" value="$(arg cbf_escape_min_cbf_delta)" />
+        <param name="cbf_escape_tangent_gain"  value="$(arg cbf_escape_tangent_gain)" />
+        <param name="cbf_escape_normal_gain"   value="$(arg cbf_escape_normal_gain)" />
+        <param name="cbf_escape_max_velocity"  value="$(arg cbf_escape_max_velocity)" />
         <param name="tcp_filter_radius" value="$(arg tcp_filter_radius)" />
         <param name="fork_filter_radius" value="$(arg fork_filter_radius)" />
         <!-- persistent_obstacles is built from cleaned_obstacles (food already excluded by SAM2)

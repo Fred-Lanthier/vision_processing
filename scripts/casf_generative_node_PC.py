@@ -288,11 +288,16 @@ class CASFGenerativeNode:
         self.log_trajectory_timing = _bool_param("~log_trajectory_timing", True)
         self.wait_for_cbf_ready = _bool_param("~wait_for_cbf_ready", True)
         self.cbf_ready = not self.wait_for_cbf_ready
+        self.hold_last_condition_on_loss = _bool_param(
+            "~hold_last_condition_on_loss", True)
+        self.condition_hold_max_age = float(rospy.get_param(
+            "~condition_hold_max_age", 0.0))
         self.plan_seq = 0
         self.plan_published = False
         self.is_committed = False
         self.fork_food_distance = float('inf')
         self.latest_cloud_gpu = None
+        self.latest_cloud_stamp = None
         self.ensembler = TemporalEnsembler(
             pred_horizon=self.pred_horizon,
             buffer_size=self.ensembler_buffer_size,
@@ -412,15 +417,32 @@ class CASFGenerativeNode:
             points = np.frombuffer(msg.data, dtype=np.float32).reshape(-1, int(msg.point_step/4))
             points = points[:, :3]
             
-            # Explicitly clear the cache if perception sends an empty cloud
+            # Empty condition clouds usually mean the target detector lost the
+            # object. Keep the last valid conditioning cloud so replanning does
+            # not stop during short SAM3/SAM2 dropouts.
             if len(points) == 0:
+                if self.hold_last_condition_on_loss and self.latest_cloud_gpu is not None:
+                    if self.latest_cloud_stamp is None:
+                        age = 0.0
+                    else:
+                        age = rospy.get_time() - self.latest_cloud_stamp
+                    if self.condition_hold_max_age <= 0.0 or age <= self.condition_hold_max_age:
+                        rospy.logwarn_throttle(
+                            5.0,
+                            "Condition cloud empty; continuing with last valid conditioning cloud "
+                            "(age %.1fs).",
+                            age,
+                        )
+                        return
                 self.latest_cloud_gpu = None
+                self.latest_cloud_stamp = None
                 return
                 
             points = stable_numpy_sample(points, self.num_points_pcd)
             
             if len(points) > 0:
                 self.latest_cloud_gpu = torch.from_numpy(points.copy()).float().to(self.device)
+                self.latest_cloud_stamp = rospy.get_time()
         except Exception as e:
             rospy.logerr_throttle(5.0, f"Error unpacking merged cloud: {e}")
 

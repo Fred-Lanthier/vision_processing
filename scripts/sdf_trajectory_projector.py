@@ -111,6 +111,8 @@ class SDFTrajectoryProjector:
         # Worker thread state
         self._pending_msg = None
         self._pending_time = 0.0
+        self._pending_seq = 0
+        self._input_seq = 0
         self._pending_lock = threading.Lock()
         self._work_event = threading.Event()
 
@@ -237,13 +239,18 @@ class SDFTrajectoryProjector:
     # ------------------------------------------------------------------
 
     def _trajectory_cb(self, msg):
-        """Queue trajectory for the worker. The worker always publishes the result."""
+        """Publish raw trajectory immediately, then queue projection work."""
         if not msg.points:
+            return
+        self.pub.publish(msg)
+        if not self.enabled:
             return
         received_time = time.perf_counter()
         with self._pending_lock:
+            self._input_seq += 1
             self._pending_msg = msg
             self._pending_time = received_time
+            self._pending_seq = self._input_seq
         self._work_event.set()
 
     # ------------------------------------------------------------------
@@ -259,12 +266,13 @@ class SDFTrajectoryProjector:
             with self._pending_lock:
                 msg = self._pending_msg
                 received_time = self._pending_time
+                seq = self._pending_seq
                 self._pending_msg = None
 
             if msg is not None:
-                self._process_trajectory(msg, received_time)
+                self._process_trajectory(msg, received_time, seq)
 
-    def _process_trajectory(self, msg, received_time):
+    def _process_trajectory(self, msg, received_time, seq):
         """Project trajectory and always publish the best result available."""
         t0 = time.perf_counter()
         q_nom = torch.tensor(
@@ -357,27 +365,44 @@ class SDFTrajectoryProjector:
             q_out[2] = 0.95 * q_out[2] + 0.05 * (q0 + qdot * dt_2)
             q_out = self._enforce_segment_velocity(q_out, times)
 
+        age_ms = (time.perf_counter() - received_time) * 1000.0
+        with self._pending_lock:
+            latest = seq == self._input_seq
+        fresh = age_ms <= self.projection_max_age_ms
         out_msg = self._make_output_msg(msg, q_out)
-        self.pub.publish(out_msg)
-        if projected and self.publish_viz:
-            self._publish_viz(q_out)
+        if projected and fresh and latest:
+            self.pub.publish(out_msg)
+            if self.publish_viz:
+                self._publish_viz(q_out)
+        elif projected and (not fresh or not latest):
+            rospy.logwarn_throttle(
+                1.0,
+                "SDF trajectory projection discarded result: age=%.0f ms "
+                "max_age=%.0f ms latest=%s h_raw=%.4f h_proj=%.4f",
+                age_ms,
+                self.projection_max_age_ms,
+                latest,
+                raw_min_h,
+                final_min_h,
+            )
 
         if self.log_timing:
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            age_ms = (time.perf_counter() - received_time) * 1000.0
             max_delta = float(torch.norm(q_out - q_nom, dim=1).max().item())
             success = final_min_h >= self.projection_margin
             improved = projected
             rospy.loginfo(
                 "⏱️ [TIMING] SDF trajectory projection: %.2f ms (age %.0f ms) | "
-                "projected=%s points=%d check=%d obs_pref=%d obs=%d "
+                "projected=%s fresh=%s latest=%s points=%d check=%d obs_pref=%d obs=%d "
                 "h_raw=%.4f h_proj=%.4f success=%s improved=%s "
                 "max_delta=%.4frad",
                 elapsed_ms,
                 age_ms,
                 projected,
+                fresh,
+                latest,
                 q_nom.shape[0],
                 eval_n,
                 obs_prefiltered_n,
