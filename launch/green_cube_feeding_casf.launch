@@ -11,9 +11,9 @@
   <arg name="casf_model_name" default="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
-  <arg name="planner_rate_hz" default="2.5" />
+  <arg name="planner_rate_hz" default="8" />
   <arg name="trajectory_waypoint_rate_hz" default="10.0" />
-  <arg name="control_rate_hz" default="60.0" />
+  <arg name="control_rate_hz" default="80.0" />
   <arg name="cbf_preprocess_rate_hz" default="30.0" />
   <arg name="viz_rate_hz" default="5.0" />
   <arg name="bridge_rate_hz" default="60.0" />
@@ -47,21 +47,25 @@
   <arg name="planner_wait_for_cbf_ready" default="true" />
   <arg name="ensembler_buffer_size" default="5" />
   <arg name="ensembler_decay" default="0.5" />
+  <arg name="trajectory_retime_mode" default="joint_speed" />
+  <arg name="trajectory_retime_joint_speed" default="0.25" />
+  <arg name="trajectory_retime_joint_weights" default="1 1 1 1 1 1 1" />
+  <arg name="trajectory_retime_min_segment_fraction" default="0.02" />
   <arg name="n_pred" default="10" />
   <arg name="n_corr" default="5" />
   <arg name="alpha_corr" default="2.0" />
   <arg name="commit_distance" default="0.00" />
-  <arg name="cbf_kappa" default="5.0" />
-  <arg name="cbf_recovery_kappa" default="8.0" />
-  <arg name="cbf_constraint_margin" default="0.005" />
+  <arg name="cbf_kappa" default="3.0" />
+  <arg name="cbf_recovery_kappa" default="5.0" />
+  <arg name="cbf_constraint_margin" default="0.001" />
   <arg name="cbf_recovery_switch_margin" default="0.000" />
   <arg name="cbf_enforce_final_constraint" default="true" />
   <arg name="cbf_integrate_from_current" default="true" />
   <arg name="cbf_command_dt" default="0.05" />
   <arg name="cbf_stateful_position_command" default="true" />
   <arg name="cbf_direct_position_mode" default="nominal_correction" />
-  <arg name="cbf_position_correction_dt" default="0.04" />
-  <arg name="cbf_max_command_lead" default="0.01" />
+  <arg name="cbf_position_correction_dt" default="0.08" />
+  <arg name="cbf_max_command_lead" default="0.05" />
   <arg name="cbf_gradient_check_period" default="0.0" />
   <arg name="cbf_gradient_check_eps" default="0.001" />
   <arg name="barrier_alpha" default="0.001" />
@@ -69,6 +73,7 @@
   <arg name="cbf_kp" default="5.0" />
   <arg name="max_feedback_velocity" default="0.5" />
   <arg name="cbf_filter_tau" default="0.05" />
+  <arg name="cbf_velocity_filter_tau" default="0.2" />
   <arg name="cbf_use_nominal_velocity_topic" default="true" />
   <arg name="cbf_nominal_velocity_timeout" default="0.25" />
   <arg name="cbf_nominal_feedforward_gain" default="1.0" />
@@ -80,6 +85,7 @@
   <arg name="cbf_escape_min_cbf_delta" default="0.02" />
   <arg name="cbf_escape_tangent_gain" default="1.5" />
   <arg name="cbf_escape_normal_gain" default="0.04" />
+  <arg name="cbf_escape_normal_h_trigger" default="0.0" />
   <arg name="cbf_escape_max_velocity" default="0.2" />
   <arg name="sam_tracking_rate_hz" default="5.0" />
   <arg name="sam2_max_side_length" default="512" />
@@ -108,7 +114,7 @@
   <arg name="condition_target_hold_max_age" default="0.0" />
   <arg name="planner_hold_last_condition_on_loss" default="true" />
   <arg name="planner_condition_hold_max_age" default="0.0" />
-  <arg name="max_joint_velocity" default="0.2" />
+  <arg name="max_joint_velocity" default="0.7" />
   <arg name="tcp_filter_radius" default="0.40" />
   <arg name="fork_filter_radius" default="0.3" />
   <arg name="cuda_memory_log_period" default="0.0" />
@@ -261,6 +267,10 @@
         <param name="d_safe" value="$(arg d_safe)" />
         <param name="planner_rate_hz" value="$(arg planner_rate_hz)" />
         <param name="trajectory_waypoint_rate_hz" value="$(arg trajectory_waypoint_rate_hz)" />
+        <param name="trajectory_retime_mode" value="$(arg trajectory_retime_mode)" />
+        <param name="trajectory_retime_joint_speed" value="$(arg trajectory_retime_joint_speed)" />
+        <param name="trajectory_retime_joint_weights" value="$(arg trajectory_retime_joint_weights)" />
+        <param name="trajectory_retime_min_segment_fraction" value="$(arg trajectory_retime_min_segment_fraction)" />
         <param name="commit_distance" value="$(arg commit_distance)" />
         <param name="merged_cloud_contains_fork" value="true" />
         <param name="obstacle_pre_sample_max" value="$(arg obstacle_pre_sample_max)" />
@@ -368,6 +378,7 @@
         <param name="cbf_kp"                   value="$(arg cbf_kp)" />
         <param name="max_feedback_velocity"    value="$(arg max_feedback_velocity)" />
         <param name="cbf_filter_tau"           value="$(arg cbf_filter_tau)" />
+        <param name="cbf_velocity_filter_tau"  value="$(arg cbf_velocity_filter_tau)" />
         <param name="use_nominal_velocity_topic" value="$(arg cbf_use_nominal_velocity_topic)" />
         <param name="nominal_velocity_topic" value="$(arg trajectory_velocity_out_topic)" />
         <param name="nominal_velocity_timeout" value="$(arg cbf_nominal_velocity_timeout)" />
@@ -380,6 +391,7 @@
         <param name="cbf_escape_min_cbf_delta" value="$(arg cbf_escape_min_cbf_delta)" />
         <param name="cbf_escape_tangent_gain"  value="$(arg cbf_escape_tangent_gain)" />
         <param name="cbf_escape_normal_gain"   value="$(arg cbf_escape_normal_gain)" />
+        <param name="cbf_escape_normal_h_trigger" value="$(arg cbf_escape_normal_h_trigger)" />
         <param name="cbf_escape_max_velocity"  value="$(arg cbf_escape_max_velocity)" />
         <param name="tcp_filter_radius" value="$(arg tcp_filter_radius)" />
         <param name="fork_filter_radius" value="$(arg fork_filter_radius)" />

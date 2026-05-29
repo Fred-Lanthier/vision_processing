@@ -148,6 +148,9 @@ class CBFSafetyNode:
         self.cbf_kp = float(rospy.get_param("~cbf_kp", 10.0))
         self.max_feedback_velocity = float(rospy.get_param("~max_feedback_velocity", 0.05))
         self.cbf_filter_tau = float(rospy.get_param("~cbf_filter_tau", 0.05))
+        self.cbf_velocity_filter_tau = float(rospy.get_param(
+            "~cbf_velocity_filter_tau", 0.08))
+        self._dq_safe_filtered = None
         self.use_nominal_velocity_topic = _bool_param("~use_nominal_velocity_topic", True)
         self.nominal_velocity_topic = rospy.get_param(
             "~nominal_velocity_topic", "/planner/nominal_joint_velocity")
@@ -166,6 +169,8 @@ class CBFSafetyNode:
             "~cbf_escape_min_cbf_delta", 0.02))
         self.cbf_escape_tangent_gain = float(rospy.get_param("~cbf_escape_tangent_gain", 1.0))
         self.cbf_escape_normal_gain = float(rospy.get_param("~cbf_escape_normal_gain", 0.04))
+        self.cbf_escape_normal_h_trigger = float(rospy.get_param(
+            "~cbf_escape_normal_h_trigger", 0.0))
         self.cbf_escape_max_velocity = float(rospy.get_param("~cbf_escape_max_velocity", 0.08))
         self._cbf_escape_active_cycles = 0
         self.last_nominal_q = None
@@ -1192,6 +1197,8 @@ class CBFSafetyNode:
                 )
                 dq_nom_base = dq_nom.clone()
                 dq_escape = torch.zeros_like(dq_nom_base)
+                dq_escape_tangent = torch.zeros_like(dq_nom_base)
+                dq_escape_normal = torch.zeros_like(dq_nom_base)
                 escape_active = False
 
                 if self.enable_cbf:
@@ -1235,7 +1242,8 @@ class CBFSafetyNode:
                             normal_speed = (dq_nom_base * normal_dir).sum(dim=1, keepdim=True)
                             dq_tangent = dq_nom_base - normal_speed * normal_dir
 
-                            dq_escape = self.cbf_escape_tangent_gain * dq_tangent
+                            dq_escape_tangent = self.cbf_escape_tangent_gain * dq_tangent
+                            dq_escape = dq_escape_tangent.clone()
                             if self.cbf_escape_normal_gain > 0.0:
                                 h_trigger = max(abs(self.cbf_escape_h_trigger), 1e-6)
                                 h_scale = (
@@ -1244,15 +1252,15 @@ class CBFSafetyNode:
                                     else self.static_h.detach()
                                 )
                                 normal_scale = torch.clamp(
-                                    (self.cbf_escape_h_trigger - h_scale).view(-1, 1)
+                                    (self.cbf_escape_normal_h_trigger - h_scale).view(-1, 1)
                                     / h_trigger,
                                     min=0.0,
                                     max=1.5,
                                 )
-                                dq_escape = (
-                                    dq_escape
-                                    + self.cbf_escape_normal_gain * normal_scale * normal_dir
+                                dq_escape_normal = (
+                                    self.cbf_escape_normal_gain * normal_scale * normal_dir
                                 )
+                                dq_escape = dq_escape + dq_escape_normal
 
                             if self.cbf_escape_max_velocity > 0.0:
                                 escape_norm = torch.norm(dq_escape, dim=1, keepdim=True)
@@ -1260,6 +1268,8 @@ class CBFSafetyNode:
                                     self.cbf_escape_max_velocity / (escape_norm + 1e-6),
                                     max=1.0,
                                 )
+                                dq_escape_tangent = dq_escape_tangent * escape_scale
+                                dq_escape_normal = dq_escape_normal * escape_scale
                                 dq_escape = dq_escape * escape_scale
 
                             dq_nom = torch.clamp(
@@ -1306,12 +1316,33 @@ class CBFSafetyNode:
                     min=-self.max_joint_velocity,
                     max=self.max_joint_velocity,
                 )
+                dq_safe_pre_filter = dq_safe.clone()
+                velocity_filter_active = False
+
+                if self.cbf_velocity_filter_tau > 0.0:
+                    gamma_cmd = dt / (dt + self.cbf_velocity_filter_tau)
+                    if self._dq_safe_filtered is None:
+                        self._dq_safe_filtered = dq_safe.clone()
+                    else:
+                        self._dq_safe_filtered = (
+                            (1.0 - gamma_cmd) * self._dq_safe_filtered
+                            + gamma_cmd * dq_safe
+                        )
+                    dq_safe = torch.clamp(
+                        self._dq_safe_filtered.clone(),
+                        min=-self.max_joint_velocity,
+                        max=self.max_joint_velocity,
+                    )
+                    velocity_filter_active = True
+                else:
+                    self._dq_safe_filtered = None
 
                 if self.enable_cbf and self.cbf_enforce_final_constraint:
                     # The velocity clamp can invalidate the single half-space
-                    # projection computed inside the CUDA graph. Repair once
-                    # after clamping so the command still satisfies the active
-                    # CBF inequality when the joint limits allow it.
+                    # projection computed inside the CUDA graph. Filtering can
+                    # also reintroduce an unsafe normal component. Repair once
+                    # after clamping/filtering so the command still satisfies
+                    # the active CBF inequality when joint limits allow it.
                     grad_h = self.static_grad_h.detach()
                     grad_norm_sq = (grad_h ** 2).sum(dim=1, keepdim=True)
                     h_now = self.static_h.detach()
@@ -1477,7 +1508,8 @@ class CBFSafetyNode:
                         "[CBF] h_soft=%.4f h_bias_corr=%.4f bias=%.4f "
                         "h_gate=%.4f vel_src=%s escape=%s cycles=%d "
                         "|dq_ff|=%.3f |dq_base|=%.3f |dq_cbf_delta|=%.3f "
-                        "|dq_escape|=%.3f |dq_des|=%.3f |dq_safe|=%.3f",
+                        "|dq_esc_t|=%.3f |dq_esc_n|=%.3f |dq_escape|=%.3f "
+                        "|dq_des|=%.3f vel_filt=%s |dq_pre_filt|=%.3f |dq_safe|=%.3f",
                         h_val,
                         h_bias_corrected,
                         h_bias,
@@ -1488,8 +1520,12 @@ class CBFSafetyNode:
                         float(torch.norm(dq_feedforward).cpu()),
                         float(torch.norm(dq_nom_base).cpu()),
                         base_delta_value,
+                        float(torch.norm(dq_escape_tangent).cpu()),
+                        float(torch.norm(dq_escape_normal).cpu()),
                         float(torch.norm(dq_escape).cpu()),
                         float(torch.norm(dq_nom).cpu()),
+                        velocity_filter_active,
+                        float(torch.norm(dq_safe_pre_filter).cpu()),
                         float(torch.norm(dq_safe).cpu()),
                     )
                     self._log_cuda_memory_throttle("CBF runtime")

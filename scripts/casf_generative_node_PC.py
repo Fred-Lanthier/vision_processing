@@ -279,6 +279,17 @@ class CASFGenerativeNode:
         if self.trajectory_waypoint_rate_hz <= 0.0:
             raise ValueError("~trajectory_waypoint_rate_hz must be > 0")
         self.trajectory_waypoint_dt = 1.0 / self.trajectory_waypoint_rate_hz
+        self.trajectory_retime_mode = str(rospy.get_param(
+            "~trajectory_retime_mode", "joint_speed")).lower()
+        if self.trajectory_retime_mode not in ("uniform", "joint_arc", "joint_speed"):
+            raise ValueError(
+                "~trajectory_retime_mode must be 'uniform', 'joint_arc', or 'joint_speed'")
+        self.trajectory_retime_joint_speed = float(rospy.get_param(
+            "~trajectory_retime_joint_speed", 0.25))
+        self.trajectory_retime_min_segment_fraction = float(rospy.get_param(
+            "~trajectory_retime_min_segment_fraction", 0.02))
+        self.trajectory_retime_joint_weights = self._parse_joint_weights(
+            rospy.get_param("~trajectory_retime_joint_weights", "1 1 1 1 1 1 1"))
         self.ensembler_buffer_size = max(1, int(rospy.get_param("~ensembler_buffer_size", 3)))
         self.ensembler_decay = float(rospy.get_param("~ensembler_decay", 1.0))
         self.use_temporal_ensembler = _bool_param("~use_temporal_ensembler", False)
@@ -360,6 +371,80 @@ class CASFGenerativeNode:
             return pts[idx]
 
         return pts
+
+    def _parse_joint_weights(self, value):
+        if isinstance(value, str):
+            weights = np.fromstring(value.replace(",", " "), sep=" ", dtype=np.float64)
+        else:
+            weights = np.asarray(value, dtype=np.float64).reshape(-1)
+        if weights.size != 7:
+            rospy.logwarn(
+                "Invalid trajectory_retime_joint_weights=%s; using all ones.",
+                value,
+            )
+            weights = np.ones(7, dtype=np.float64)
+        weights = np.where(np.isfinite(weights), weights, 1.0)
+        return np.maximum(weights, 1e-3)
+
+    def _retime_joint_trajectory(self, q_traj):
+        q_arm = np.asarray(q_traj, dtype=np.float64)[:, :7]
+        n_points = q_arm.shape[0]
+        if n_points == 0:
+            return np.empty((0,), dtype=np.float64), {}
+        if n_points == 1:
+            return np.zeros((1,), dtype=np.float64), {
+                "mode": "single",
+                "weighted_path": 0.0,
+                "min_dt": 0.0,
+                "max_dt": 0.0,
+            }
+
+        nominal_total = (n_points - 1) * self.trajectory_waypoint_dt
+        if self.trajectory_retime_mode == "uniform":
+            times = np.arange(n_points, dtype=np.float64) * self.trajectory_waypoint_dt
+            return times, {
+                "mode": "uniform",
+                "weighted_path": 0.0,
+                "min_dt": self.trajectory_waypoint_dt,
+                "max_dt": self.trajectory_waypoint_dt,
+            }
+
+        weighted_dq = np.diff(q_arm, axis=0) * self.trajectory_retime_joint_weights.reshape(1, 7)
+        segment_lengths = np.linalg.norm(weighted_dq, axis=1)
+        weighted_path = float(np.sum(segment_lengths))
+        if weighted_path <= 1e-9 or not np.isfinite(weighted_path):
+            times = np.arange(n_points, dtype=np.float64) * self.trajectory_waypoint_dt
+            return times, {
+                "mode": "uniform_fallback",
+                "weighted_path": weighted_path,
+                "min_dt": self.trajectory_waypoint_dt,
+                "max_dt": self.trajectory_waypoint_dt,
+            }
+
+        min_fraction = max(0.0, self.trajectory_retime_min_segment_fraction)
+        min_length = min_fraction * weighted_path / max(1, n_points - 1)
+        segment_weights = np.maximum(segment_lengths, min_length)
+        if self.trajectory_retime_mode == "joint_speed":
+            speed = max(self.trajectory_retime_joint_speed, 1e-6)
+            segment_dt = segment_weights / speed
+            times = np.concatenate(([0.0], np.cumsum(segment_dt)))
+            return times, {
+                "mode": "joint_speed",
+                "weighted_path": weighted_path,
+                "target_speed": speed,
+                "min_dt": float(np.min(segment_dt)),
+                "max_dt": float(np.max(segment_dt)),
+            }
+
+        segment_dt = nominal_total * segment_weights / max(np.sum(segment_weights), 1e-9)
+        times = np.concatenate(([0.0], np.cumsum(segment_dt)))
+        times[-1] = nominal_total
+        return times, {
+            "mode": "joint_arc",
+            "weighted_path": weighted_path,
+            "min_dt": float(np.min(segment_dt)),
+            "max_dt": float(np.max(segment_dt)),
+        }
 
     def initial_fm_noise(self, batch_size, horizon, action_dim):
         if self.fm_noise_seed < 0:
@@ -1061,11 +1146,12 @@ class CASFGenerativeNode:
         msg.header.stamp = rospy.Time.now()
         msg.header.frame_id = "world"
         msg.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
+        time_stamps, retime_stats = self._retime_joint_trajectory(q_traj)
         
         for i in range(len(q_traj)):
             point = JointTrajectoryPoint()
             point.positions = q_traj[i][:7].tolist()
-            point.time_from_start = rospy.Duration(i * self.trajectory_waypoint_dt)
+            point.time_from_start = rospy.Duration(float(time_stamps[i]))
             msg.points.append(point)
             
         self.traj_pub.publish(msg)
@@ -1086,16 +1172,22 @@ class CASFGenerativeNode:
             )
             rospy.loginfo(
                 "[TRAJ TIMING] published id=%d points=%d expected_duration=%.3fs "
-                "waypoint_dt=%.3fs capture_to_publish=%.3fs build=%.1fms "
-                "publish_ik=%.1fms joint_path=%.3frad first_step=%.3frad max_step=%.3frad",
+                "waypoint_dt=%.3fs retime=%s speed=%.3frad/s dt_range=[%.3f, %.3f]s "
+                "capture_to_publish=%.3fs build=%.1fms publish_ik=%.1fms "
+                "joint_path=%.3frad weighted_path=%.3f first_step=%.3frad max_step=%.3frad",
                 self.plan_seq,
                 len(msg.points),
                 expected_duration,
                 self.trajectory_waypoint_dt,
+                retime_stats.get("mode", "unknown"),
+                retime_stats.get("target_speed", 0.0),
+                retime_stats.get("min_dt", 0.0),
+                retime_stats.get("max_dt", 0.0),
                 rospy.get_time() - t_capture,
                 (time.perf_counter() - t_build_start) * 1000.0,
                 t_publish_ik * 1000.0,
                 joint_path,
+                retime_stats.get("weighted_path", 0.0),
                 first_step,
                 max_step,
             )
