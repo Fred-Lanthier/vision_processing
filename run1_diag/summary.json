@@ -1,0 +1,15 @@
+{
+  "duration_s": 18.503999999999998,
+  "cycles": 1333,
+  "pct_dummy_selection": 6.22655663915979,
+  "min_h": -0.014073112048208714,
+  "min_h_corr": -0.009467941708862782,
+  "pct_cbf_active": 84.08,
+  "pct_escape": 82.64,
+  "pct_cap_active": 0.0,
+  "pct_recovery": 0.0,
+  "pct_repair": 38.56,
+  "worst_final_constraint": -3.92901711165905e-07,
+  "mean_total_ms": 9.549705672961649,
+  "p99_total_ms": 22.351477813720756
+}

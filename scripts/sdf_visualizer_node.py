@@ -47,7 +47,7 @@ from third_party.SDF_Bernstein_Basis.bernstein_core import BernsteinCore
 LINK_NAMES = [
     'panda_link0', 'panda_link1', 'panda_link2', 'panda_link3',
     'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
-    'panda_hand', 'panda_leftfinger', 'panda_rightfinger', 'fork_tip',
+    'panda_hand', 'fork_tip',
 ]
 
 LINK_COLORS_RGB = [

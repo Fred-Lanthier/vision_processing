@@ -1,7 +1,8 @@
 <?xml version="1.0"?>
 <launch>
   <arg name="arm_id" default="panda"/>
-  <arg name="paused" default="false"/>
+  <!-- Keep physics paused until every model and the selected controller exist. -->
+  <arg name="paused" default="true"/>
   <arg name="gui" default="true"/>
   <arg name="use_direct_group_position_controller" default="false"/>
 
@@ -45,14 +46,14 @@
 
   <node name="spawn_container" pkg="gazebo_ros" type="spawn_model"
         args="-urdf -param container_description -model container
-              -x 0.43 -y 0.0 -z 0.76"/>
+              -x 0.43 -y 0.0 -z 0.778 -R 1.5708"/>
 
   <param name="food_description"
          textfile="$(find vision_processing)/urdf/food.urdf"/>
 
   <node name="spawn_food" pkg="gazebo_ros" type="spawn_model"
         args="-urdf -param food_description -model food_cube
-              -x 0.5 -y 0.0 -z 0.775"/>
+              -x 0.43 -y 0.0 -z 0.764"/>
 
   <param name="robot_description"
          command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro arm_id:=$(arg arm_id)"/>
@@ -103,25 +104,28 @@
         pkg="vision_processing" type="franka_state_camera_reader"
         respawn="true" output="screen"/>
 
-  <node name="publish_homing_hold"
-        pkg="vision_processing" type="publish_homing_hold.py"
+  <node name="unpause_after_trajectory_controller_hold"
+        pkg="vision_processing" type="unpause_after_controller_hold.py"
         output="screen"
         unless="$(arg use_direct_group_position_controller)">
     <param name="controller_name" value="position_joint_trajectory_controller"/>
     <param name="command_topic" value="/position_joint_trajectory_controller/command"/>
+    <param name="command_type" value="trajectory"/>
+    <rosparam param="expected_models">[person, table, container, food_cube, panda]</rosparam>
     <rosparam param="homing_position">[-0.000059, -0.125928, 0.000117, -2.193312, -0.000251, 2.064780, 0.785511]</rosparam>
     <param name="lead_time" value="0.10"/>
     <param name="hold_duration" value="2.0"/>
     <param name="publish_repeats" value="20"/>
     <param name="publish_period" value="0.05"/>
   </node>
-  <node name="publish_group_homing_hold"
-        pkg="vision_processing" type="publish_homing_hold.py"
+  <node name="unpause_after_group_controller_hold"
+        pkg="vision_processing" type="unpause_after_controller_hold.py"
         output="screen"
         if="$(arg use_direct_group_position_controller)">
     <param name="controller_name" value="joint_group_position_controller"/>
     <param name="command_topic" value="/joint_group_position_controller/command"/>
     <param name="command_type" value="group_position"/>
+    <rosparam param="expected_models">[person, table, container, food_cube, panda]</rosparam>
     <rosparam param="homing_position">[-0.000059, -0.125928, 0.000117, -2.193312, -0.000251, 2.064780, 0.785511]</rosparam>
     <param name="publish_repeats" value="20"/>
     <param name="publish_period" value="0.05"/>

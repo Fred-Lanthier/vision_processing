@@ -5,13 +5,14 @@ import rospkg
 import os
 import sys
 import time
+import json
 import torch
 import numpy as np
 import struct
 import xacro
 import tempfile
 import xml.etree.ElementTree as ET
-from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray, Header
+from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray, Header, String
 from sensor_msgs.msg import JointState, PointCloud2, PointField
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import Point
@@ -22,6 +23,11 @@ try:
     import trimesh
 except ImportError:
     trimesh = None
+
+try:
+    from skimage.measure import marching_cubes
+except ImportError:
+    marching_cubes = None
 
 rospack = rospkg.RosPack()
 pkg_path = rospack.get_path('vision_processing')
@@ -43,6 +49,46 @@ def _bool_param(name, default=False):
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+# Layout of /cbf_safety/diagnostics (Float32MultiArray). Joint-space vectors
+# come first (7 values each, in DIAG_VEC_FIELDS order), then the scalars in
+# DIAG_SCALAR_FIELDS order. The full layout is also published as JSON on the
+# latched topic /cbf_safety/diagnostics_layout so analysis scripts can decode
+# bags without importing this file.
+DIAG_VEC_FIELDS = [
+    "dq_ff",          # feedforward from the nominal trajectory
+    "dq_fb",          # saturated proportional tracking feedback
+    "dq_base",        # filtered nominal = ff + fb after low-pass/deadband
+    "dq_escape",      # escape velocity (tangent + normal), zero when inactive
+    "dq_cbf_delta",   # projection output minus the velocity fed to the QP
+    "dq_pre_filter",  # safe velocity before the output low-pass filter
+    "dq_final",       # velocity actually integrated into the command
+]
+DIAG_SCALAR_FIELDS = [
+    "h",                # soft-min barrier value (uncorrected)
+    "h_corr",           # h + alpha*log(N) soft-min bias compensation
+    "lam",              # QP multiplier (after cap)
+    "cap_active",       # 1 if the safe-region lambda cap bound this cycle
+    "recovery_used",    # 1 if hard recovery replaced the projection
+    "grad_degenerate",  # 1 if |grad_h|^2 < 1e-6 while constraint violated
+    "constr_pre",       # CBF constraint value of the velocity fed to the QP
+    "repair_applied",   # 1 if post-filter repair modified the command
+    "constr_final",     # constraint value after repair (NaN if repair off)
+    "grad_h_norm",      # |grad_h|
+    "escape_active",    # 1 while the escape hysteresis is engaged
+    "ema_applied",      # 1 if boundary-band EMA smoothed dq_safe
+    "velocity_filter_active",  # 1 if the output low-pass filter ran
+    "vel_source",       # nominal velocity source: 0=topic 1=diff 2=zero
+    "velocity_age",     # age of the nominal velocity topic sample (s)
+    "dt",               # control loop dt (s)
+    "selected_count",   # number of obstacle points fed to the barrier
+    "min_obs_dist",     # min obstacle distance from the selection stage
+    "cbf_ms",           # barrier + projection (+escape replay) time
+    "q_cmd_ms",         # command construction time
+    "total_ms",         # loop start to safe-command publish
+]
+DIAG_VEC_SOURCE_CODES = {"topic": 0.0, "diff": 1.0, "zero": 2.0}
 
 
 class CBFSafetyNode:
@@ -75,7 +121,7 @@ class CBFSafetyNode:
         
         # 2. On défini les links que l'on veut charger (correspondant aux links cinématiques dans l'ordre)
         # Pruning: We only protect the upper arm and wrist (Links 4-7 + Fork)
-        link_names = ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7', 'panda_hand', 'panda_leftfinger', 'panda_rightfinger', 'fork_tip']
+        link_names = ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7', 'panda_hand', 'fork_tip']
         self.protected_link_names = link_names
         self.fork_link_index = link_names.index('fork_tip')
         weight_handler.add_models(link_names, robot_name='panda')
@@ -183,7 +229,14 @@ class CBFSafetyNode:
         self.preprocess_rate_hz = float(rospy.get_param("~preprocess_rate_hz", 30.0))
         self.viz_rate_hz = float(rospy.get_param("~viz_rate_hz", 5.0))
         self.publish_debug_topics = _bool_param("~publish_debug_topics", False)
+        self.publish_diagnostics = _bool_param("~publish_diagnostics", True)
         self.publish_viz_topics = _bool_param("~publish_viz_topics", True)
+        self.publish_safety_envelope = _bool_param(
+            "~publish_safety_envelope", True)
+        self.safety_envelope_resolution = max(
+            24, int(rospy.get_param("~safety_envelope_resolution", 40)))
+        self.safety_envelope_alpha = float(rospy.get_param(
+            "~safety_envelope_alpha", 0.20))
         self.profile_sync = _bool_param("~profile_sync", False)
         self.cuda_memory_log_period = float(rospy.get_param("~cuda_memory_log_period", 10.0))
         self._last_cuda_memory_log = 0.0
@@ -259,6 +312,14 @@ class CBFSafetyNode:
         self.safe_cmd_pub = rospy.Publisher('/planner/safe_joint_command', Float64MultiArray, queue_size=1)
         self.ready_pub = rospy.Publisher('/cbf_safety/ready', Bool, queue_size=1, latch=True)
         self.h_pub = rospy.Publisher('/cbf_safety/h_value', Float32MultiArray, queue_size=1)
+        self.diag_pub = rospy.Publisher('/cbf_safety/diagnostics', Float32MultiArray, queue_size=10)
+        self.diag_layout_pub = rospy.Publisher('/cbf_safety/diagnostics_layout', String, queue_size=1, latch=True)
+        self.diag_layout_pub.publish(String(data=json.dumps({
+            "vec_fields": DIAG_VEC_FIELDS,
+            "vec_dim": 7,
+            "scalar_fields": DIAG_SCALAR_FIELDS,
+            "vel_source_codes": DIAG_VEC_SOURCE_CODES,
+        })))
         self.debug_input_pub = rospy.Publisher('/debug/cbf/input_joint_command_seen', Float64MultiArray, queue_size=1)
         self.debug_output_pub = rospy.Publisher('/debug/cbf/output_joint_command', Float64MultiArray, queue_size=1)
         self.debug_input_vel_pub = rospy.Publisher('/debug/cbf/input_joint_velocity', Float32MultiArray, queue_size=1)
@@ -273,6 +334,13 @@ class CBFSafetyNode:
         self.pub_selection_debug = rospy.Publisher('/viz/cbf_selection_debug', MarkerArray, queue_size=1)
         self.safe_traj_viz_pub = rospy.Publisher('/viz/safe_trajectory_3d', MarkerArray, queue_size=1)
         self.pub_cbf_velocity_arrows = rospy.Publisher('/viz/cbf_velocity_arrows', MarkerArray, queue_size=1)
+        self.pub_safety_envelope = rospy.Publisher(
+            '/viz/robot_safety_envelope', MarkerArray, queue_size=1, latch=True)
+
+        if self.publish_viz_topics and self.publish_safety_envelope:
+            envelope_markers = self._build_safety_envelope_markers()
+            if envelope_markers.markers:
+                self.pub_safety_envelope.publish(envelope_markers)
         
         self.rate_hz = float(rospy.get_param("~rate_hz", 150.0))
         if self.rate_hz <= 0.0:
@@ -413,6 +481,153 @@ class CBFSafetyNode:
         )
         return h_per_link.min(dim=1).values
 
+    def _evaluate_link_sdf_local(self, link_index, points_local):
+        """Evaluate one link with the same bounded Bernstein SDF as the CBF."""
+        group = None
+        group_index = None
+        for candidate in self.bernstein_core.groups.values():
+            if link_index in candidate["indices"]:
+                group = candidate
+                group_index = candidate["indices"].index(link_index)
+                break
+        if group is None:
+            raise ValueError("No Bernstein group for protected link index %d" % link_index)
+
+        offset = self.bernstein_core.offsets[link_index]
+        scale = self.bernstein_core.scales[link_index]
+        points_scaled = (points_local - offset) / scale
+        points_bounded = torch.clamp(points_scaled, min=-0.99, max=0.99)
+        residual = points_scaled - points_bounded
+
+        phi = self.bernstein_core.build_basis_function_from_points(
+            points_bounded,
+            n_func=group["n_func"],
+            comb=group["comb"],
+            i_tensor=group["i_tensor"],
+        )
+        sdf = torch.matmul(phi, group["weights"][group_index])
+        return (sdf + torch.norm(residual, dim=-1)) * scale
+
+    def _find_visual_info(self, link_name):
+        for info in self.robot_layer.meshes_info:
+            if info['link_name'] == link_name:
+                return info
+
+        target = link_name.replace('panda_', '').replace('_w', '').replace('.pt', '')
+        for info in self.robot_layer.meshes_info:
+            candidate = info['link_name'].replace('panda_', '')
+            if target in candidate or candidate in target:
+                return info
+        return None
+
+    def _build_safety_envelope_markers(self):
+        """Precompute d_robot=d_safe isosurfaces in each protected link frame."""
+        marker_array = MarkerArray()
+        if marching_cubes is None:
+            rospy.logwarn(
+                "scikit-image is unavailable; the robot safety envelope is disabled.")
+            return marker_array
+
+        resolution = self.safety_envelope_resolution
+        level = self.d_safe
+        started = time.perf_counter()
+
+        try:
+            with torch.no_grad():
+                for link_index, link_name in enumerate(self.protected_link_names):
+                    offset = self.bernstein_core.offsets[link_index]
+                    scale = self.bernstein_core.scales[link_index]
+                    half_extent = 0.99 * float(scale.item()) + level + 0.005
+                    lower = offset - half_extent
+                    upper = offset + half_extent
+
+                    axes = [
+                        torch.linspace(
+                            float(lower[axis].item()),
+                            float(upper[axis].item()),
+                            resolution,
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        for axis in range(3)
+                    ]
+                    grid = torch.stack(
+                        torch.meshgrid(*axes, indexing='ij'), dim=-1).reshape(-1, 3)
+
+                    sdf_chunks = []
+                    for points_chunk in torch.split(grid, 4096, dim=0):
+                        sdf_chunks.append(
+                            self._evaluate_link_sdf_local(
+                                link_index, points_chunk).detach().cpu())
+                    sdf_grid = torch.cat(sdf_chunks).reshape(
+                        resolution, resolution, resolution).numpy()
+
+                    sdf_min = float(sdf_grid.min())
+                    sdf_max = float(sdf_grid.max())
+                    if not (sdf_min <= level <= sdf_max):
+                        rospy.logwarn(
+                            "Safety envelope skipped for %s: level %.4f outside [%.4f, %.4f]",
+                            link_name, level, sdf_min, sdf_max)
+                        continue
+
+                    spacing = tuple(
+                        float((upper[axis] - lower[axis]).item()) / (resolution - 1)
+                        for axis in range(3)
+                    )
+                    vertices, faces, _, _ = marching_cubes(
+                        sdf_grid, level=level, spacing=spacing)
+                    vertices += lower.detach().cpu().numpy()
+
+                    visual_info = self._find_visual_info(link_name)
+                    if visual_info is None:
+                        rospy.logwarn(
+                            "Safety envelope skipped for %s: visual transform not found",
+                            link_name)
+                        continue
+
+                    visual_transform = visual_info['visual_offset'].detach().cpu().numpy()
+                    vertices_h = np.concatenate([
+                        vertices,
+                        np.ones((vertices.shape[0], 1), dtype=vertices.dtype),
+                    ], axis=1)
+                    vertices_link = (vertices_h @ visual_transform.T)[:, :3]
+
+                    marker = Marker()
+                    marker.header.frame_id = link_name
+                    marker.header.stamp = rospy.Time(0)
+                    marker.ns = "robot_safety_envelope"
+                    marker.id = link_index
+                    marker.type = Marker.TRIANGLE_LIST
+                    marker.action = Marker.ADD
+                    marker.pose.orientation.w = 1.0
+                    marker.scale.x = 1.0
+                    marker.scale.y = 1.0
+                    marker.scale.z = 1.0
+                    marker.color.r = 1.0
+                    marker.color.g = 0.55
+                    marker.color.b = 0.05
+                    marker.color.a = max(0.0, min(1.0, self.safety_envelope_alpha))
+                    marker.frame_locked = True
+
+                    for vertex_index in faces.reshape(-1):
+                        xyz = vertices_link[vertex_index]
+                        marker.points.append(Point(
+                            x=float(xyz[0]), y=float(xyz[1]), z=float(xyz[2])))
+                    marker_array.markers.append(marker)
+
+                    rospy.loginfo(
+                        "Safety envelope %s: d_robot=%.3fm, %d triangles",
+                        link_name, level, int(faces.shape[0]))
+        except Exception as exc:
+            rospy.logerr("Could not build robot safety envelope: %s", exc)
+            return MarkerArray()
+
+        rospy.loginfo(
+            "Robot safety envelope ready: d_robot=%.3fm, links=%d, %.1fms",
+            level, len(marker_array.markers),
+            1000.0 * (time.perf_counter() - started))
+        return marker_array
+
     def _maybe_check_gradient_direction(self, current_q, obs, h_now, grad_h):
         if self.cbf_gradient_check_period <= 0.0:
             return
@@ -475,6 +690,12 @@ class CBFSafetyNode:
         self.static_h      = torch.zeros((batch_size,), device=self.device)
         self.static_constr = torch.zeros((batch_size,), device=self.device)
         self.static_grad_h = torch.zeros((batch_size, 7), device=self.device)
+        # Diagnostic buffers: expose decisions taken inside the captured graph
+        # (lambda cap, recovery mode, degenerate gradient) for logging.
+        self.static_lam             = torch.zeros((batch_size,), device=self.device)
+        self.static_cap_active      = torch.zeros((batch_size,), device=self.device)
+        self.static_recovery_used   = torch.zeros((batch_size,), device=self.device)
+        self.static_grad_degenerate = torch.zeros((batch_size,), device=self.device)
 
         # Capture scalars as Python floats so the CUDA graph bakes in the params.
         kappa = self.cbf_kappa
@@ -513,6 +734,14 @@ class CBFSafetyNode:
             grad_h_unit = grad_h / (torch.sqrt(denom).unsqueeze(-1) + 1e-6)
             dq_recovery = nom_speed.unsqueeze(-1) * grad_h_unit
             use_recovery = (h < recovery_switch_h) & (dot_nom_grad < 0.0)
+
+            proj_branch = (constr < 0.0) & (denom >= 1e-6)
+            self.static_lam.copy_(lam)
+            self.static_cap_active.copy_(
+                (proj_branch & (~use_recovery) & (lam_uncapped > lam_max)).float())
+            self.static_recovery_used.copy_((proj_branch & use_recovery).float())
+            self.static_grad_degenerate.copy_(
+                ((constr < 0.0) & (denom < 1e-6)).float())
 
             dq_safe = torch.where(
                 constr.unsqueeze(-1) < 0,
@@ -1200,6 +1429,11 @@ class CBFSafetyNode:
                 dq_escape_tangent = torch.zeros_like(dq_nom_base)
                 dq_escape_normal = torch.zeros_like(dq_nom_base)
                 escape_active = False
+                dq_cbf_delta = torch.zeros_like(dq_nom_base)
+                constr_pre_t = None
+                repair_flag_t = None
+                final_constr_t = None
+                ema_applied = False
 
                 if self.enable_cbf:
                     local_obs = self.selected_obs
@@ -1283,6 +1517,11 @@ class CBFSafetyNode:
                     else:
                         self._cbf_escape_active_cycles = 0
 
+                    # Diagnostics: raw projection effect (before EMA/filtering)
+                    # and the constraint value of the velocity fed to the QP.
+                    dq_cbf_delta = dq_safe - dq_nom
+                    constr_pre_t = self.static_constr.detach().clone()
+
                     t_cbf_done = time.perf_counter()
                     self._maybe_check_gradient_direction(
                         q_cur, local_obs, self.static_h.detach(),
@@ -1306,6 +1545,7 @@ class CBFSafetyNode:
                             + (1.0 - self.cbf_ema_alpha) * self._dq_safe_ema
                         )
                         dq_safe = self._dq_safe_ema.clone()
+                        ema_applied = True
                 else:
                     dq_safe = dq_nom.clone()
                     self._dq_safe_ema = None
@@ -1377,6 +1617,8 @@ class CBFSafetyNode:
                         - self.cbf_constraint_margin
                     )
                     self.static_constr.copy_(repaired_constr)
+                    repair_flag_t = needs_repair.float().view(-1)
+                    final_constr_t = repaired_constr.detach().view(-1)
 
                 if (
                     self.publish_controller_command
@@ -1440,6 +1682,70 @@ class CBFSafetyNode:
             t_before_safe_pub = time.perf_counter()
             self.safe_cmd_pub.publish(pos_msg)
             t_after_safe_pub = time.perf_counter()
+
+            if self.publish_diagnostics:
+                nan_t = torch.full((1,), float('nan'), device=self.device)
+                if self.enable_cbf:
+                    h_t = self.static_h.detach().view(-1)
+                    lam_t = self.static_lam.detach().view(-1)
+                    cap_t = self.static_cap_active.detach().view(-1)
+                    rec_t = self.static_recovery_used.detach().view(-1)
+                    deg_t = self.static_grad_degenerate.detach().view(-1)
+                    grad_norm_t = torch.norm(
+                        self.static_grad_h.detach(), dim=1).view(-1)
+                else:
+                    h_t = lam_t = cap_t = rec_t = deg_t = grad_norm_t = nan_t
+                # Single GPU->CPU transfer: 7 joint vectors then the GPU scalars
+                # in the order unpacked below.
+                diag_gpu = torch.cat([
+                    dq_feedforward.view(-1),
+                    dq_feedback.view(-1),
+                    dq_nom_base.view(-1),
+                    dq_escape.view(-1),
+                    dq_cbf_delta.view(-1),
+                    dq_safe_pre_filter.view(-1),
+                    dq_safe.view(-1),
+                    h_t, lam_t, cap_t, rec_t, deg_t,
+                    constr_pre_t.view(-1) if constr_pre_t is not None else nan_t,
+                    repair_flag_t if repair_flag_t is not None else nan_t,
+                    final_constr_t if final_constr_t is not None else nan_t,
+                    grad_norm_t,
+                ]).float().cpu().numpy()
+                n_vec = 7 * len(DIAG_VEC_FIELDS)
+                (h_d, lam_d, cap_d, rec_d, deg_d,
+                 cpre_d, rep_d, cfin_d, gnorm_d) = diag_gpu[n_vec:].tolist()
+                if self.enable_cbf:
+                    h_corr_d = h_d + float(self.barrier.alpha) * float(
+                        np.log(max(1, int(self.selected_count))))
+                else:
+                    h_corr_d = float('nan')
+                min_obs_d = float(self.selected_min_obs_dist)
+                scalars = [
+                    h_d,
+                    h_corr_d,
+                    lam_d,
+                    cap_d,
+                    rec_d,
+                    deg_d,
+                    cpre_d,
+                    rep_d,
+                    cfin_d,
+                    gnorm_d,
+                    1.0 if escape_active else 0.0,
+                    1.0 if ema_applied else 0.0,
+                    1.0 if velocity_filter_active else 0.0,
+                    DIAG_VEC_SOURCE_CODES.get(
+                        nominal_velocity_source, float('nan')),
+                    float(velocity_age) if np.isfinite(velocity_age) else float('nan'),
+                    float(dt),
+                    float(self.selected_count),
+                    min_obs_d if np.isfinite(min_obs_d) else float('nan'),
+                    (t_cbf_done - t_loop_start) * 1000.0,
+                    (t_q_cmd_done - t_cbf_done) * 1000.0,
+                    (t_after_safe_pub - t_loop_start) * 1000.0,
+                ]
+                self.diag_pub.publish(Float32MultiArray(
+                    data=diag_gpu[:n_vec].tolist() + scalars))
 
             if self.publish_debug_topics:
                 self.debug_input_pub.publish(

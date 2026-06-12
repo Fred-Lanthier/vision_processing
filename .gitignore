@@ -13,3 +13,6 @@ resources/
 *.zip
 *.jpg
 *.pdf
+*.bag
+*.png
+*.svg

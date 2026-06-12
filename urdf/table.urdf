@@ -75,6 +75,8 @@
 
   <gazebo reference="base_link">
     <material>Gazebo/Wood</material>
+  </gazebo>
+  <gazebo>
     <static>true</static>
   </gazebo>
 </robot>

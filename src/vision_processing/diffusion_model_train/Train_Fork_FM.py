@@ -716,10 +716,10 @@ def train_flow_matching(
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             history['best_val_loss'] = best_val_loss
-            save_name = "best_fm_model_high_dim_CFM_relative_dropout.ckpt"
+            save_name = "best_fm_model_high_dim_CFM_relative_dropout_1024_H.ckpt"
             print("Saved Best EMA Model")
         else:
-            save_name = "last_fm_model_high_dim_CFM_relative_dropout.ckpt"
+            save_name = "last_fm_model_high_dim_CFM_relative_dropout_1024_H.ckpt"
             print("Saved Last EMA Model")
 
         torch.save({
@@ -835,7 +835,7 @@ def main():
     ACTION_DIM = 9
     OBS_HORIZON = 2
     PRED_HORIZON = 16
-    NUM_POINTS = 256
+    NUM_POINTS = 1024
     
     # Flow Matching specific
     NUM_INFERENCE_STEPS = 10  # 10-15 recommended for standard FM

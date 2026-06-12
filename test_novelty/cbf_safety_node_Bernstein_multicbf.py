@@ -5,13 +5,14 @@ import rospkg
 import os
 import sys
 import time
+import json
 import torch
 import numpy as np
 import struct
 import xacro
 import tempfile
 import xml.etree.ElementTree as ET
-from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray, Header
+from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray, Header, String
 from sensor_msgs.msg import JointState, PointCloud2, PointField
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import Point
@@ -43,6 +44,58 @@ def _bool_param(name, default=False):
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+# Layout of /cbf_safety/diagnostics (Float32MultiArray). Same base fields as
+# cbf_safety_node_Bernstein.py so analysis scripts work across both nodes;
+# concepts this node does not implement (escape, output EMA/low-pass, single
+# QP multiplier) are published as 0/NaN. The multicbf extensions are appended
+# after the base scalars. Full layout is published as JSON on the latched
+# topic /cbf_safety/diagnostics_layout.
+DIAG_VEC_FIELDS = [
+    "dq_ff",          # feedforward from nominal position differencing
+    "dq_fb",          # shaped tracking feedback (see _shape_tracking_feedback)
+    "dq_base",        # filtered nominal velocity fed to the solver
+    "dq_escape",      # always zero (no escape mechanism in this node)
+    "dq_cbf_delta",   # solver output minus dq_base (before repair)
+    "dq_pre_filter",  # solver output before clamp/repair
+    "dq_final",       # velocity actually published
+]
+DIAG_SCALAR_FIELDS = [
+    "h",                # min barrier value (hard min in multi_projected)
+    "h_corr",           # bias-compensated h (== h in multi_projected mode)
+    "lam",              # NaN (no single multiplier in this node)
+    "cap_active",       # NaN
+    "recovery_used",    # NaN
+    "grad_degenerate",  # NaN
+    "constr_pre",       # CBF constraint value of dq_base (most-critical grad)
+    "repair_applied",   # 1 if post-clamp repair modified the command
+    "constr_final",     # constraint value after repair (NaN if repair off)
+    "grad_h_norm",      # |grad_h| of the most critical constraint
+    "escape_active",    # always 0
+    "ema_applied",      # always 0
+    "velocity_filter_active",  # always 0
+    "vel_source",       # always 1 (position differencing)
+    "velocity_age",     # NaN
+    "dt",               # control loop dt (s)
+    "selected_count",   # obstacle points fed to the solver
+    "min_obs_dist",     # min obstacle distance from the selection stage
+    "cbf_ms",           # solver + repair time
+    "q_cmd_ms",         # command construction time
+    "total_ms",         # solver start to safe-command publish
+    # --- multicbf extensions ---
+    "cmd_hdot",         # grad_h . dq_safe (commanded h-rate)
+    "real_hdot",        # grad_h . dq_measured (executed h-rate)
+    "real_constr",      # CBF constraint evaluated on the measured velocity
+    "h_rate",           # finite-difference dh/dt
+    "alignment",        # cos(angle) between dq_base and dq_safe
+    "q_lead",           # |q_cmd - q_cur|
+    "dq_real_norm",     # |measured joint velocity|
+    "active_constraints",  # number of half-spaces in the QP this cycle
+    "solver_mode",      # 0 = fast_tangent, 1 = multi_projected
+    "monitor_only",     # 1 = barrier evaluated but no correction applied
+    "contact_stop",     # 1 = latched contact stop active (robot frozen)
+]
 
 
 class CBFSafetyNode:
@@ -77,7 +130,7 @@ class CBFSafetyNode:
         
         # 2. On défini les links que l'on veut charger (correspondant aux links cinématiques dans l'ordre)
         # Pruning: We only protect the upper arm and wrist (Links 4-7 + Fork)
-        link_names = ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7', 'panda_hand', 'panda_leftfinger', 'panda_rightfinger', 'fork_tip']
+        link_names = ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7', 'panda_hand', 'fork_tip']
         self.protected_link_names = link_names
         self.fork_link_index = link_names.index('fork_tip')
         weight_handler.add_models(link_names, robot_name='panda')
@@ -197,17 +250,47 @@ class CBFSafetyNode:
         self.cbf_feedback_coupling = float(rospy.get_param("~cbf_feedback_coupling", 0.1))
         self.max_feedback_velocity = float(rospy.get_param("~max_feedback_velocity", 0.05))
         self.cbf_filter_tau = float(rospy.get_param("~cbf_filter_tau", 0.05))
+        # Output low-pass on the safe velocity (0 = off). Applied before the
+        # final-constraint repair so the smoothed command is re-validated.
+        self.cbf_velocity_filter_tau = float(rospy.get_param("~cbf_velocity_filter_tau", 0.0))
+        self._dq_safe_filtered = None
         self.real_velocity_filter_tau = float(rospy.get_param("~real_velocity_filter_tau", 0.08))
         self.last_nominal_q = None
         self.dq_nom_filtered = None
         self.last_nominal_tangent_dir = None
         self.last_h_value_for_feedback = float("inf")
+        # Retimed feedforward from the trajectory executor (constant joint
+        # speed). Position differencing is only the fallback when stale.
+        self.use_nominal_velocity_topic = _bool_param("~use_nominal_velocity_topic", True)
+        self.nominal_velocity_topic = str(rospy.get_param(
+            "~nominal_velocity_topic", "/planner/nominal_joint_velocity"))
+        self.nominal_velocity_timeout = float(rospy.get_param(
+            "~nominal_velocity_timeout", 0.25))
+        self.nominal_feedforward_gain = float(rospy.get_param(
+            "~nominal_feedforward_gain", 1.0))
+        self.nominal_dq_ff = None
+        self.nominal_dq_stamp = 0.0
 
         self.enable_cbf = _bool_param("~enable_cbf", True)
+        # Monitor-only baseline mode: the barrier, diagnostics and the
+        # counterfactual correction are still computed, but the nominal
+        # velocity is passed through unmodified ("sans CBF" runs).
+        self.cbf_monitor_only = _bool_param("~cbf_monitor_only", False)
+        # Perception-referenced contact stop: latch a permanent position hold
+        # the first time the estimated true clearance (h_corr + d_safe) drops
+        # below ~contact_stop_clearance for ~contact_stop_cycles consecutive
+        # cycles. Needed because the fork has no Gazebo collision geometry.
+        self.contact_stop_enabled = _bool_param("~contact_stop_enabled", False)
+        self.contact_stop_clearance = float(rospy.get_param("~contact_stop_clearance", 0.0))
+        self.contact_stop_cycles = max(1, int(rospy.get_param("~contact_stop_cycles", 2)))
+        self._contact_counter = 0
+        self._contact_stopped = False
+        self._contact_q = None
         self.publish_controller_command = _bool_param("~publish_controller_command", False)
         self.preprocess_rate_hz = float(rospy.get_param("~preprocess_rate_hz", 30.0))
         self.viz_rate_hz = float(rospy.get_param("~viz_rate_hz", 5.0))
         self.publish_debug_topics = _bool_param("~publish_debug_topics", False)
+        self.publish_diagnostics = _bool_param("~publish_diagnostics", True)
         self.publish_viz_topics = _bool_param("~publish_viz_topics", True)
         self.profile_sync = _bool_param("~profile_sync", False)
         self.cuda_memory_log_period = float(rospy.get_param("~cuda_memory_log_period", 10.0))
@@ -263,7 +346,11 @@ class CBFSafetyNode:
         self._viz_dq_nom = None
         self._viz_dq_safe = None
         self.last_h_debug = None
-        self.transfer_buffer = torch.zeros(39, dtype=torch.float32, device=self.device)
+        # Slots 0-38: original telemetry. Slots 39-63: diagnostics extension
+        # (39:46 dq_ff, 46:53 dq_fb, 53:60 solver output, 60 repair flag,
+        #  61 final constraint, 62 pre-projection constraint, 63 |grad_h|).
+        self.transfer_buffer = torch.zeros(64, dtype=torch.float32, device=self.device)
+        self._last_active_constraints = 0
         self._log_cuda_memory("CBF after runtime buffers")
 
         self.comp_times = []
@@ -271,6 +358,7 @@ class CBFSafetyNode:
         rospy.Subscriber('/joint_states', JointState, self.joint_callback)
         rospy.Subscriber('/planner/nominal_trajectory', JointTrajectory, self.trajectory_timing_callback)
         rospy.Subscriber('/planner/nominal_joint_command', Float64MultiArray, self.nominal_command_callback)
+        rospy.Subscriber(self.nominal_velocity_topic, Float64MultiArray, self._nominal_vel_cb)
         obs_topic = rospy.get_param("~obs_topic", "/perception/persistent_obstacles")
         rospy.Subscriber(obs_topic, PointCloud2, self.obs_callback)
         
@@ -280,6 +368,18 @@ class CBFSafetyNode:
             self.pos_cmd_pub = rospy.Publisher('/joint_group_position_controller/command', Float64MultiArray, queue_size=1)
         self.safe_cmd_pub = rospy.Publisher('/planner/safe_joint_command', Float64MultiArray, queue_size=1)
         self.ready_pub = rospy.Publisher('/cbf_safety/ready', Bool, queue_size=1, latch=True)
+        self.h_pub = rospy.Publisher('/cbf_safety/h_value', Float32MultiArray, queue_size=1)
+        self.contact_event_pub = rospy.Publisher(
+            '/cbf_safety/contact_event', Float32MultiArray, queue_size=1, latch=True)
+        self.diag_pub = rospy.Publisher('/cbf_safety/diagnostics', Float32MultiArray, queue_size=10)
+        self.diag_layout_pub = rospy.Publisher('/cbf_safety/diagnostics_layout', String, queue_size=1, latch=True)
+        self.diag_layout_pub.publish(String(data=json.dumps({
+            "vec_fields": DIAG_VEC_FIELDS,
+            "vec_dim": 7,
+            "scalar_fields": DIAG_SCALAR_FIELDS,
+            "vel_source_codes": {"topic": 0.0, "diff": 1.0, "zero": 2.0},
+            "node": "multicbf",
+        })))
         self.debug_input_pub = rospy.Publisher('/debug/cbf/input_joint_command_seen', Float64MultiArray, queue_size=1)
         self.debug_output_pub = rospy.Publisher('/debug/cbf/output_joint_command', Float64MultiArray, queue_size=1)
         self.debug_input_vel_pub = rospy.Publisher('/debug/cbf/input_joint_velocity', Float32MultiArray, queue_size=1)
@@ -593,6 +693,7 @@ class CBFSafetyNode:
             int(self.preprocess_max_points) if self.preprocess_max_points > 0 else int(obs_points.shape[0]),
         )
         if valid_count <= 0:
+            self._last_active_constraints = 0
             self.static_h.fill_(1.0)
             self.static_constr.zero_()
             self.static_grad_h.zero_()
@@ -611,6 +712,7 @@ class CBFSafetyNode:
         h_near = h_probe[near_idx]
         active_mask = h_near <= self.cbf_h_activate
         if not torch.any(active_mask):
+            self._last_active_constraints = 0
             h_min = h_probe.min().view(1)
             self.static_h.copy_(h_min)
             self.static_constr.copy_(torch.zeros_like(h_min))
@@ -629,6 +731,7 @@ class CBFSafetyNode:
         h_active = sdf_active[0] - self.d_safe
 
         if int(h_active.numel()) <= 0:
+            self._last_active_constraints = 0
             self.static_h.copy_(h_probe.min().view(1))
             self.static_constr.zero_()
             self.static_grad_h.zero_()
@@ -674,31 +777,42 @@ class CBFSafetyNode:
         bounds = torch.where(h_det > 0.0, outside_bound, inside_bound)
         bounds = bounds + self.cbf_constraint_margin
 
-        dq = dq_nom.detach().clone()
-        for _ in range(self.cbf_projection_iters):
-            gdq = torch.matmul(G, dq.squeeze(0))
-            violations = bounds - gdq
-            for i in range(int(G.shape[0])):
-                violation = violations[i]
-                if bool(violation > 0.0):
-                    g = G[i]
-                    denom = torch.dot(g, g) + 1e-6
-                    dq = dq + (
-                        self.cbf_projection_relaxation
-                        * violation
-                        * g.view(1, 7)
-                        / denom
-                    )
-                    dq.clamp_(min=-self.max_joint_velocity, max=self.max_joint_velocity)
+        # The projection itself is a 7-variable QP with K half-spaces: a CPU
+        # problem. Solving it on GPU forced one host sync per constraint per
+        # sweep (`bool(violation > 0)`); instead, pack G/bounds/h/dq into one
+        # transfer and run Gauss-Seidel in numpy (microseconds at this size).
+        K = int(G.shape[0])
+        packed = torch.cat([
+            G.reshape(-1), bounds, h_det, dq_nom.detach().view(-1),
+        ]).cpu().numpy().astype(np.float64)
+        G_np = packed[:7 * K].reshape(K, 7)
+        b_np = packed[7 * K:8 * K]
+        h_np = packed[8 * K:9 * K]
+        dq_np = packed[9 * K:9 * K + 7].copy()
 
-        gdq_final = torch.matmul(G, dq.squeeze(0))
-        constr = gdq_final - bounds
-        min_idx = torch.argmin(h_det)
+        row_sq = np.einsum('ij,ij->i', G_np, G_np) + 1e-6
+        vmax = self.max_joint_velocity
+        relax = self.cbf_projection_relaxation
+        for _ in range(self.cbf_projection_iters):
+            updated = False
+            for i in range(K):
+                violation = b_np[i] - G_np[i].dot(dq_np)
+                if violation > 0.0:
+                    dq_np += relax * violation * G_np[i] / row_sq[i]
+                    np.clip(dq_np, -vmax, vmax, out=dq_np)
+                    updated = True
+            if not updated:
+                break
+
+        constr = G_np.dot(dq_np) - b_np
+        min_idx = int(np.argmin(h_np))
+        self._last_active_constraints = K
         self.static_h.copy_(h_det[min_idx].view(1))
-        self.static_constr.copy_(constr.min().view(1))
+        self.static_constr.fill_(float(constr.min()))
         self.static_grad_h.copy_(G[min_idx].view(1, 7))
         torch.set_grad_enabled(prev_grad_enabled)
-        return dq
+        return torch.as_tensor(
+            dq_np, dtype=torch.float32, device=self.device).view(1, 7)
 
     def joint_callback(self, msg):
         try:
@@ -803,6 +917,13 @@ class CBFSafetyNode:
 
         forward_speed = (dq_fb * tangent_dir).sum(dim=1, keepdim=True).clamp(min=0.0)
         return forward_speed * tangent_dir
+
+    def _nominal_vel_cb(self, msg):
+        if len(msg.data) < 7:
+            return
+        dq = torch.tensor(msg.data[:7], dtype=torch.float32, device=self.device).unsqueeze(0)
+        self.nominal_dq_ff = dq
+        self.nominal_dq_stamp = rospy.get_time()
 
     def obs_callback(self, msg):
         try:
@@ -1377,12 +1498,29 @@ class CBFSafetyNode:
                     elif not stateful_position_command:
                         self.last_q_safe = (1.0 - self.cbf_feedback_coupling) * self.last_q_safe + self.cbf_feedback_coupling * current_q
 
-                    # 1. Feedforward nominal velocity
-                    last_nominal_q = self.last_nominal_q
-                    if last_nominal_q is None:
-                        last_nominal_q = nominal_q.clone()
-                    dq_nom_pure = (nominal_q - last_nominal_q) / dt
+                    # 1. Feedforward nominal velocity. Prefer the executor's
+                    # retimed velocity topic (constant joint speed); fall back
+                    # to position differencing only when the topic is stale.
+                    velocity_age = float('inf')
+                    if self.use_nominal_velocity_topic and self.nominal_dq_ff is not None:
+                        velocity_age = current_time - self.nominal_dq_stamp
+                    use_velocity_topic = (
+                        self.use_nominal_velocity_topic
+                        and self.nominal_dq_ff is not None
+                        and (self.nominal_velocity_timeout <= 0.0
+                             or velocity_age <= self.nominal_velocity_timeout)
+                    )
+                    if use_velocity_topic:
+                        dq_nom_pure = self.nominal_feedforward_gain * self.nominal_dq_ff.detach()
+                        diag_vel_source = 0.0
+                    else:
+                        last_nominal_q = self.last_nominal_q
+                        if last_nominal_q is None:
+                            last_nominal_q = nominal_q.clone()
+                        dq_nom_pure = (nominal_q - last_nominal_q) / dt
+                        diag_vel_source = 1.0
                     self.last_nominal_q = nominal_q.clone()
+                    dq_fb = torch.zeros_like(dq_nom_pure)
 
                     if direct_nominal_position:
                         # In direct position-controller mode, the trajectory
@@ -1431,6 +1569,7 @@ class CBFSafetyNode:
                 t_start = time.perf_counter()
 
                 with torch.no_grad():
+                    self.transfer_buffer[39:].zero_()
                     if self.enable_cbf:
                         local_obs = self.selected_obs # Read reference atomically
                         self.static_q.copy_(current_q)
@@ -1445,6 +1584,12 @@ class CBFSafetyNode:
                     else:
                         self.dq_safe_work.copy_(dq_nom_torch)
 
+                    solver_out = self.dq_safe_work.detach().clone()
+                    if self.cbf_monitor_only:
+                        # Baseline mode: keep h/diagnostics (solver_out records
+                        # the counterfactual correction) but apply nothing.
+                        self.dq_safe_work.copy_(dq_nom_torch)
+
                     self._viz_q = current_q.detach().clone()
                     self._viz_dq_nom = dq_nom_torch.detach().clone()
                     self._viz_dq_safe = self.dq_safe_work.detach().clone()
@@ -1456,7 +1601,18 @@ class CBFSafetyNode:
                     self.dq_safe_work.clamp_(min=-self.max_joint_velocity,
                                              max=self.max_joint_velocity)
 
-                    if self.enable_cbf and self.cbf_enforce_final_constraint:
+                    velocity_filter_active = False
+                    if self.cbf_velocity_filter_tau > 0.0:
+                        if self._dq_safe_filtered is None:
+                            self._dq_safe_filtered = self.dq_safe_work.detach().clone()
+                        else:
+                            gamma_v = dt / (dt + self.cbf_velocity_filter_tau)
+                            self._dq_safe_filtered.mul_(1.0 - gamma_v).add_(
+                                self.dq_safe_work, alpha=gamma_v)
+                        self.dq_safe_work.copy_(self._dq_safe_filtered)
+                        velocity_filter_active = True
+
+                    if self.enable_cbf and self.cbf_enforce_final_constraint and not self.cbf_monitor_only:
                         # Component-wise velocity limits can invalidate the QP
                         # half-space projection. If that happens, project the
                         # already-filtered command again so tangential/nominal
@@ -1500,7 +1656,10 @@ class CBFSafetyNode:
                             final_constr,
                             torch.ones_like(final_constr),
                         ))
+                        self.transfer_buffer[60].copy_(needs_repair.float().view(-1)[0])
+                        self.transfer_buffer[61].copy_(final_constr.view(-1)[0])
 
+                    t_cbf_done = time.perf_counter()
                     cbf_delta_vel_for_command = self.dq_safe_work - dq_nom_torch
                     cbf_modified_mask = (
                         torch.norm(cbf_delta_vel_for_command)
@@ -1524,6 +1683,12 @@ class CBFSafetyNode:
                             torch.full_like(h_now, self.cbf_recovery_kappa),
                             torch.full_like(h_now, self.cbf_kappa),
                         )
+                        self.transfer_buffer[62].copy_((
+                            (grad_h_dbg * dq_nom_torch).sum(dim=1)
+                            + kappa_dbg * h_now
+                            - self.cbf_constraint_margin
+                        ).view(-1)[0])
+                        self.transfer_buffer[63].copy_(torch.norm(grad_h_dbg))
 
                         dq_real = self.dq_real_measured.detach()
 
@@ -1624,8 +1789,12 @@ class CBFSafetyNode:
                         # setpoint. Rebuilding q_safe from q_current every tick
                         # can collapse the requested velocity into tiny one-step
                         # targets that the position controller never realizes.
+                        # The integration step must be the real loop dt: using
+                        # cbf_command_dt here (a lead gain meant for the
+                        # current-anchored mode) makes the reference advance at
+                        # cbf_command_dt/dt times the certified velocity.
                         integration_base = self.last_q_safe
-                        integration_dt = self.cbf_command_dt if self.cbf_command_dt > 0.0 else dt
+                        integration_dt = dt
                     else:
                         integration_base = (
                             current_q if self.cbf_integrate_from_current
@@ -1667,6 +1836,13 @@ class CBFSafetyNode:
                     else:
                         dq_pub = (self.q_safe_work - current_q) / dt
 
+                    if self._contact_stopped:
+                        # Latched contact stop: hold the frozen configuration.
+                        self.dq_safe_work.zero_()
+                        dq_pub = self.dq_safe_work
+                        self.q_safe_work.copy_(self._contact_q)
+                        self.last_q_safe.copy_(self._contact_q)
+
                     # Fill CUDA transfer buffer
                     self.transfer_buffer[0:7].copy_(dq_pub.squeeze(0))
                     self.transfer_buffer[7:14].copy_(self.q_safe_work.squeeze(0))
@@ -1687,7 +1863,11 @@ class CBFSafetyNode:
                     self.transfer_buffer[36].copy_(norm_dq_real)
                     self.transfer_buffer[37].copy_(h_rate.squeeze(0))
                     self.transfer_buffer[38].copy_(q_lead_norm)
+                    self.transfer_buffer[39:46].copy_(dq_nom_pure.squeeze(0))
+                    self.transfer_buffer[46:53].copy_(dq_fb.squeeze(0))
+                    self.transfer_buffer[53:60].copy_(solver_out.squeeze(0))
 
+                t_q_cmd_done = time.perf_counter()
                 # Single sync transfer to CPU
                 cpu_buffer = self.transfer_buffer.cpu().numpy()
                 dq_pub_cpu = cpu_buffer[0:7].tolist()
@@ -1713,6 +1893,34 @@ class CBFSafetyNode:
                         - np.array(dq_nom_torch_cpu, dtype=np.float32)
                     )
                 )
+
+                if (
+                    self.contact_stop_enabled
+                    and self.enable_cbf
+                    and not self._contact_stopped
+                ):
+                    if self.cbf_solver_mode == "fast_tangent":
+                        h_bias = float(self.barrier.alpha) * float(
+                            np.log(max(1, int(self.selected_count))))
+                    else:
+                        h_bias = 0.0
+                    clearance_est = h_val + h_bias + self.d_safe
+                    if (
+                        int(self.selected_count) > 0
+                        and clearance_est <= self.contact_stop_clearance
+                    ):
+                        self._contact_counter += 1
+                    else:
+                        self._contact_counter = 0
+                    if self._contact_counter >= self.contact_stop_cycles:
+                        self._contact_stopped = True
+                        self._contact_q = current_q.detach().clone()
+                        self.contact_event_pub.publish(Float32MultiArray(
+                            data=[rospy.get_time(), h_val, clearance_est]))
+                        rospy.logerr(
+                            "CONTACT STOP: estimated clearance %.4f m <= %.4f m "
+                            "(h=%.4f). Robot frozen at current configuration.",
+                            clearance_est, self.contact_stop_clearance, h_val)
 
                 if self.enable_cbf and self.log_cbf_events:
                     if h_val < 0:
@@ -1758,6 +1966,65 @@ class CBFSafetyNode:
                     )
                     self._cbf_first_safe_for_plan = True
                 self.safe_cmd_pub.publish(pos_msg)
+                t_pub_done = time.perf_counter()
+
+                if self.publish_diagnostics:
+                    nan = float('nan')
+                    self.h_pub.publish(Float32MultiArray(data=[h_val]))
+                    if self.enable_cbf and self.cbf_solver_mode == "fast_tangent":
+                        h_corr_val = h_val + float(self.barrier.alpha) * float(
+                            np.log(max(1, int(self.selected_count))))
+                    else:
+                        # multi_projected uses a hard min: no soft-min bias.
+                        h_corr_val = h_val
+                    solver_out_v = cpu_buffer[53:60]
+                    dq_base_v = cpu_buffer[26:33]
+                    repair_on = self.enable_cbf and self.cbf_enforce_final_constraint
+                    min_obs_d = float(self.selected_min_obs_dist)
+                    scalars = [
+                        h_val if self.enable_cbf else nan,
+                        h_corr_val if self.enable_cbf else nan,
+                        nan,  # lam
+                        nan,  # cap_active
+                        nan,  # recovery_used
+                        nan,  # grad_degenerate
+                        float(cpu_buffer[62]) if self.enable_cbf else nan,
+                        float(cpu_buffer[60]) if repair_on else nan,
+                        float(cpu_buffer[61]) if repair_on else nan,
+                        float(cpu_buffer[63]) if self.enable_cbf else nan,
+                        0.0,  # escape_active
+                        0.0,  # ema_applied
+                        1.0 if velocity_filter_active else 0.0,
+                        diag_vel_source,
+                        float(velocity_age) if np.isfinite(velocity_age) else nan,
+                        float(dt_measured),
+                        float(self.selected_count),
+                        min_obs_d if np.isfinite(min_obs_d) else nan,
+                        (t_cbf_done - t_start) * 1000.0,
+                        (t_q_cmd_done - t_cbf_done) * 1000.0,
+                        (t_pub_done - t_start) * 1000.0,
+                        float(cpu_buffer[33]),  # cmd_hdot
+                        float(cpu_buffer[34]),  # real_hdot
+                        float(cpu_buffer[35]),  # real_constr
+                        float(cpu_buffer[37]),  # h_rate
+                        float(cpu_buffer[16]),  # alignment
+                        float(cpu_buffer[38]),  # q_lead
+                        float(cpu_buffer[36]),  # dq_real_norm
+                        float(self._last_active_constraints
+                              if self.cbf_solver_mode == "multi_projected" else 1.0),
+                        0.0 if self.cbf_solver_mode == "fast_tangent" else 1.0,
+                        1.0 if self.cbf_monitor_only else 0.0,
+                        1.0 if self._contact_stopped else 0.0,
+                    ]
+                    self.diag_pub.publish(Float32MultiArray(data=(
+                        cpu_buffer[39:46].tolist()                 # dq_ff
+                        + cpu_buffer[46:53].tolist()               # dq_fb
+                        + dq_base_v.tolist()                       # dq_base
+                        + [0.0] * 7                                # dq_escape
+                        + (solver_out_v - dq_base_v).tolist()      # dq_cbf_delta
+                        + solver_out_v.tolist()                    # dq_pre_filter
+                        + cpu_buffer[0:7].tolist()                 # dq_final
+                        + scalars)))
 
                 if self.profile_sync:
                     torch.cuda.synchronize()

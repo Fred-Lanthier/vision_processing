@@ -32,9 +32,11 @@ rospack = rospkg.RosPack()
 pkg_path = rospack.get_path("vision_processing")
 sys.path.insert(0, pkg_path)
 
-from third_party.RDF.urdf_layer import URDFLayer
-from third_party.SDF_Bernstein_Basis.src.rdf_weights import RDF_Weights
-from third_party.SDF_Bernstein_Basis.bernstein_core import BernsteinCore
+# NOTE: URDFLayer/RDF_Weights/BernsteinCore (and their heavy deps such as
+# pytorch_kinematics) are imported lazily inside _init_bernstein(), which only
+# runs when ~enabled is true. With ~enabled=false this node is a pure
+# pass-through (/planner/raw_nominal_trajectory -> /planner/nominal_trajectory)
+# and must start even if those optional deps are unavailable.
 
 
 JOINT_NAMES = [f"panda_joint{i}" for i in range(1, 8)]
@@ -152,6 +154,12 @@ class SDFTrajectoryProjector:
         )
 
     def _init_bernstein(self):
+        # Imported here (not at module scope) so the disabled pass-through mode
+        # has no hard dependency on pytorch_kinematics / RDF / Bernstein.
+        from third_party.RDF.urdf_layer import URDFLayer
+        from third_party.SDF_Bernstein_Basis.src.rdf_weights import RDF_Weights
+        from third_party.SDF_Bernstein_Basis.bernstein_core import BernsteinCore
+
         urdf_path_raw = os.path.join(pkg_path, "urdf", "panda_camera.xacro")
         if urdf_path_raw.endswith(".xacro"):
             doc = xacro.process_file(urdf_path_raw)
@@ -177,8 +185,6 @@ class SDFTrajectoryProjector:
             "panda_link6",
             "panda_link7",
             "panda_hand",
-            "panda_leftfinger",
-            "panda_rightfinger",
             "fork_tip",
         ]
         weight_handler = RDF_Weights(device=self.device, dtype=torch.float32)

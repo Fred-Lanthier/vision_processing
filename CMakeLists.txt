@@ -7,7 +7,11 @@ cmake_policy(SET CMP0057 NEW)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
+  controller_manager_msgs
+  gazebo_msgs
   std_msgs
+  std_srvs
+  trajectory_msgs
   sensor_msgs
   cv_bridge
   geometry_msgs
@@ -60,7 +64,11 @@ catkin_package(
   CATKIN_DEPENDS 
     rospy 
     std_msgs 
-    sensor_msgs 
+    std_srvs
+    trajectory_msgs
+    sensor_msgs
+    controller_manager_msgs
+    gazebo_msgs
     cv_bridge
     geometry_msgs
     moveit_core
@@ -140,6 +148,7 @@ catkin_install_python(PROGRAMS
   scripts/circle_trajectory_publisher.py
   scripts/face_detection_mock.py
   scripts/fake_finger_publisher.py
+  scripts/unpause_after_controller_hold.py
   scripts/sam3_server.py
   test_novelty/cbf_safety_node_Bernstein.py
   test_novelty/cbf_safety_node_Bernstein_multicbf.py

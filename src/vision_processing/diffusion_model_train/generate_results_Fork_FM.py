@@ -7,6 +7,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import json
 import pandas as pd
 from tqdm import tqdm
+from dtw import dtw
 import rospkg
 import time
 
@@ -99,6 +100,63 @@ def ortho6d_to_rotation_matrix(d6):
     z = z / (np.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
     y = np.cross(z, x)
     return np.stack([x, y, z], axis=-1)
+
+
+def compute_ade_position_error(pred_pos, gt_pos):
+    """
+    Standard point-to-point ADE between two 3D trajectories.
+
+    If the trajectories do not have the same length, both are truncated to the
+    shortest length so this metric remains usable. DTW should be preferred when
+    timing or trajectory length differs.
+    """
+    min_len = min(len(pred_pos), len(gt_pos))
+    if min_len == 0:
+        return np.nan
+
+    return np.mean(
+        np.linalg.norm(pred_pos[:min_len] - gt_pos[:min_len], axis=1)
+    )
+
+
+def compute_dtw_position_error(pred_pos, gt_pos, normalize=True):
+    """
+    DTW distance between predicted and ground-truth 3D position trajectories.
+
+    pred_pos: array-like, shape (T_pred, 3), in meters
+    gt_pos:   array-like, shape (T_gt, 3), in meters
+
+    If normalize=True, returns the average DTW cost per alignment-pair, which is
+    easier to interpret like an ADE after temporal alignment. The result is still
+    in meters if the input positions are in meters.
+    """
+    pred_pos = np.asarray(pred_pos, dtype=np.float64)
+    gt_pos = np.asarray(gt_pos, dtype=np.float64)
+
+    if pred_pos.ndim != 2 or gt_pos.ndim != 2:
+        raise ValueError("pred_pos and gt_pos must be 2D arrays: (T, D).")
+    if pred_pos.shape[1] != gt_pos.shape[1]:
+        raise ValueError(
+            f"Trajectory dimensions must match, got {pred_pos.shape[1]} "
+            f"and {gt_pos.shape[1]}."
+        )
+    if len(pred_pos) == 0 or len(gt_pos) == 0:
+        return np.nan
+
+    # dtw-python supports multivariate trajectories directly. With 3D inputs,
+    # dist_method='euclidean' computes the Euclidean distance between positions.
+    alignment = dtw(
+        pred_pos,
+        gt_pos,
+        dist_method='euclidean',
+        keep_internals=False
+    )
+
+    if not normalize:
+        return alignment.distance
+
+    path_len = max(len(alignment.index1), 1)
+    return alignment.distance / path_len
 
 
 # ==============================================================================
@@ -392,52 +450,76 @@ def make_flow_matching_gif(model, sample, DEVICE, idx, num_steps=10):
 # ==============================================================================
 
 def run_quantitative_analysis(model, val_dataset, DEVICE,
-                              n_samples=20, num_steps=10):
+                              n_samples=20, num_steps=10,
+                              use_dtw_for_success=True):
+    """
+    Quantitative evaluation of the Flow Matching policy.
+
+    Main position metric:
+      - DTW: trajectory distance after temporal alignment, in cm.
+
+    Extra diagnostic metric:
+      - ADE: point-to-point trajectory distance, in cm.
+
+    Success uses normalized DTW by default:
+      normalized DTW < 2 cm AND final rotation error < 15 deg.
+    """
     model.eval()
     results = []
 
-    THRESHOLD_POS = 0.02   # 2 cm (applied to ADE)
+    THRESHOLD_POS = 0.02   # 2 cm, applied to normalized DTW by default
     THRESHOLD_ROT = 15.0   # 15 deg
 
-    num_eval = min(30, len(val_dataset))
+    num_eval = min(len(val_dataset) // 3, len(val_dataset))
     indices = np.linspace(0, len(val_dataset) - 1, num_eval, dtype=int)
 
-    print(f"📊 Evaluating {num_eval} sequences (success = ADE < 2 cm)...")
+    metric_name = 'DTW' if use_dtw_for_success else 'ADE'
+    print(
+        f"📊 Evaluating {num_eval} sequences "
+        f"(success = {metric_name} < {THRESHOLD_POS * 100:.1f} cm "
+        f"and RotErr < {THRESHOLD_ROT:.1f}°)..."
+    )
 
     for idx in tqdm(indices):
         sample = val_dataset[idx]
         gt_pos = sample['action'].numpy()[:, :3]
 
-        seq_ades, seq_angles, seq_preds = [], [], []
+        seq_dtws, seq_ades, seq_angles, seq_preds = [], [], [], []
 
         for _ in range(n_samples):
             pred, _, final_angle, _ = infer_single(
                 model, sample, DEVICE, num_steps=num_steps)
 
             pred_pos = pred[:, :3]
-            current_ade = np.mean(np.linalg.norm(pred_pos - gt_pos, axis=1))
 
+            current_dtw = compute_dtw_position_error(
+                pred_pos, gt_pos, normalize=True)
+            current_ade = compute_ade_position_error(pred_pos, gt_pos)
+
+            seq_dtws.append(current_dtw)
             seq_ades.append(current_ade)
             seq_angles.append(final_angle)
             seq_preds.append(pred)
 
         seq_preds = np.array(seq_preds)
 
-        # Dispersion
+        # Dispersion between stochastic predictions, in meters.
         mean_pred_path = np.mean(seq_preds[:, :, :3], axis=0)
         path_variance = np.mean(
             np.linalg.norm(seq_preds[:, :, :3] - mean_pred_path, axis=2))
 
-        # Success based on ADE
+        # Success based on DTW by default. ADE is still saved for diagnostics.
+        position_errors = seq_dtws if use_dtw_for_success else seq_ades
         success_count = sum(
-            ade < THRESHOLD_POS and rot < THRESHOLD_ROT
-            for ade, rot in zip(seq_ades, seq_angles))
+            pos_err < THRESHOLD_POS and rot < THRESHOLD_ROT
+            for pos_err, rot in zip(position_errors, seq_angles))
         success_rate = (success_count / n_samples) * 100
 
         results.append({
             'seq_idx':     idx,
-            'ADE':         np.mean(seq_ades) * 100,     # cm
-            'RotErr':      np.mean(seq_angles),          # deg
+            'DTW':         np.mean(seq_dtws) * 100,       # cm
+            'ADE':         np.mean(seq_ades) * 100,       # cm
+            'RotErr':      np.mean(seq_angles),           # deg
             'SuccessRate': success_rate,                  # %
             'Dispersion':  path_variance * 100,           # cm
         })
@@ -445,13 +527,17 @@ def run_quantitative_analysis(model, val_dataset, DEVICE,
     df = pd.DataFrame(results)
 
     print("\n" + "=" * 60)
-    print("🚀 RESULTS (Success = ADE < 2 cm)")
+    print(f"🚀 RESULTS (Success = {metric_name} < {THRESHOLD_POS * 100:.1f} cm)")
     print("=" * 60)
     print(f"  Mean Success Rate    : {df['SuccessRate'].mean():.2f} %")
-    print(f"  Mean Position (ADE)  : {df['ADE'].mean():.2f} cm")
-    print(f"  Mean Rotation (FDE)  : {df['RotErr'].mean():.2f} deg")
+    print(f"  Mean Position DTW    : {df['DTW'].mean():.2f} cm")
+    print(f"  Mean Position ADE    : {df['ADE'].mean():.2f} cm")
+    print(f"  Mean Rotation Error  : {df['RotErr'].mean():.2f} deg")
     print(f"  Mean Dispersion      : {df['Dispersion'].mean():.2f} cm")
     print("=" * 60)
+
+    df.to_csv('fm_quantitative_results_dtw.csv', index=False)
+    print("💾 Saved quantitative results to fm_quantitative_results_dtw.csv")
 
     return df
 
@@ -473,20 +559,53 @@ def plot_error_distributions(df):
     ax1.set_ylabel('Count')
     ax1.grid(True, axis='y')
 
-    # Right: ADE vs RotErr scatter
-    sc = ax2.scatter(df['ADE'], df['RotErr'],
+    # Right: DTW vs RotErr scatter
+    sc = ax2.scatter(df['DTW'], df['RotErr'],
                      c=df['SuccessRate'], cmap='RdYlGn',
                      edgecolors='#333333', linewidths=0.4,
                      s=60, alpha=0.85)
     cbar = fig.colorbar(sc, ax=ax2)
     cbar.set_label('Success Rate (%)', fontsize=STYLE['label_size'])
-    ax2.set_title('Position vs Rotation Error')
-    ax2.set_xlabel('ADE (cm)')
+    ax2.set_title('DTW Position Error vs Rotation Error')
+    ax2.set_xlabel('Normalized DTW (cm)')
     ax2.set_ylabel('Rotation Error (°)')
     ax2.grid(True)
 
     fig.tight_layout()
-    fig.savefig('04_fm_metrics_distribution.png')
+    fig.savefig('04_fm_metrics_distribution_dtw.png')
+    plt.close(fig)
+
+
+def plot_dtw_vs_ade(df):
+    """
+    Diagnostic plot: separates timing errors from spatial errors.
+
+    - Low DTW + high ADE: good path, bad timing.
+    - High DTW + high ADE: bad path.
+    """
+    print("📊 Generating DTW vs ADE diagnostic plot...")
+
+    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    sc = ax.scatter(df['ADE'], df['DTW'],
+                    c=df['SuccessRate'], cmap='RdYlGn',
+                    edgecolors='#333333', linewidths=0.4,
+                    s=60, alpha=0.85)
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label('Success Rate (%)', fontsize=STYLE['label_size'])
+
+    max_err = max(df['ADE'].max(), df['DTW'].max())
+    ax.plot([0, max_err], [0, max_err],
+            color=STYLE['accent_color'], linestyle='--', linewidth=1.5,
+            label='ADE = DTW')
+
+    ax.set_title('DTW vs ADE Diagnostic')
+    ax.set_xlabel('ADE point-to-point (cm)')
+    ax.set_ylabel('Normalized DTW (cm)')
+    ax.legend()
+    ax.grid(True)
+
+    fig.tight_layout()
+    fig.savefig('04b_fm_dtw_vs_ade.png')
     plt.close(fig)
 
 
@@ -577,12 +696,12 @@ def main():
     rospack = rospkg.RosPack()
     pkg_path = rospack.get_path('vision_processing')
     data_path = os.path.join(pkg_path, 'datas', 'Trajectories_preprocess')
-    ckpt_path = os.path.join(pkg_path, 'models', 'last_fm_model_high_dim_CFM_relative_dropout.ckpt')
+    ckpt_path = os.path.join(pkg_path, 'models', 'best_fm_model_high_dim_CFM_relative_dropout_1024_H.ckpt')
 
     # 2. Dataset
     val_dataset = Robot3DDataset(
         data_path, mode='val', val_ratio=0.2, seed=42,
-        num_points=256, obs_horizon=2, pred_horizon=16)
+        num_points=1024, obs_horizon=2, pred_horizon=16)
     print(f"✅ Validation set: {len(val_dataset)} sequences")
 
     # 3. Model
@@ -624,8 +743,10 @@ def main():
 
     # 5. Full benchmark
     df = run_quantitative_analysis(
-        model, val_dataset, DEVICE, n_samples=20, num_steps=NUM_STEPS)
+        model, val_dataset, DEVICE, n_samples=20, num_steps=NUM_STEPS,
+        use_dtw_for_success=True)
     plot_error_distributions(df)
+    plot_dtw_vs_ade(df)
 
     # 6. Inference speed benchmark
     run_inference_speed_benchmark(
@@ -636,7 +757,10 @@ def main():
     worst_seq = df.loc[df['SuccessRate'].idxmin()]
     idx_worst = int(worst_seq['seq_idx'])
     print(f"\n🚨 Worst sequence (idx {idx_worst}): "
-          f"Success {worst_seq['SuccessRate']:.1f}%")
+          f"Success {worst_seq['SuccessRate']:.1f}% | "
+          f"DTW {worst_seq['DTW']:.2f} cm | "
+          f"ADE {worst_seq['ADE']:.2f} cm | "
+          f"RotErr {worst_seq['RotErr']:.2f}°")
 
     worst_sample = val_dataset[idx_worst]
     plot_3d_multimodality_with_orientation(

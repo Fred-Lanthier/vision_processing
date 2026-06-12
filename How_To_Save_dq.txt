@@ -1,0 +1,28 @@
+In a first terminal, launch :
+
+roslaunch vision_processing green_cube_feeding_casf.launch
+
+ou 
+
+roslaunch vision_processing green_cube_feeding_casf.launch       cbf_node_type:=cbf_safety_node_Bernstein_multicbf.py       cbf_direct_position_mode:=integrated
+
+roslaunch vision_processing green_cube_feeding_casf.launch \
+    cbf_node_type:=cbf_safety_node_Bernstein_multicbf.py \
+    cbf_direct_position_mode:=integrated \
+    cbf_solver_mode:=multi_projected
+
+In a second terminal, launch :
+
+rosbag record -O run1.bag /cbf_safety/diagnostics /cbf_safety/diagnostics_layout
+
+pour les trajectoires, ajouté :
+
+rosbag record -O run4.bag /cbf_safety/diagnostics /cbf_safety/diagnostics_layout /joint_states /perception/persistent_obstacles
+
+When it is done, run :
+
+python3 scripts/plot_cbf_diagnostics.py run1.bag --csv for the plots of one bag
+
+For comparison : 
+
+python3 scripts/analyze_trajectory.py run4.bag run6_NO_CBF.bag -o trajectory_comparison_2

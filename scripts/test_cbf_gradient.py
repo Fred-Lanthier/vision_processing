@@ -56,7 +56,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 LINK_NAMES = [
     'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
-    'panda_hand', 'panda_leftfinger', 'panda_rightfinger', 'fork_tip',
+    'panda_hand', 'fork_tip',
 ]
 VOXEL_DIR = os.path.join(PKG_DIR, 'third_party/RDF/panda_layer/meshes/voxel_128')
 

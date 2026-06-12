@@ -11,7 +11,7 @@
   <arg name="casf_model_name" default="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
-  <arg name="planner_rate_hz" default="8" />
+  <arg name="planner_rate_hz" default="12" />
   <arg name="trajectory_waypoint_rate_hz" default="10.0" />
   <arg name="control_rate_hz" default="80.0" />
   <arg name="cbf_preprocess_rate_hz" default="30.0" />
@@ -51,7 +51,7 @@
   <arg name="trajectory_retime_joint_speed" default="0.25" />
   <arg name="trajectory_retime_joint_weights" default="1 1 1 1 1 1 1" />
   <arg name="trajectory_retime_min_segment_fraction" default="0.02" />
-  <arg name="n_pred" default="10" />
+  <arg name="n_pred" default="5" />
   <arg name="n_corr" default="5" />
   <arg name="alpha_corr" default="2.0" />
   <arg name="commit_distance" default="0.00" />
@@ -69,7 +69,10 @@
   <arg name="cbf_gradient_check_period" default="0.0" />
   <arg name="cbf_gradient_check_eps" default="0.001" />
   <arg name="barrier_alpha" default="0.001" />
-  <arg name="d_safe" default="0.01" />
+  <arg name="d_safe" default="0.015" />
+  <arg name="cbf_publish_safety_envelope" default="true" />
+  <arg name="cbf_safety_envelope_resolution" default="40" />
+  <arg name="cbf_safety_envelope_alpha" default="0.20" />
   <arg name="cbf_kp" default="5.0" />
   <arg name="max_feedback_velocity" default="0.5" />
   <arg name="cbf_filter_tau" default="0.05" />
@@ -129,6 +132,30 @@
   <arg name="log_persistent_counts" default="false" />
   <arg name="log_cbf_events" default="false" />
   <arg name="log_cbf_command_timing" default="true" />
+  <arg name="cbf_publish_diagnostics" default="true" />
+  <!-- CBF node selection: cbf_safety_node_Bernstein.py (single soft-min
+       constraint, CUDA graph) or cbf_safety_node_Bernstein_multicbf.py.
+       The multicbf-specific args below are ignored by the Bernstein node. -->
+  <arg name="cbf_node_type" default="cbf_safety_node_Bernstein.py" />
+  <arg name="cbf_solver_mode" default="fast_tangent" />
+  <arg name="cbf_active_constraints" default="4" />
+  <arg name="cbf_h_activate" default="0.006" />
+  <arg name="cbf_max_inward_speed" default="0.20" />
+  <arg name="cbf_recovery_speed" default="0.0" />
+  <arg name="cbf_recovery_depth" default="0.01" />
+  <arg name="cbf_max_correction_speed" default="0.35" />
+  <arg name="cbf_projection_iters" default="3" />
+  <arg name="cbf_projection_relaxation" default="1.0" />
+  <arg name="cbf_tracking_feedback_mode" default="tangent_near" />
+  <arg name="cbf_passthrough_when_inactive" default="true" />
+  <!-- Baseline "sans CBF" mode: barrier and diagnostics still computed, no
+       correction applied; the robot freezes at first estimated contact
+       (the fork has no Gazebo collision geometry, so contact is detected
+       from the perception-based clearance h_corr + d_safe <= threshold). -->
+  <arg name="cbf_monitor_only" default="false" />
+  <arg name="contact_stop_enabled" default="false" />
+  <arg name="contact_stop_clearance" default="0.0" />
+  <arg name="contact_stop_cycles" default="2" />
   <arg name="log_trajectory_timing" default="false" />
   <arg name="log_trajectory_executor_events" default="false" />
   <arg name="log_bridge_events" default="false" />
@@ -208,7 +235,7 @@
        Voxels outside FOV persist indefinitely (no age-based eviction).
        Voxels inside FOV where camera sees background are evicted immediately.
        Tuning guide:
-         voxel_size       — obstacle resolution (5 mm for fork-tip accuracy)
+         voxel_size       — obstacle resolution (10 mm for fork-tip accuracy)
          commit_threshold — obs frames before a voxel is published (2 = fast, 3 = robust)
          free_margin      — depth band (m); camera must see this far beyond voxel to evict
                             (default 2×voxel_size = 10 mm)
@@ -338,7 +365,7 @@
          cbf_kappa    — class-K gain: lower = softer correction (try 1.0–3.0, was 10.0)
          barrier_alpha — softmin temperature: higher = smoother gradient direction (try 0.003–0.007)
          d_safe        — minimum clearance enforced by the QP (metres) -->
-  <node name="cbf_safety_Bernstein" pkg="vision_processing" type="cbf_safety_node_Bernstein.py" output="screen" cwd="node">
+  <node name="cbf_safety_Bernstein" pkg="vision_processing" type="$(arg cbf_node_type)" output="screen" cwd="node">
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
         <param name="enable_cbf"               value="true" />
         <param name="publish_controller_command" value="$(arg use_direct_group_position_controller)" />
@@ -371,9 +398,29 @@
         <param name="cbf_gradient_check_eps" value="$(arg cbf_gradient_check_eps)" />
         <param name="log_cbf_events" value="$(arg log_cbf_events)" />
         <param name="log_cbf_command_timing" value="$(arg log_cbf_command_timing)" />
+        <param name="publish_diagnostics" value="$(arg cbf_publish_diagnostics)" />
+        <!-- multicbf-only parameters (unread by the Bernstein node) -->
+        <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)" />
+        <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)" />
+        <param name="cbf_h_activate" value="$(arg cbf_h_activate)" />
+        <param name="cbf_max_inward_speed" value="$(arg cbf_max_inward_speed)" />
+        <param name="cbf_recovery_speed" value="$(arg cbf_recovery_speed)" />
+        <param name="cbf_recovery_depth" value="$(arg cbf_recovery_depth)" />
+        <param name="cbf_max_correction_speed" value="$(arg cbf_max_correction_speed)" />
+        <param name="cbf_projection_iters" value="$(arg cbf_projection_iters)" />
+        <param name="cbf_projection_relaxation" value="$(arg cbf_projection_relaxation)" />
+        <param name="cbf_tracking_feedback_mode" value="$(arg cbf_tracking_feedback_mode)" />
+        <param name="cbf_passthrough_when_inactive" value="$(arg cbf_passthrough_when_inactive)" />
+        <param name="cbf_monitor_only" value="$(arg cbf_monitor_only)" />
+        <param name="contact_stop_enabled" value="$(arg contact_stop_enabled)" />
+        <param name="contact_stop_clearance" value="$(arg contact_stop_clearance)" />
+        <param name="contact_stop_cycles" value="$(arg contact_stop_cycles)" />
         <param name="log_trajectory_timing" value="$(arg log_trajectory_timing)" />
         <param name="barrier_alpha" value="$(arg barrier_alpha)" />
         <param name="d_safe"       value="$(arg d_safe)" />
+        <param name="publish_safety_envelope" value="$(arg cbf_publish_safety_envelope)" />
+        <param name="safety_envelope_resolution" value="$(arg cbf_safety_envelope_resolution)" />
+        <param name="safety_envelope_alpha" value="$(arg cbf_safety_envelope_alpha)" />
         <param name="max_joint_velocity" value="$(arg max_joint_velocity)" />
         <param name="cbf_kp"                   value="$(arg cbf_kp)" />
         <param name="max_feedback_velocity"    value="$(arg max_feedback_velocity)" />

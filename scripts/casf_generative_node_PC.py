@@ -105,7 +105,22 @@ if scripts_path not in sys.path:
     sys.path.insert(0, scripts_path)
 sys.path.append(os.path.join(pkg_path, 'src', 'vision_processing', 'diffusion_model_train'))
 
-from Train_Fork_FM import FlowMatchingAgent, Normalizer
+# Two checkpoint families share the same U-Net architecture but use different
+# normalizers:
+#   - Train_Fork_FM.py            → Normalizer with pos_min/pos_max, normalize()/unnormalize()
+#                                   and stats keyed {'agent_pos','action'} (shared pos stats).
+#   - Train_Fork_FlowMP_9D.py     → Normalizer with obs_min/obs_max/act_min/act_max,
+#                                   normalize_obs()/normalize_act()/unnormalize_act()
+#                                   and stats keyed {'obs','action'} (separate obs/act stats).
+# The node auto-detects which family a checkpoint belongs to (see model loading
+# below) so both model types load without code changes.
+# Each agent builds its OWN normalizer from its OWN module:
+#   FlowMatchingAgentFM → FM Normalizer (pos_min/pos_max)
+#   FlowMatchingAgent9D → 9D Normalizer (obs_min/act_min, separate obs/act stats)
+# We never import a Normalizer directly, so there is no risk of applying the
+# wrong one to a model.
+from Train_Fork_FM import FlowMatchingAgent as FlowMatchingAgentFM
+from Train_Fork_FlowMP_9D import FlowMatchingAgent as FlowMatchingAgent9D
 from vision_processing import fast_ik_module
 from third_party.SDF_Bernstein_Basis.src.rdf_weights import RDF_Weights
 from third_party.SDF_Bernstein_Basis.bernstein_core import BernsteinCore
@@ -190,7 +205,7 @@ class CASFGenerativeNode:
         weight_handler.init_robot_folder(weights_dir, robot_name='panda')
         link_names = [
             'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
-            'panda_hand', 'panda_leftfinger', 'panda_rightfinger', 'fork_tip',
+            'panda_hand', 'fork_tip',
         ]
         weight_handler.add_models(link_names, robot_name='panda')
         self.bernstein_core = BernsteinCore(weight_handler, self.robot_layer, self.device, link_names)
@@ -232,19 +247,40 @@ class CASFGenerativeNode:
         self.action_dim = cfg.get('action_dim', 9)
         self.obs_dim = cfg.get('obs_dim', 9)
         self.pred_horizon = int(cfg.get('pred_horizon', 16))
-        self.fm_agent = FlowMatchingAgent(
+        stats = payload.get('stats', None)
+
+        # Auto-detect the normalizer family from the checkpoint. The 9D-dynamics
+        # models store separate obs/act stats (normalizer.obs_min / act_min);
+        # the original FM models store a single pos_min/pos_max.
+        state_dict = payload['model_state_dict']
+        self.norm_is_9d = (
+            any(k.startswith('normalizer.obs_') or k.startswith('normalizer.act_')
+                for k in state_dict)
+            or (isinstance(stats, dict) and 'obs' in stats and 'action' in stats)
+        )
+        AgentCls = FlowMatchingAgent9D if self.norm_is_9d else FlowMatchingAgentFM
+        rospy.loginfo(
+            "🧭 Detected %s normalizer for checkpoint %s",
+            "9D-dynamics (obs/act)" if self.norm_is_9d else "FM (shared pos)",
+            model_name,
+        )
+
+        agent_kwargs = dict(
             action_dim=self.action_dim,
             obs_horizon=cfg.get('obs_horizon', 2),
             pred_horizon=self.pred_horizon,
             encoder_output_dim=cfg.get('encoder_output_dim', 64),
             diffusion_step_embed_dim=cfg.get('diffusion_step_embed_dim', 256),
             down_dims=cfg.get('down_dims', [256, 512, 1024]),
-            stats=payload.get('stats', None)
-        ).to(self.device)
-        self.fm_agent.load_state_dict(payload['model_state_dict'])
+            stats=stats,
+        )
+        if self.norm_is_9d:
+            agent_kwargs['obs_dim'] = self.obs_dim
+        self.fm_agent = AgentCls(**agent_kwargs).to(self.device)
+        self.fm_agent.load_state_dict(state_dict)
         self.normalizer = self.fm_agent.normalizer
-        if not self.normalizer.is_initialized and 'stats' in payload:
-            self.normalizer.load_stats_from_dict(payload['stats'])
+        if not self.normalizer.is_initialized and stats is not None:
+            self.normalizer.load_stats_from_dict(stats)
         self.fm_agent.eval()
 
         # 4. State variables
@@ -347,6 +383,25 @@ class CASFGenerativeNode:
         if msg.data and not self.cbf_ready:
             rospy.loginfo("[TRAJ TIMING] CBF ready received; planner may publish trajectories.")
         self.cbf_ready = bool(msg.data)
+
+    # ----- Normalizer dispatch (handles both FM and 9D-dynamics checkpoints) -----
+    def norm_obs(self, x):
+        """Normalize the proprioceptive observation (agent_pos)."""
+        if self.norm_is_9d:
+            return self.normalizer.normalize_obs(x)
+        return self.normalizer.normalize(x)
+
+    def norm_act(self, x):
+        """Normalize an action / trajectory sample."""
+        if self.norm_is_9d:
+            return self.normalizer.normalize_act(x)
+        return self.normalizer.normalize(x)
+
+    def unnorm_act(self, x):
+        """Un-normalize an action / trajectory sample back to physical units."""
+        if self.norm_is_9d:
+            return self.normalizer.unnormalize_act(x)
+        return self.normalizer.unnormalize(x)
 
     def stable_torch_sample(self, points, count):
         """Deterministic point selection/padding for stable FM conditioning."""
@@ -715,7 +770,7 @@ class CASFGenerativeNode:
             
         obs_norm = {
             'point_cloud': obs_dict['point_cloud'].to(dev),
-            'agent_pos': self.normalizer.normalize(obs_dict['agent_pos'].to(dev))
+            'agent_pos': self.norm_obs(obs_dict['agent_pos'].to(dev))
         }
 
         # ---------------------------------------------------------
@@ -832,7 +887,7 @@ class CASFGenerativeNode:
                 v_nom = alpha_corr * (1.0 - tau) * v_theta
                 
                 # 1. Unnormalize to get physical poses of Fork Tip
-                A_unnorm = self.normalizer.unnormalize(A)
+                A_unnorm = self.unnorm_act(A)
                 A_world = A_unnorm.clone()
                 A_world[..., :3] += curr_pos
                 
@@ -889,7 +944,7 @@ class CASFGenerativeNode:
                     w_alpha = w * self.casf_alpha
                     
                     # Unnormalize v_nom to get physical displacement
-                    A_next_unnorm = self.normalizer.unnormalize(A + v_nom * dt_corr)
+                    A_next_unnorm = self.unnorm_act(A + v_nom * dt_corr)
                     A_next_world = A_next_unnorm.clone()
                     A_next_world[..., :3] += curr_pos
                     v_world = (A_next_world - A_world).reshape(B, H, 9)
@@ -910,7 +965,7 @@ class CASFGenerativeNode:
                     
                     # Back to relative, normalized A
                     A_world_next[..., :3] -= curr_pos
-                    A = self.normalizer.normalize(A_world_next)
+                    A = self.norm_act(A_world_next)
                     
                 t_casf_total += (time.perf_counter() - t2)
                 
@@ -930,8 +985,8 @@ class CASFGenerativeNode:
         """Publish full joint trajectory for the safety shield."""
         t_build_start = time.perf_counter()
         current_time = rospy.get_time()
-        
-        A_unnorm = self.normalizer.unnormalize(A_norm)
+
+        A_unnorm = self.unnorm_act(A_norm)
         A_world = A_unnorm.clone()
         # pos_fork is already a torch tensor from control_loop
         A_world[..., :3] += pos_fork

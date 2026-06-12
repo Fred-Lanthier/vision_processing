@@ -1,0 +1,20 @@
+{
+  "duration_s": 42.33295512199402,
+  "cycles": 3219,
+  "pct_dummy_selection": 0.0,
+  "min_h": -0.019367877393960953,
+  "min_h_corr": -0.01476270705461502,
+  "pct_cbf_active": 29.481205343274308,
+  "pct_escape": 0.0,
+  "pct_cap_active": 0.0,
+  "pct_recovery": 0.0,
+  "pct_repair": 0.0,
+  "worst_final_constraint": 0.0,
+  "mean_total_ms": 6.379950416536204,
+  "p99_total_ms": 20.498941650390638,
+  "hdot_execution_ratio": 0.9736124960646587,
+  "mean_alignment_active": 1.0000000049618198,
+  "mean_active_constraints": 1.0,
+  "monitor_only": true,
+  "contact_time_s": null
+}
