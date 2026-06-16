@@ -84,15 +84,34 @@ def panel_label(ax, s, x=-0.12):
 
 def legend_top(ax, ncol=None, anchor=(0.0, 1.01), **kw):
     """The ONLY legend style: horizontal strip above the axes, left-aligned.
-    Never overlaps data and sits in the same place in every figure."""
+    Never overlaps data and sits in the same place in every figure.
+
+    The strip wraps onto extra rows when it would be wider than the axes:
+    ``ncol`` is treated as an upper bound and reduced until the legend fits,
+    so long labels never spill past the right edge of the graph."""
     handles, labels = ax.get_legend_handles_labels()
     if not handles:
         return None
-    if ncol is None:
-        ncol = min(len(labels), 4)
-    return ax.legend(handles, labels, loc="lower left", bbox_to_anchor=anchor,
-                     ncol=ncol, borderaxespad=0.0, columnspacing=1.2,
-                     handlelength=1.5, handletextpad=0.5, **kw)
+    max_ncol = len(labels) if ncol is None else min(ncol, len(labels))
+
+    def build(nc):
+        return ax.legend(handles, labels, loc="lower left", bbox_to_anchor=anchor,
+                         ncol=nc, borderaxespad=0.0, columnspacing=1.2,
+                         handlelength=1.5, handletextpad=0.5, **kw)
+
+    fig = ax.figure
+    try:
+        fig.canvas.draw()  # need a renderer to measure widths
+        ax_w = ax.get_window_extent().width
+        for nc in range(max_ncol, 0, -1):
+            leg = build(nc)
+            fig.canvas.draw()
+            if leg.get_window_extent().width <= ax_w or nc == 1:
+                return leg
+            leg.remove()
+    except Exception:
+        pass
+    return build(max_ncol)
 
 
 def fig_legend_top(fig, ax, ncol=4):

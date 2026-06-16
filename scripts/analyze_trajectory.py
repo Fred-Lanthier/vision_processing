@@ -35,7 +35,7 @@ PANDA_JOINTS = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
 
 def load_run(path):
     """Extract joint trajectory, barrier series and obstacle snapshot."""
-    run = {"t_q": [], "q": [], "t_h": [], "h": [], "h_corr": [],
+    run = {"t_q": [], "q": [], "t_h": [], "h": [],
            "contact_time": None, "obs": None}
     layout = None
     obs_msgs = []
@@ -66,7 +66,6 @@ def load_run(path):
     diag = np.asarray(run["h"], dtype=np.float64)
     t_h = np.asarray(run["t_h"])
     h = diag[:, n_vec + scal["h"]]
-    h_corr = diag[:, n_vec + scal["h_corr"]]
     sel = diag[:, n_vec + scal["selected_count"]]
     valid = (sel > 0) & (np.nan_to_num(h, nan=1e9) < 5.0)
     if "contact_stop" in scal and run["contact_time"] is None:
@@ -85,7 +84,7 @@ def load_run(path):
 
     run["t_q"] = np.asarray(run["t_q"])
     run["q"] = np.asarray(run["q"])
-    run["t_h"], run["h"], run["h_corr"], run["valid"] = t_h, h, h_corr, valid
+    run["t_h"], run["h"], run["valid"] = t_h, h, valid
 
     # Trim to the active-task window (first/last cycle with a real obstacle
     # selection): removes the startup idle period and prevents the clearance
@@ -97,7 +96,7 @@ def load_run(path):
         kh = (t_h >= t0) & (t_h <= t1)
         run["t_q"], run["q"] = run["t_q"][kq] - t0, run["q"][kq]
         run["t_h"], run["h"] = t_h[kh] - t0, h[kh]
-        run["h_corr"], run["valid"] = h_corr[kh], valid[kh]
+        run["valid"] = valid[kh]
         if run["contact_time"] is not None:
             run["contact_time"] -= t0
     return run
@@ -132,7 +131,7 @@ def make_fk():
 
 
 def clearance(run, d_safe):
-    return run["h_corr"] + d_safe
+    return run["h"] + d_safe
 
 
 def truncate_at_contact(run, tip, t_tip):
@@ -249,7 +248,7 @@ def main():
     lc.set_array(np.clip(cl[:-1], 0, 60))
     ax.add_collection(lc)
     tb, _ = tips["base"]
-    ax.plot(tb[:, 0], tb[:, 2], color=ts.GREY, lw=1.1, ls="--",
+    ax.plot(tb[:, 0], tb[:, 2], color=ts.ORANGE, lw=1.1, ls="--",
             label="exécution sans filtre (référence)")
     if obs is not None:
         ax.scatter(obs[:, 0], obs[:, 2], s=1.0, c=C_OBS, alpha=0.3)

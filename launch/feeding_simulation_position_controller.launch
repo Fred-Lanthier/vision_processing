@@ -46,14 +46,14 @@
 
   <node name="spawn_container" pkg="gazebo_ros" type="spawn_model"
         args="-urdf -param container_description -model container
-              -x 0.43 -y 0.0 -z 0.778 -R 1.5708"/>
+              -x 0.47 -y 0.0 -z 0.778 -R 1.5708"/>
 
   <param name="food_description"
          textfile="$(find vision_processing)/urdf/food.urdf"/>
 
   <node name="spawn_food" pkg="gazebo_ros" type="spawn_model"
         args="-urdf -param food_description -model food_cube
-              -x 0.43 -y 0.0 -z 0.764"/>
+              -x 0.45 -y 0.0 -z 0.764"/>
 
   <param name="robot_description"
          command="$(find xacro)/xacro $(find vision_processing)/urdf/panda_camera.xacro arm_id:=$(arg arm_id)"/>

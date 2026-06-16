@@ -11,23 +11,25 @@
   <arg name="casf_model_name" default="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
-  <arg name="planner_rate_hz" default="12" />
+  <arg name="planner_rate_hz" default="1.5" />
   <arg name="trajectory_waypoint_rate_hz" default="10.0" />
   <arg name="control_rate_hz" default="80.0" />
-  <arg name="cbf_preprocess_rate_hz" default="30.0" />
+  <arg name="cbf_preprocess_rate_hz" default="50.0" />
   <arg name="viz_rate_hz" default="5.0" />
   <arg name="bridge_rate_hz" default="60.0" />
   <arg name="bridge_horizon_points" default="1" />
   <arg name="bridge_point_dt" default="0.02" />
   <arg name="bridge_lead_time" default="0.01" />
   <arg name="cbf_graph_points" default="100" />
-  <arg name="cbf_preprocess_max_points" default="512" />
+  <arg name="cbf_preprocess_max_points" default="1024" />
   <arg name="cbf_candidate_filter" default="sdf" />
-  <arg name="cbf_sdf_candidate_max_dist" default="0.15" />
+  <arg name="cbf_link_filter_radius" default="0.35" />
+  <arg name="cbf_link_prefilter_points" default="256" />
+  <arg name="cbf_sdf_candidate_max_dist" default="0.35" />
   <arg name="cbf_sdf_prune_chunk_size" default="2048" />
-  <arg name="cbf_sdf_self_filter_margin" default="-0.003" />
+  <arg name="cbf_sdf_self_filter_margin" default="-0.05" />
   <arg name="cbf_sdf_prefilter_radius" default="0.35" />
-  <arg name="cbf_sdf_prefilter_max_points" default="1000" />
+  <arg name="cbf_sdf_prefilter_max_points" default="500" />
   <arg name="cbf_selection_metric" default="sdf" />
   <arg name="cbf_cluster_mode" default="topk" />
   <arg name="cbf_fork_mesh_selection_points" default="512" />
@@ -91,18 +93,27 @@
   <arg name="cbf_escape_normal_h_trigger" default="0.0" />
   <arg name="cbf_escape_max_velocity" default="0.2" />
   <arg name="sam_tracking_rate_hz" default="5.0" />
+  <arg name="sam3_init_retry_period" default="8.0" />
+  <arg name="sam3_init_backoff_after_failures" default="2" />
+  <arg name="sam3_init_backoff_period" default="30.0" />
   <arg name="sam2_max_side_length" default="512" />
   <arg name="projector_max_points" default="5000" />
   <arg name="projector_max_target_points" default="2000" />
   <arg name="obstacle_sample_multiplier" default="3.0" />
   <arg name="projector_tf_timeout" default="0.01" />
   <arg name="fork_sam3_prompt" default="4 fork tips" />
-  <arg name="fork_mask_dilation_px" default="5" />
+  <arg name="fork_mask_dilation_px" default="7" />
   <arg name="run_3d_fork_filter_backup" default="false" />
   <arg name="persistent_voxel_size" default="0.01" />
+  <!-- Freespace eviction band (m). Default ~2x voxel_size. Set very large
+       (e.g. 100.0) for a baseline collision run so the static bowl is never
+       evicted as the fork passes through it; the whole-body barrier then
+       reaches h < 0 at true contact and contact_stop fires anywhere on the
+       robot, not just the fork tip. -->
+  <arg name="persistent_free_margin" default="0.02" />
   <arg name="persistent_commit_threshold" default="1" />
   <arg name="persistent_max_voxels" default="100000" />
-  <arg name="persistent_robot_body_radius" default="0.03" />
+  <arg name="persistent_robot_body_radius" default="-0.03" />
   <arg name="persistent_dilate_cloud" default="false" />
   <arg name="persistent_publish_rate_hz" default="30.0" />
   <arg name="persistent_target_exclusion_radius" default="0.005" />
@@ -132,7 +143,10 @@
   <arg name="log_persistent_counts" default="false" />
   <arg name="log_cbf_events" default="false" />
   <arg name="log_cbf_command_timing" default="true" />
+  <arg name="log_cbf_preprocess_breakdown" default="false" />
+  <arg name="cbf_profile_sync" default="false" />
   <arg name="cbf_publish_diagnostics" default="true" />
+  <arg name="fm_use_torch_compile" default="false" />
   <!-- CBF node selection: cbf_safety_node_Bernstein.py (single soft-min
        constraint, CUDA graph) or cbf_safety_node_Bernstein_multicbf.py.
        The multicbf-specific args below are ignored by the Bernstein node. -->
@@ -197,6 +211,9 @@
         <param name="target_prompt" value="$(arg target_prompt)" />
         <param name="publish_all_as_obstacles" value="true" />
         <param name="tracking_rate_hz" value="$(arg sam_tracking_rate_hz)" />
+        <param name="sam3_init_retry_period" value="$(arg sam3_init_retry_period)" />
+        <param name="sam3_init_backoff_after_failures" value="$(arg sam3_init_backoff_after_failures)" />
+        <param name="sam3_init_backoff_period" value="$(arg sam3_init_backoff_period)" />
         <param name="sam2_max_side_length" value="$(arg sam2_max_side_length)" />
         <param name="log_timing" value="$(arg log_sam_timing)" />
         <param name="target_frame" value="world" />
@@ -244,6 +261,7 @@
         <param name="depth_topic"         value="$(arg depth_topic)" />
         <param name="info_topic"          value="$(arg info_topic)" />
         <param name="voxel_size"          value="$(arg persistent_voxel_size)" />
+        <param name="free_margin"         value="$(arg persistent_free_margin)" />
         <param name="commit_threshold"    value="$(arg persistent_commit_threshold)" />
         <param name="max_voxels"          value="$(arg persistent_max_voxels)" />
         <param name="robot_body_radius"   value="$(arg persistent_robot_body_radius)" />
@@ -285,6 +303,7 @@
         <param name="ensembler_buffer_size" value="$(arg ensembler_buffer_size)" />
         <param name="ensembler_decay" value="$(arg ensembler_decay)" />
         <param name="log_trajectory_timing" value="$(arg log_trajectory_timing)" />
+        <param name="fm_use_torch_compile" value="$(arg fm_use_torch_compile)" />
         <!-- CASF integration: n_pred controls pure FM trajectory smoothness;
              n_corr controls safety correction strength and cost. -->
         <param name="n_pred"     value="$(arg n_pred)" />
@@ -373,6 +392,8 @@
         <param name="cbf_graph_points" value="$(arg cbf_graph_points)" />
         <param name="preprocess_max_points" value="$(arg cbf_preprocess_max_points)" />
         <param name="cbf_candidate_filter" value="$(arg cbf_candidate_filter)" />
+        <param name="cbf_link_filter_radius" value="$(arg cbf_link_filter_radius)" />
+        <param name="cbf_link_prefilter_points" value="$(arg cbf_link_prefilter_points)" />
         <param name="cbf_sdf_candidate_max_dist" value="$(arg cbf_sdf_candidate_max_dist)" />
         <param name="cbf_sdf_prune_chunk_size" value="$(arg cbf_sdf_prune_chunk_size)" />
         <param name="cbf_sdf_self_filter_margin" value="$(arg cbf_sdf_self_filter_margin)" />
@@ -449,7 +470,8 @@
         <param name="viz_rate_hz" value="$(arg viz_rate_hz)" />
         <param name="publish_debug_topics" value="false" />
         <param name="publish_viz_topics" value="$(arg launch_rviz)" />
-        <param name="profile_sync" value="false" />
+        <param name="profile_sync" value="$(arg cbf_profile_sync)" />
+        <param name="log_cbf_preprocess_breakdown" value="$(arg log_cbf_preprocess_breakdown)" />
         <param name="cuda_memory_log_period" value="$(arg cuda_memory_log_period)" />
         <param name="nominal_hold_deadband" value="$(arg nominal_hold_deadband)" />
         <param name="cbf_ema_alpha" value="$(arg cbf_ema_alpha)" />

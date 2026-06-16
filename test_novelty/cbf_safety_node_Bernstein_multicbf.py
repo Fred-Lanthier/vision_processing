@@ -133,6 +133,7 @@ class CBFSafetyNode:
         link_names = ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7', 'panda_hand', 'fork_tip']
         self.protected_link_names = link_names
         self.fork_link_index = link_names.index('fork_tip')
+        self.protected_fk_tree = self.robot_layer.make_fk_subset(link_names)
         weight_handler.add_models(link_names, robot_name='panda')
         self._log_cuda_memory("CBF after Bernstein weights")
         
@@ -178,6 +179,14 @@ class CBFSafetyNode:
             "~cbf_recovery_depth", 0.01))
         self.cbf_max_correction_speed = float(rospy.get_param(
             "~cbf_max_correction_speed", 0.35))
+        # Repair gradient gate. When |grad_h| falls below this the obstacle
+        # geometry is degenerate/conflicting (e.g. the fork wedged between both
+        # walls of a slim container, where opposing per-point gradients cancel):
+        # the repair direction grad_h/|grad_h| is unreliable, so the repair is
+        # ramped to zero between grad_min and 2*grad_min and the nominal (which
+        # enters/exits the container vertically) is trusted instead.
+        self.cbf_repair_grad_min = float(rospy.get_param(
+            "~cbf_repair_grad_min", 0.1))
         self.cbf_projection_iters = max(1, int(rospy.get_param(
             "~cbf_projection_iters", 3)))
         self.cbf_projection_relaxation = float(rospy.get_param(
@@ -216,6 +225,10 @@ class CBFSafetyNode:
         self.cbf_gradient_check_eps = float(rospy.get_param("~cbf_gradient_check_eps", 1e-3))
         self.log_cbf_events = _bool_param("~log_cbf_events", False)
         self.log_cbf_command_timing = _bool_param("~log_cbf_command_timing", True)
+        self.log_cbf_preprocess_breakdown = _bool_param("~log_cbf_preprocess_breakdown", False)
+        self.cbf_preprocess_breakdown_period = float(rospy.get_param(
+            "~cbf_preprocess_breakdown_period", 2.0))
+        self._last_preprocess_breakdown_log = 0.0
         self.log_trajectory_timing = _bool_param("~log_trajectory_timing", True)
         self.active_plan_id = 0
         self.active_plan_stamp = None
@@ -299,8 +312,17 @@ class CBFSafetyNode:
         self.fork_filter_radius = float(rospy.get_param("~fork_filter_radius", 0.15))
         self.nominal_hold_deadband = float(rospy.get_param("~nominal_hold_deadband", 1e-4))
         self.cbf_candidate_filter = str(rospy.get_param("~cbf_candidate_filter", "sphere")).lower()
-        if self.cbf_candidate_filter not in ("sphere", "sdf"):
-            raise ValueError("~cbf_candidate_filter must be 'sphere' or 'sdf'")
+        if self.cbf_candidate_filter not in ("sphere", "sdf", "link_spheres"):
+            raise ValueError(
+                "~cbf_candidate_filter must be 'sphere', 'link_spheres', or 'sdf'")
+        # Debug radius for the RViz link spheres. The live 'link_spheres'
+        # prefilter keeps a fixed number of nearest points, rather than a hard
+        # radius, so the CBF is never starved when the cloud is sparse or the
+        # nearest obstacle is just outside this visual radius.
+        self.cbf_link_filter_radius = float(
+            rospy.get_param("~cbf_link_filter_radius", 0.25))
+        self.cbf_link_prefilter_points = int(rospy.get_param(
+            "~cbf_link_prefilter_points", 512))
         self.cbf_sdf_candidate_max_dist = float(rospy.get_param("~cbf_sdf_candidate_max_dist", 0.15))
         self.cbf_sdf_prune_chunk_size = max(1, int(rospy.get_param("~cbf_sdf_prune_chunk_size", 4096)))
         self.cbf_sdf_self_filter_margin = float(rospy.get_param("~cbf_sdf_self_filter_margin", -0.003))
@@ -334,6 +356,8 @@ class CBFSafetyNode:
         self.debug_score_seed = None
         self.debug_tip_min = None
         self.debug_filter_center = None
+        self.debug_link_centers = None
+        self.debug_candidate_points = None   # the candidate pool (~512) the SDF ranks
 
         self.last_q_safe = None
         self.q_safe_work = torch.zeros((1, 7), device=self.device)
@@ -389,6 +413,7 @@ class CBFSafetyNode:
         # Publishers RViz (Uniquement Jaune et Rouge)
         self.pub_inside_yellow = rospy.Publisher('/viz/obs_inside_yellow', PointCloud2, queue_size=1)
         self.pub_top100_red = rospy.Publisher('/viz/obs_top100_red', PointCloud2, queue_size=1)
+        self.pub_candidates = rospy.Publisher('/viz/cbf_candidates', PointCloud2, queue_size=1)
         self.pub_fork_mesh_debug = rospy.Publisher('/viz/cbf_fork_mesh_points', PointCloud2, queue_size=1)
         self.pub_selection_debug = rospy.Publisher('/viz/cbf_selection_debug', MarkerArray, queue_size=1)
         self.safe_traj_viz_pub = rospy.Publisher('/viz/safe_trajectory_3d', MarkerArray, queue_size=1)
@@ -893,8 +918,14 @@ class CBFSafetyNode:
         self._cbf_first_safe_for_plan = False
         if self.nominal_q is not None:
             self.last_nominal_q = self.nominal_q.detach().clone()
-        if self.dq_nom_filtered is not None:
-            self.dq_nom_filtered.zero_()
+        # NOTE: do NOT zero self.dq_nom_filtered here. The planner streams a
+        # fresh plan at the waypoint rate (~10 Hz), so zeroing the velocity
+        # low-pass on every plan reset it ~10x/s and never let it reach steady
+        # state: the EMA fed to the QP became a 10 Hz sawtooth averaging ~55% of
+        # the intended feedforward speed. The low-pass is meant to persist
+        # across the continuously-streamed nominal; the finite-diff fallback is
+        # already protected by the last_nominal_q reset above, and the default
+        # velocity-topic feedforward does not use differencing at all.
         self.last_nominal_tangent_dir = None
 
     def _shape_tracking_feedback(self, dq_nom_pure, dq_fb):
@@ -949,7 +980,7 @@ class CBFSafetyNode:
         
         return msg
 
-    def _sphere_marker(self, marker_id, ns, point_tensor, color, scale):
+    def _sphere_marker(self, marker_id, ns, point_tensor, color, scale, alpha=1.0):
         marker = Marker()
         marker.header.frame_id = "world"
         marker.header.stamp = rospy.Time.now()
@@ -960,7 +991,7 @@ class CBFSafetyNode:
         marker.scale.x = scale
         marker.scale.y = scale
         marker.scale.z = scale
-        marker.color.a = 1.0
+        marker.color.a = alpha
         marker.color.r = color[0]
         marker.color.g = color[1]
         marker.color.b = color[2]
@@ -985,6 +1016,15 @@ class CBFSafetyNode:
             # White: fork_tip center used for the initial tcp_filter_radius candidate sphere.
             markers.markers.append(self._sphere_marker(
                 2, "cbf_filter_center", self.debug_filter_center, (1.0, 1.0, 1.0), 0.018))
+        if self.debug_link_centers is not None:
+            # Translucent green: the per-link candidate spheres of the
+            # 'link_spheres' filter (diameter = 2 * cbf_link_filter_radius).
+            diam = 2.0 * self.cbf_link_filter_radius
+            centers = self.debug_link_centers
+            for i in range(int(centers.shape[0])):
+                markers.markers.append(self._sphere_marker(
+                    100 + i, "cbf_link_spheres", centers[i],
+                    (0.2, 0.85, 0.3), diam, alpha=0.15))
         if markers.markers:
             stamp = rospy.Time.now()
             for marker in markers.markers:
@@ -1169,13 +1209,17 @@ class CBFSafetyNode:
         self.debug_score_seed = None
         self.debug_tip_min = None
         self.debug_filter_center = None
+        self.debug_link_centers = None
+        self.debug_candidate_points = None   # the candidate pool (~512) the SDF ranks
 
-    def _prefilter_for_sdf(self, pts, q9):
+    def _prefilter_for_sdf(self, pts, q9, link_poses=None):
         """Cheap all-link prefilter before expensive whole-body SDF."""
         if self.cbf_sdf_prefilter_radius <= 0.0 and self.cbf_sdf_prefilter_max_points <= 0:
             return pts
 
-        link_poses = self.robot_layer._native_forward_kinematics(q9)
+        if link_poses is None:
+            link_poses = self.robot_layer._native_forward_kinematics_subset(
+                q9, self.protected_fk_tree)
         centers = []
         for link_name in self.protected_link_names:
             T_link = link_poses.get(link_name, None)
@@ -1204,13 +1248,13 @@ class CBFSafetyNode:
 
         return pts
 
-    def _whole_body_sdf_candidates(self, pts, q9):
+    def _whole_body_sdf_candidates(self, pts, q9, link_poses=None):
         """Return points near protected links, scored by whole-body SDF.
 
         This is outside the CUDA graph and runs at the preprocessing rate, so
         chunking keeps the memory bounded when the persistent cloud is large.
         """
-        pts = self._prefilter_for_sdf(pts, q9)
+        pts = self._prefilter_for_sdf(pts, q9, link_poses=link_poses)
         if pts.shape[0] == 0:
             empty = torch.empty((0,), dtype=torch.float32, device=self.device)
             return torch.empty((0, 3), dtype=torch.float32, device=self.device), empty, empty, empty
@@ -1223,7 +1267,7 @@ class CBFSafetyNode:
         for start in range(0, int(pts.shape[0]), self.cbf_sdf_prune_chunk_size):
             pts_chunk = pts[start:start + self.cbf_sdf_prune_chunk_size]
             _, sdf_per_link = self.bernstein_core.get_whole_body_sdf_batch(
-                pts_chunk, self.eye4, q9, return_per_link=True)
+                pts_chunk, self.eye4, q9, return_per_link=True, link_poses=link_poses)
 
             sdf_body = sdf_per_link[0, :5, :].min(dim=0).values
             sdf_all = sdf_per_link[0].min(dim=0).values
@@ -1260,6 +1304,18 @@ class CBFSafetyNode:
         if self.profile_sync:
             torch.cuda.synchronize()
         t_start = time.perf_counter()
+        stage_times = []
+        last_stage_t = t_start
+
+        def mark_stage(name):
+            nonlocal last_stage_t
+            if not self.log_cbf_preprocess_breakdown:
+                return
+            if self.profile_sync:
+                torch.cuda.synchronize()
+            now = time.perf_counter()
+            stage_times.append((name, (now - last_stage_t) * 1000.0))
+            last_stage_t = now
 
         pts = self.obs_points
         if pts is None or pts.shape[0] == 0:
@@ -1268,11 +1324,15 @@ class CBFSafetyNode:
 
         try:
             with torch.no_grad():
-                T_fork_center = self.get_fork_tip_pose(self.current_q)
+                q9_current = torch.cat([self.current_q.detach(), self.q_pad2], dim=1)
+                link_poses_current = self.robot_layer._native_forward_kinematics_subset(
+                    q9_current, self.protected_fk_tree)
+                T_fork_center = link_poses_current.get('fork_tip', None)
                 if T_fork_center is None:
                     rospy.logwarn_throttle(
                         5, "CBF preprocessing cannot find fork_tip in FK tree.")
                     return
+                mark_stage("fork_fk")
 
                 x_now_pos = T_fork_center[:, :3, 3]
                 self.debug_filter_center = x_now_pos[0].detach()
@@ -1283,18 +1343,54 @@ class CBFSafetyNode:
 
                 sdf_all_candidates = None
                 sdf_fork_candidates = None
-                q9 = None
+                q9 = q9_current
 
                 if self.cbf_candidate_filter == "sdf":
-                    q9 = torch.cat([self.current_q.detach(), self.q_pad2], dim=1)
                     pts_inside, _, sdf_all_candidates, sdf_fork_candidates = self._whole_body_sdf_candidates(
-                        pts, q9)
+                        pts, q9, link_poses=link_poses_current)
                     dist_inside = torch.norm(pts_inside - x_now_pos, dim=1)
+                elif self.cbf_candidate_filter == "link_spheres":
+                    # Cheap union-of-spheres over ALL protected links (one FK
+                    # call, no voxel SDF), so obstacles near the elbow/wrist are
+                    # kept, not just those near the fork. dist_inside is the
+                    # nearest-link distance so the distance pre-top-k below also
+                    # respects the whole body before the SDF selection runs.
+                    centers = [T[0, :3, 3] for T in
+                               (link_poses_current.get(n) for n in self.protected_link_names)
+                               if T is not None]
+                    if centers:
+                        centers = torch.stack(centers, dim=0)
+                        self.debug_link_centers = centers.detach()
+                        diff = pts.unsqueeze(1) - centers.unsqueeze(0)
+                        d_links_sq = (diff * diff).sum(dim=-1).min(dim=1).values
+                        max_candidates = int(pts.shape[0])
+                        if self.preprocess_max_points > 0:
+                            max_candidates = min(max_candidates, self.preprocess_max_points)
+                        if self.cbf_link_prefilter_points > 0:
+                            max_candidates = min(max_candidates, self.cbf_link_prefilter_points)
+                        max_candidates = max(
+                            min(int(pts.shape[0]), self.cbf_graph_points),
+                            max_candidates,
+                        )
+                        if int(pts.shape[0]) > max_candidates:
+                            _, pre_idx = torch.topk(
+                                d_links_sq, k=max_candidates, largest=False)
+                            pts_inside = pts[pre_idx]
+                            dist_inside = torch.sqrt(d_links_sq[pre_idx].clamp_min(0.0))
+                        else:
+                            pts_inside = pts
+                            dist_inside = torch.sqrt(d_links_sq.clamp_min(0.0))
+                    else:
+                        dist_tcp = torch.norm(pts - x_now_pos, dim=1)
+                        inside_mask = dist_tcp < self.tcp_filter_radius
+                        pts_inside = pts[inside_mask]
+                        dist_inside = dist_tcp[inside_mask]
                 else:
                     dist_tcp = torch.norm(pts - x_now_pos, dim=1)
                     inside_mask = dist_tcp < self.tcp_filter_radius
                     pts_inside = pts[inside_mask]
                     dist_inside = dist_tcp[inside_mask]
+                mark_stage("candidate_filter")
 
                 num_inside = int(pts_inside.shape[0])
 
@@ -1320,9 +1416,19 @@ class CBFSafetyNode:
                             sdf_all_candidates = sdf_all_candidates[pre_idx]
                             sdf_fork_candidates = sdf_fork_candidates[pre_idx]
                         num_inside = int(pts_inside.shape[0])
+                mark_stage("preselect")
 
-                if self.cbf_selection_metric == "fork_mesh":
-                    T_fork_now = self.get_fork_tip_pose(self.current_q)
+                needs_score = (
+                    num_inside > self.cbf_graph_points
+                    or sdf_all_candidates is not None
+                    or self.cbf_candidate_filter == "sdf"
+                )
+
+                if not needs_score:
+                    scores = dist_inside
+                    largest = False
+                elif self.cbf_selection_metric == "fork_mesh":
+                    T_fork_now = T_fork_center
                     if T_fork_now is None or self.fork_mesh_points_local.shape[0] == 0:
                         scores = dist_inside
                     else:
@@ -1349,7 +1455,8 @@ class CBFSafetyNode:
                         if q9 is None:
                             q9 = torch.cat([self.current_q.detach(), self.q_pad2], dim=1)
                         _, sdf_per_link = self.bernstein_core.get_whole_body_sdf_batch(
-                            pts_inside, self.eye4, q9, return_per_link=True)
+                            pts_inside, self.eye4, q9, return_per_link=True,
+                            link_poses=link_poses_current)
 
                         # Pruned self-filter: indices 0:5 now correspond to [link4, link5, link6, link7, hand]
                         sdf_body = sdf_per_link[0, :5, :].min(dim=0).values
@@ -1369,15 +1476,22 @@ class CBFSafetyNode:
                 else:
                     scores = dist_inside
                     largest = False
+                mark_stage("score")
 
                 if num_inside == 0:
                     self._clear_or_hold_obstacles()
                     return
 
+                # The candidate pool the SDF actually ranks (sphere-preselected,
+                # distance-capped to preprocess_max_points): the set the top-100
+                # are SDF-selected from. Published for visualization.
+                self.debug_candidate_points = pts_inside.detach()
+
                 score_min_idx = torch.argmin(scores)
                 tip_min_idx = torch.argmin(dist_inside)
                 self.debug_score_seed = pts_inside[score_min_idx].detach()
                 self.debug_tip_min = pts_inside[tip_min_idx].detach()
+                mark_stage("debug_seed")
 
                 if num_inside > self.cbf_graph_points:
                     if self.cbf_cluster_mode == "topk":
@@ -1408,11 +1522,36 @@ class CBFSafetyNode:
                 self._copy_fixed_obstacles(obs.contiguous())
                 self.selected_pts_yellow = pts_yellow.detach()
                 self.selected_num_inside = num_inside
-                self.selected_min_obs_dist = float(dist_tip.min().item())
+                mark_stage("topk_copy")
+                # Keep this on the GPU (no .item() here): a .item() in the
+                # preprocess thread is a hard GPU sync that blocks until the whole
+                # device queue drains — including the FM planner's 60-78 ms
+                # predict sharing the GPU. It is converted to a Python float in
+                # the command loop at L~2083, which runs *after* the existing
+                # transfer_buffer.cpu() sync, so the read is then free.
+                self.selected_min_obs_dist = dist_tip.min().detach()
+                mark_stage("min_dist")
 
                 if self.profile_sync:
                     torch.cuda.synchronize()
                 self.preprocess_times.append(time.perf_counter() - t_start)
+                if self.log_cbf_preprocess_breakdown:
+                    now_ros = rospy.get_time()
+                    if now_ros - self._last_preprocess_breakdown_log >= self.cbf_preprocess_breakdown_period:
+                        self._last_preprocess_breakdown_log = now_ros
+                        total_ms = (time.perf_counter() - t_start) * 1000.0
+                        stage_msg = " ".join(
+                            f"{name}={dt_ms:.2f}ms" for name, dt_ms in stage_times)
+                        rospy.loginfo(
+                            "[TIMING] CBF red breakdown: total=%.3fms obs=%d "
+                            "candidates=%d selected=%d sync=%s | %s",
+                            total_ms,
+                            int(pts.shape[0]),
+                            self.selected_num_inside,
+                            self.selected_count,
+                            self.profile_sync,
+                            stage_msg,
+                        )
                 if len(self.preprocess_times) >= 20:
                     avg_t = sum(self.preprocess_times) / len(self.preprocess_times)
                     rospy.loginfo_throttle(
@@ -1452,6 +1591,13 @@ class CBFSafetyNode:
 
             if msg_red is not None:
                 self.pub_top100_red.publish(msg_red)
+
+            # Blue: the full candidate pool the SDF ranks (red 100 are a subset).
+            if self.debug_candidate_points is not None:
+                msg_cand = self.create_cloud_xyzrgb(
+                    self.debug_candidate_points, (60, 120, 255))
+                if msg_cand is not None:
+                    self.pub_candidates.publish(msg_cand)
 
             if msg_mesh is not None:
                 self.pub_fork_mesh_debug.publish(msg_mesh)
@@ -1640,10 +1786,36 @@ class CBFSafetyNode:
                             (-final_constr).clamp(min=0.0),
                             torch.zeros_like(final_constr),
                         ).view(-1, 1)
-                        dq_repaired = (
-                            self.dq_safe_work
-                            + repair_step * grad_h / (grad_norm_sq + 1e-6)
-                        )
+                        # Repair velocity = repair_step * grad_h / |grad_h|^2, so
+                        # its norm is repair_step / |grad_h|. When the soft-min
+                        # gradient collapses (thin/slim obstacles: opposing
+                        # per-point gradients on the two close faces cancel), this
+                        # explodes and shoves the arm THROUGH the wall in an
+                        # ill-defined direction. Bound the repair velocity norm to
+                        # cbf_max_correction_speed so a degenerate gradient cannot
+                        # produce a violent command; the residual violation is
+                        # handled on later cycles as the geometry de-degenerates.
+                        repair_delta = repair_step * grad_h / (grad_norm_sq + 1e-6)
+                        if self.cbf_max_correction_speed > 0.0:
+                            rd_norm = torch.norm(repair_delta, dim=1, keepdim=True)
+                            rd_scale = torch.clamp(
+                                self.cbf_max_correction_speed / (rd_norm + 1e-9),
+                                max=1.0)
+                            repair_delta = repair_delta * rd_scale
+                        # Gradient-reliability gate: ramp the repair from 0 at
+                        # |grad_h| = grad_min to full at 3*grad_min, so a
+                        # degenerate/conflicting gradient (fork wedged in a slim
+                        # container, where |grad_h| collapses well below its ~0.6
+                        # single-wall value) does not push the arm sideways along
+                        # a meaningless direction. Trust the nominal there instead.
+                        if self.cbf_repair_grad_min > 0.0:
+                            grad_norm = torch.sqrt(grad_norm_sq)
+                            grad_gate = torch.clamp(
+                                (grad_norm - self.cbf_repair_grad_min)
+                                / (2.0 * self.cbf_repair_grad_min + 1e-9),
+                                min=0.0, max=1.0)
+                            repair_delta = repair_delta * grad_gate
+                        dq_repaired = self.dq_safe_work + repair_delta
                         dq_repaired.clamp_(min=-self.max_joint_velocity, max=self.max_joint_velocity)
                         self.dq_safe_work.copy_(torch.where(needs_repair, dq_repaired, self.dq_safe_work))
                         final_constr = (
@@ -1899,12 +2071,15 @@ class CBFSafetyNode:
                     and self.enable_cbf
                     and not self._contact_stopped
                 ):
-                    if self.cbf_solver_mode == "fast_tangent":
-                        h_bias = float(self.barrier.alpha) * float(
-                            np.log(max(1, int(self.selected_count))))
-                    else:
-                        h_bias = 0.0
-                    clearance_est = h_val + h_bias + self.d_safe
+                    # Test the SAME conservative soft-min clearance that is
+                    # reported/logged (clearance_val = h + d_safe). The previous
+                    # de-bias term h_bias = alpha*log(N) (~4.6 mm with N=100)
+                    # made this test that much more optimistic than the displayed
+                    # clearance, so contact never latched even when the reported
+                    # clearance reached ~0. The soft-min pessimism also offsets
+                    # the perception underestimate of penetration, so clearance_val
+                    # actually crosses 0 at true contact.
+                    clearance_est = clearance_val
                     if (
                         int(self.selected_count) > 0
                         and clearance_est <= self.contact_stop_clearance

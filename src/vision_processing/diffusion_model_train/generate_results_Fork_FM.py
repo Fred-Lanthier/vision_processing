@@ -102,13 +102,65 @@ def ortho6d_to_rotation_matrix(d6):
     return np.stack([x, y, z], axis=-1)
 
 
+def rotation_matrix_to_quaternion(R):
+    """
+    Convert rotation matrix to unit quaternion (w, x, y, z).
+    Works cleanly on batched trajectories of shape (H, 3, 3).
+    """
+    R = np.asarray(R)
+    shape = R.shape[:-2]
+    R_flat = R.reshape(-1, 3, 3)
+    q_list = []
+    
+    for r in R_flat:
+        tr = np.trace(r)
+        if tr > 0:
+            S = np.sqrt(tr + 1.0) * 2
+            qw = 0.25 * S
+            qx = (r[2, 1] - r[1, 2]) / S
+            qy = (r[0, 2] - r[2, 0]) / S
+            qz = (r[1, 0] - r[0, 1]) / S
+        elif (r[0, 0] > r[1, 1]) and (r[0, 0] > r[2, 2]):
+            S = np.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2
+            qw = (r[2, 1] - r[1, 2]) / S
+            qx = 0.25 * S
+            qy = (r[0, 1] + r[1, 0]) / S
+            qz = (r[0, 2] + r[2, 0]) / S
+        elif r[1, 1] > r[2, 2]:
+            S = np.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2
+            qw = (r[0, 2] - r[2, 0]) / S
+            qx = (r[0, 1] + r[1, 0]) / S
+            qy = 0.25 * S
+            qz = (r[1, 2] + r[2, 1]) / S
+        else:
+            S = np.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2
+            qw = (r[1, 0] - r[0, 1]) / S
+            qx = (r[0, 2] + r[2, 0]) / S
+            qy = (r[1, 2] + r[2, 1]) / S
+            qz = 0.25 * S
+        q_list.append([qw, qx, qy, qz])
+        
+    q = np.array(q_list).reshape(shape + (4,))
+    # Enforce canonical form (positive scalar part) to avoid antipodal doubling artifacts
+    flip = q[..., 0] < 0
+    q[flip] *= -1.0
+    return q
+
+
+def geodesic_angle_deg(R1, R2):
+    """
+    Geodesic (rotation) angle in degrees between two rotation matrices.
+    Batched over arbitrary leading dimensions: (..., 3, 3) -> (...).
+    """
+    r_diff = np.matmul(R1, np.swapaxes(R2, -1, -2))
+    trace = np.trace(r_diff, axis1=-2, axis2=-1)
+    cos_theta = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+    return np.degrees(np.arccos(cos_theta))
+
+
 def compute_ade_position_error(pred_pos, gt_pos):
     """
     Standard point-to-point ADE between two 3D trajectories.
-
-    If the trajectories do not have the same length, both are truncated to the
-    shortest length so this metric remains usable. DTW should be preferred when
-    timing or trajectory length differs.
     """
     min_len = min(len(pred_pos), len(gt_pos))
     if min_len == 0:
@@ -122,13 +174,6 @@ def compute_ade_position_error(pred_pos, gt_pos):
 def compute_dtw_position_error(pred_pos, gt_pos, normalize=True):
     """
     DTW distance between predicted and ground-truth 3D position trajectories.
-
-    pred_pos: array-like, shape (T_pred, 3), in meters
-    gt_pos:   array-like, shape (T_gt, 3), in meters
-
-    If normalize=True, returns the average DTW cost per alignment-pair, which is
-    easier to interpret like an ADE after temporal alignment. The result is still
-    in meters if the input positions are in meters.
     """
     pred_pos = np.asarray(pred_pos, dtype=np.float64)
     gt_pos = np.asarray(gt_pos, dtype=np.float64)
@@ -143,8 +188,6 @@ def compute_dtw_position_error(pred_pos, gt_pos, normalize=True):
     if len(pred_pos) == 0 or len(gt_pos) == 0:
         return np.nan
 
-    # dtw-python supports multivariate trajectories directly. With 3D inputs,
-    # dist_method='euclidean' computes the Euclidean distance between positions.
     alignment = dtw(
         pred_pos,
         gt_pos,
@@ -402,7 +445,6 @@ def plot_rotation_error_over_time(gt_action, pred_action, idx):
 def make_flow_matching_gif(model, sample, DEVICE, idx, num_steps=10):
     """
     Animated GIF of the ODE integration: from random noise to final trajectory.
-    Each frame = one Euler step along the learned velocity field.
     """
     print(f"🎬 Generating FM integration GIF for seq {idx}...")
 
@@ -442,6 +484,9 @@ def make_flow_matching_gif(model, sample, DEVICE, idx, num_steps=10):
 
     ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=200)
     ani.save(f'03_fm_integration_seq{idx}.gif', writer='pillow')
+    
+    # Clean up reference hook to avoid memory leaks
+    del ani
     plt.close(fig)
 
 
@@ -454,15 +499,7 @@ def run_quantitative_analysis(model, val_dataset, DEVICE,
                               use_dtw_for_success=True):
     """
     Quantitative evaluation of the Flow Matching policy.
-
-    Main position metric:
-      - DTW: trajectory distance after temporal alignment, in cm.
-
-    Extra diagnostic metric:
-      - ADE: point-to-point trajectory distance, in cm.
-
-    Success uses normalized DTW by default:
-      normalized DTW < 2 cm AND final rotation error < 15 deg.
+    Calculates exact evaluation-wide micro-averaged performance metrics.
     """
     model.eval()
     results = []
@@ -470,7 +507,7 @@ def run_quantitative_analysis(model, val_dataset, DEVICE,
     THRESHOLD_POS = 0.02   # 2 cm, applied to normalized DTW by default
     THRESHOLD_ROT = 15.0   # 15 deg
 
-    num_eval = min(len(val_dataset) // 3, len(val_dataset))
+    num_eval = min(30, len(val_dataset))
     indices = np.linspace(0, len(val_dataset) - 1, num_eval, dtype=int)
 
     metric_name = 'DTW' if use_dtw_for_success else 'ADE'
@@ -479,6 +516,9 @@ def run_quantitative_analysis(model, val_dataset, DEVICE,
         f"(success = {metric_name} < {THRESHOLD_POS * 100:.1f} cm "
         f"and RotErr < {THRESHOLD_ROT:.1f}°)..."
     )
+
+    total_trials = 0
+    total_successes = 0
 
     for idx in tqdm(indices):
         sample = val_dataset[idx]
@@ -508,11 +548,14 @@ def run_quantitative_analysis(model, val_dataset, DEVICE,
         path_variance = np.mean(
             np.linalg.norm(seq_preds[:, :, :3] - mean_pred_path, axis=2))
 
-        # Success based on DTW by default. ADE is still saved for diagnostics.
+        # Track tracking success rates micro-architecturally across trial runs
         position_errors = seq_dtws if use_dtw_for_success else seq_ades
         success_count = sum(
             pos_err < THRESHOLD_POS and rot < THRESHOLD_ROT
             for pos_err, rot in zip(position_errors, seq_angles))
+        
+        total_trials += n_samples
+        total_successes += success_count
         success_rate = (success_count / n_samples) * 100
 
         results.append({
@@ -525,11 +568,12 @@ def run_quantitative_analysis(model, val_dataset, DEVICE,
         })
 
     df = pd.DataFrame(results)
+    global_micro_success = (total_successes / total_trials) * 100
 
     print("\n" + "=" * 60)
     print(f"🚀 RESULTS (Success = {metric_name} < {THRESHOLD_POS * 100:.1f} cm)")
     print("=" * 60)
-    print(f"  Mean Success Rate    : {df['SuccessRate'].mean():.2f} %")
+    print(f"  Micro Success Rate   : {global_micro_success:.2f} %")
     print(f"  Mean Position DTW    : {df['DTW'].mean():.2f} cm")
     print(f"  Mean Position ADE    : {df['ADE'].mean():.2f} cm")
     print(f"  Mean Rotation Error  : {df['RotErr'].mean():.2f} deg")
@@ -579,9 +623,6 @@ def plot_error_distributions(df):
 def plot_dtw_vs_ade(df):
     """
     Diagnostic plot: separates timing errors from spatial errors.
-
-    - Low DTW + high ADE: good path, bad timing.
-    - High DTW + high ADE: bad path.
     """
     print("📊 Generating DTW vs ADE diagnostic plot...")
 
@@ -617,10 +658,6 @@ def run_inference_speed_benchmark(model, val_dataset, DEVICE,
                                   num_steps=10, n_warmup=5, n_runs=100):
     """
     Measures inference latency over many runs on random samples.
-
-    Warmup: the first few CUDA calls are slow (lazy kernel compilation
-    and memory allocation). We discard them so the histogram reflects
-    the steady-state latency your robot actually sees.
     """
     model.eval()
     print(f"⏱️  Inference speed benchmark  (warmup={n_warmup}, runs={n_runs})")
@@ -682,7 +719,372 @@ def run_inference_speed_benchmark(model, val_dataset, DEVICE,
 
 
 # ==============================================================================
-# 11. MAIN
+# 10b. FRÉCHET DISTANCE (FID-STYLE GENERATIVE METRIC)
+# ==============================================================================
+
+from scipy.linalg import sqrtm
+
+def _compute_fid_score(mu1, sigma1, mu2, sigma2):
+    """
+    Standard mathematical calculation for Fréchet Distance using SciPy.
+    """
+    diff = mu1 - mu2
+    covmean, _ = sqrtm(sigma1.dot(sigma2), disp=False)
+    
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+        
+    return float(diff.dot(diff) + np.trace(sigma1 + sigma2 - 2.0 * covmean))
+
+
+def _fid_from_features(ref, other):
+    """
+    Handles data conditioning and computes FID using robust covariance tracking.
+    """
+    ref = np.asarray(ref)
+    other = np.asarray(other)
+
+    # Automatically drop completely static dimensions (variance < 1e-6)
+    active_dims = ref.std(axis=0) > 1e-6
+    ref, other = ref[:, active_dims], other[:, active_dims]
+
+    # Standardize data relative to the Reference (GT) distribution
+    mu_ref, std_ref = ref.mean(axis=0), ref.std(axis=0)
+    std_ref = np.where(std_ref < 1e-6, 1.0, std_ref) # Safe boundary protection
+
+    ref_scaled = (ref - mu_ref) / std_ref
+    other_scaled = (other - mu_ref) / std_ref
+
+    # Extract means and covariances cleanly
+    mu_r, sig_r = ref_scaled.mean(axis=0), np.cov(ref_scaled, rowvar=False)
+    mu_o, sig_o = other_scaled.mean(axis=0), np.cov(other_scaled, rowvar=False)
+
+    # Regularize slightly to guarantee numerical stability and fix baseline explosions
+    sig_r += np.eye(sig_r.shape[0]) * 1e-5
+    sig_o += np.eye(sig_o.shape[0]) * 1e-5
+
+    return _compute_fid_score(mu_r, sig_r, mu_o, sig_o)
+
+
+def compute_trajectory_fid(model, dataset, DEVICE, num_steps=10, n_per_side=500):
+    """
+    FID-style Fréchet distance using downsampled unit quaternions keyframes 
+    to maintain geometry-accurate manifold tracking without numerical collinearity explosions.
+    """
+    model.eval()
+
+    n = min(n_per_side, len(dataset) // 2)
+    real_indices = np.linspace(0, len(dataset) - 1, 2 * n, dtype=int)
+    gen_indices = real_indices[:n]   
+    print(f"📏 Computing trajectory FID  ({n} samples/side, one chunk per seq)...")
+
+    def feats(action):
+        pos = action[:, :3]
+        rot_mats = ortho6d_to_rotation_matrix(action[None, :, 3:])[0]  # (H, 3, 3)
+        quats = rotation_matrix_to_quaternion(rot_mats) # (H, 4)
+        
+        # Global canonical sign alignment to fix double-cover artifacts
+        if quats[0, 0] < 0:
+            quats *= -1.0
+            
+        # Downsample to strategic keyframes to prevent ill-conditioned covariances
+        indices = np.linspace(0, len(quats) - 1, 4, dtype=int)
+        downsampled_quats = quats[indices]
+        downsampled_pos = pos[indices]
+        
+        full_feat = np.concatenate([downsampled_pos.reshape(-1), downsampled_quats.reshape(-1)])
+        return full_feat, downsampled_pos.reshape(-1), downsampled_quats.reshape(-1)
+
+    real_full, real_pos, real_rot = [], [], []
+    for idx in tqdm(real_indices, desc="FID GT features"):
+        f, p, r = feats(dataset[int(idx)]['action'].numpy())
+        real_full.append(f); real_pos.append(p); real_rot.append(r)
+
+    gen_full, gen_pos, gen_rot = [], [], []
+    for idx in tqdm(gen_indices, desc="FID sampling"):
+        sample = dataset[int(idx)]
+        pred, _, _, _ = infer_single(model, sample, DEVICE, num_steps=num_steps)
+        f, p, r = feats(pred)
+        gen_full.append(f); gen_pos.append(p); gen_rot.append(r)
+
+    results, baseline = {}, {}
+    for name, real_list, gen_list in [
+        ('FID_full', real_full, gen_full),
+        ('FID_pos',  real_pos,  gen_pos),
+        ('FID_rot',  real_rot,  gen_rot),
+    ]:
+        real = np.asarray(real_list)
+        half_a, half_b = real[:n], real[n:]            
+        results[name] = _fid_from_features(half_a, np.asarray(gen_list))
+        baseline[name] = _fid_from_features(half_a, half_b)
+
+    print("\n" + "=" * 60)
+    print("📏 TRAJECTORY FID (Fréchet distance, lower = better)")
+    print("=" * 60)
+    for k in results:
+        print(f"  {k:10s} : {results[k]:.4f}   (baseline {baseline[k]:.4f})")
+    print("=" * 60)
+
+    out = {'fid': results, 'baseline': baseline}
+    with open('fm_fid_results.json', 'w') as fh:
+        json.dump(out, fh, indent=2)
+    print("💾 Saved FID results to fm_fid_results.json")
+    return out
+
+
+# ==============================================================================
+# 11. TIER-1 DIAGNOSTICS — IS RIEMANNIAN FLOW MATCHING NECESSARY?
+# ==============================================================================
+
+def characterize_rotation_range(dataset, max_seqs=None):
+    """
+    (a) Quantify the rotation regime of the dataset.
+    """
+    n = len(dataset) if max_seqs is None else min(max_seqs, len(dataset))
+    indices = np.linspace(0, len(dataset) - 1, n, dtype=int)
+    print(f"📐 Characterizing rotation range over {n} action chunks...")
+
+    per_step, per_chunk = [], []
+    for idx in tqdm(indices, desc="Scanning rotations"):
+        action = dataset[int(idx)]['action'].numpy()      
+        rot = ortho6d_to_rotation_matrix(action[None, :, 3:])[0]  
+
+        step_ang = geodesic_angle_deg(rot[1:], rot[:-1])
+        per_step.extend(step_ang.tolist())
+        per_chunk.append(float(geodesic_angle_deg(rot[-1], rot[0])))
+
+    per_step = np.asarray(per_step)
+    per_chunk = np.asarray(per_chunk)
+
+    stats = {
+        'step_mean':       float(per_step.mean()),
+        'step_p95':        float(np.percentile(per_step, 95)),
+        'step_max':        float(per_step.max()),
+        'chunk_spread_mean': float(per_chunk.mean()),
+        'chunk_spread_p95':  float(np.percentile(per_chunk, 95)),
+        'chunk_spread_max':  float(per_chunk.max()),
+    }
+
+    print("\n" + "=" * 60)
+    print("📐 ROTATION RANGE (per action chunk)")
+    print("=" * 60)
+    print(f"  Per-step angle    : mean {stats['step_mean']:.2f}°  "
+          f"p95 {stats['step_p95']:.2f}°  max {stats['step_max']:.2f}°")
+    print(f"  Per-chunk spread  : mean {stats['chunk_spread_mean']:.2f}°  "
+          f"p95 {stats['chunk_spread_p95']:.2f}°  max {stats['chunk_spread_max']:.2f}°")
+    print("=" * 60)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+    ax1.hist(per_step, bins=40, color=STYLE['hist_color'],
+             edgecolor='white', linewidth=0.6, alpha=0.85)
+    ax1.axvline(stats['step_p95'], color=STYLE['accent_color'], linestyle='--',
+                linewidth=1.8, label=f"P95 {stats['step_p95']:.1f}°")
+    ax1.set_title('Per-Step Rotation Angle')
+    ax1.set_xlabel('Geodesic angle between consecutive waypoints (°)')
+    ax1.set_ylabel('Count')
+    ax1.legend()
+    ax1.grid(True, axis='y')
+
+    ax2.hist(per_chunk, bins=40, color=STYLE['gt_color'],
+             edgecolor='white', linewidth=0.6, alpha=0.85)
+    ax2.axvline(stats['chunk_spread_p95'], color=STYLE['accent_color'], linestyle='--',
+                linewidth=1.8, label=f"P95 {stats['chunk_spread_p95']:.1f}°")
+    ax2.set_title('Per-Chunk Rotation Spread')
+    ax2.set_xlabel('Geodesic angle, first→last waypoint (°)')
+    ax2.set_ylabel('Count')
+    ax2.legend()
+    ax2.grid(True, axis='y')
+
+    fig.tight_layout()
+    fig.savefig('07_fm_rotation_range.png')
+    plt.close(fig)
+    return stats
+
+
+def plot_chord_vs_geodesic_error(operating_angle_deg=None):
+    """
+    (b) Analytic distortion of linear interpolation vs the true geodesic (slerp).
+    """
+    print("📈 Computing chord-vs-geodesic (lerp vs slerp) distortion curve...")
+
+    thetas = np.linspace(1.0, 179.0, 179)
+    ts = np.linspace(0.0, 1.0, 51)
+    max_err = []
+
+    for th in thetas:
+        omega = np.radians(th)
+        p = np.array([1.0, 0.0])
+        q = np.array([np.cos(omega), np.sin(omega)])
+
+        errs = []
+        for t in ts:
+            slerp = (np.sin((1 - t) * omega) * p + np.sin(t * omega) * q) / np.sin(omega)
+            lin = (1 - t) * p + t * q
+            nlerp = lin / (np.linalg.norm(lin) + 1e-12)
+            cos_a = np.clip(np.dot(slerp, nlerp), -1.0, 1.0)
+            errs.append(np.degrees(np.arccos(cos_a)))
+        max_err.append(max(errs))
+
+    max_err = np.asarray(max_err)
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.plot(thetas, max_err, color=STYLE['pred_color'], linewidth=2.2,
+            label='Max interpolation error (lerp vs slerp)')
+
+    if operating_angle_deg is not None:
+        op_err = np.interp(operating_angle_deg, thetas, max_err)
+        ax.axvline(operating_angle_deg, color=STYLE['gt_color'], linestyle='--',
+                   linewidth=1.8,
+                   label=f'Operating point  {operating_angle_deg:.1f}°  →  {op_err:.2f}° error')
+        ax.scatter([operating_angle_deg], [op_err], color=STYLE['gt_color'],
+                   s=60, zorder=5)
+
+    ax.axvspan(150, 180, color=STYLE['accent_color'], alpha=0.12,
+               label='Degenerate regime (→180°)')
+    ax.set_title('Geometric Distortion of Euclidean Interpolation on SO(3)')
+    ax.set_xlabel('Angle between orientations θ (°)')
+    ax.set_ylabel('Worst-case angular error (°)')
+    ax.set_xlim(0, 180)
+    ax.legend()
+    ax.grid(True)
+
+    fig.tight_layout()
+    fig.savefig('08_fm_chord_vs_geodesic.png')
+    plt.close(fig)
+
+
+def analyze_orthonormality(model, dataset, DEVICE, num_steps=10,
+                           n_seqs=60, n_samples=5):
+    """
+    (c) Check orthonormality of raw 6D output before Gram-Schmidt.
+    """
+    model.eval()
+    indices = np.linspace(0, len(dataset) - 1, min(n_seqs, len(dataset)), dtype=int)
+    print(f"🔎 Orthonormality of raw 6D output over {len(indices)} seqs "
+          f"× {n_samples} samples...")
+
+    def ortho_stats(d6):
+        a = d6[..., 0:3]
+        b = d6[..., 3:6]
+        na = np.linalg.norm(a, axis=-1)
+        nb = np.linalg.norm(b, axis=-1)
+        norm_err = np.concatenate([np.abs(na - 1.0).ravel(),
+                                   np.abs(nb - 1.0).ravel()])
+        cos_ab = np.sum(a * b, axis=-1) / (na * nb + 1e-12)
+        angle = np.degrees(np.arccos(np.clip(cos_ab, -1.0, 1.0)))
+        non_ortho = np.abs(90.0 - angle).ravel()
+        return norm_err, non_ortho
+
+    pred_norm, pred_ortho, gt_norm, gt_ortho = [], [], [], []
+    for idx in tqdm(indices, desc="Sampling outputs"):
+        sample = dataset[int(idx)]
+        gn, go = ortho_stats(sample['action'].numpy()[:, 3:])
+        gt_norm.extend(gn.tolist())
+        gt_ortho.extend(go.tolist())
+        for _ in range(n_samples):
+            pred, _, _, _ = infer_single(model, sample, DEVICE, num_steps=num_steps)
+            pn, po = ortho_stats(pred[:, 3:])
+            pred_norm.extend(pn.tolist())
+            pred_ortho.extend(po.tolist())
+
+    pred_norm = np.asarray(pred_norm); pred_ortho = np.asarray(pred_ortho)
+    gt_norm = np.asarray(gt_norm);     gt_ortho = np.asarray(gt_ortho)
+
+    print("\n" + "=" * 60)
+    print("🔎 RAW 6D OUTPUT — DISTANCE TO ROTATION MANIFOLD")
+    print("=" * 60)
+    print(f"  Unit-norm error   | pred mean {pred_norm.mean():.4f}  "
+          f"p95 {np.percentile(pred_norm, 95):.4f}  | gt mean {gt_norm.mean():.4f}")
+    print(f"  Non-orthogonality | pred mean {pred_ortho.mean():.2f}°  "
+          f"p95 {np.percentile(pred_ortho, 95):.2f}°  | gt mean {gt_ortho.mean():.2f}°")
+    print("=" * 60)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+    ax1.hist(pred_norm, bins=40, color=STYLE['pred_color'], alpha=0.7,
+             edgecolor='white', linewidth=0.5, label='Prediction', density=True)
+    ax1.hist(gt_norm, bins=40, color=STYLE['gt_color'], alpha=0.5,
+             edgecolor='white', linewidth=0.5, label='Ground Truth', density=True)
+    ax1.set_title('Column Unit-Norm Deviation')
+    ax1.set_xlabel('|‖column‖ - 1|')
+    ax1.set_ylabel('Density')
+    ax1.legend()
+    ax1.grid(True, axis='y')
+
+    ax2.hist(pred_ortho, bins=40, color=STYLE['pred_color'], alpha=0.7,
+             edgecolor='white', linewidth=0.5, label='Prediction', density=True)
+    ax2.hist(gt_ortho, bins=40, color=STYLE['gt_color'], alpha=0.5,
+             edgecolor='white', linewidth=0.5, label='Ground Truth', density=True)
+    ax2.set_title('Column Non-Orthogonality')
+    ax2.set_xlabel('|90° - angle(col1, col2)|  (°)')
+    ax2.set_ylabel('Density')
+    ax2.legend()
+    ax2.grid(True, axis='y')
+
+    fig.tight_layout()
+    fig.savefig('09_fm_orthonormality.png')
+    plt.close(fig)
+
+
+def analyze_inference_steps(model, dataset, DEVICE,
+                            steps_list=(1, 2, 3, 5, 8, 10, 15, 20, 30),
+                            n_seqs=40, n_samples=3):
+    """
+    (d) Convergence of position vs rotation error as the number of ODE steps grows.
+    """
+    model.eval()
+    indices = np.linspace(0, len(dataset) - 1, min(n_seqs, len(dataset)), dtype=int)
+    print(f"🪜 Inference-steps sensitivity over {len(indices)} seqs "
+          f"for steps {list(steps_list)}...")
+
+    pos_ade, rot_ade = [], []
+    for steps in steps_list:
+        seq_pos, seq_rot = [], []
+        for idx in tqdm(indices, desc=f"steps={steps}", leave=False):
+            sample = dataset[int(idx)]
+            gt = sample['action'].numpy()
+            gt_rot = ortho6d_to_rotation_matrix(gt[None, :, 3:])[0]
+            for _ in range(n_samples):
+                pred, _, _, _ = infer_single(model, sample, DEVICE, num_steps=int(steps))
+                seq_pos.append(compute_ade_position_error(pred[:, :3], gt[:, :3]))
+                pred_rot = ortho6d_to_rotation_matrix(pred[None, :, 3:])[0]
+                seq_rot.append(geodesic_angle_deg(pred_rot, gt_rot).mean())
+        pos_ade.append(np.mean(seq_pos) * 100.0)   
+        rot_ade.append(np.mean(seq_rot))           
+
+    steps_arr = np.asarray(steps_list)
+
+    print("\n" + "=" * 60)
+    print("🪜 ERROR vs ODE STEPS")
+    print("=" * 60)
+    for s, p, r in zip(steps_arr, pos_ade, rot_ade):
+        print(f"  steps={s:>3}  |  pos ADE {p:6.2f} cm  |  rot ADE {r:6.2f}°")
+    print("=" * 60)
+
+    fig, ax1 = plt.subplots(figsize=(9, 5.5))
+    ax1.plot(steps_arr, pos_ade, color=STYLE['hist_color'], marker='o',
+             linewidth=2.0, label='Position ADE (cm)')
+    ax1.set_xlabel('Number of ODE integration steps')
+    ax1.set_ylabel('Position ADE (cm)', color=STYLE['hist_color'])
+    ax1.tick_params(axis='y', labelcolor=STYLE['hist_color'])
+    ax1.grid(True)
+
+    ax2 = ax1.twinx()
+    ax2.plot(steps_arr, rot_ade, color=STYLE['pred_color'], marker='s',
+             linewidth=2.0, label='Rotation ADE (°)')
+    ax2.set_ylabel('Rotation ADE (°)', color=STYLE['pred_color'])
+    ax2.tick_params(axis='y', labelcolor=STYLE['pred_color'])
+
+    lines = ax1.get_lines() + ax2.get_lines()
+    ax1.legend(lines, [l.get_label() for l in lines], loc='upper right')
+    ax1.set_title('Convergence vs ODE Steps — Position vs Rotation')
+
+    fig.tight_layout()
+    fig.savefig('10_fm_steps_sensitivity.png')
+    plt.close(fig)
+
+
+# ==============================================================================
+# 12. MAIN
 # ==============================================================================
 
 def main():
@@ -690,7 +1092,7 @@ def main():
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🖥️ Device: {DEVICE}")
 
-    NUM_STEPS = 5  # ODE integration steps
+    NUM_STEPS = 5  
 
     # 1. Paths
     rospack = rospkg.RosPack()
@@ -748,10 +1150,22 @@ def main():
     plot_error_distributions(df)
     plot_dtw_vs_ade(df)
 
+    # 5b. Generative distribution metric (FID-style Fréchet distance)
+    compute_trajectory_fid(
+        model, val_dataset, DEVICE, num_steps=NUM_STEPS, n_per_side=500)
+
     # 6. Inference speed benchmark
     run_inference_speed_benchmark(
         model, val_dataset, DEVICE, num_steps=NUM_STEPS,
         n_warmup=5, n_runs=100)
+
+    # 6b. Tier-1 diagnostics: is Riemannian flow matching necessary?
+    rot_stats = characterize_rotation_range(val_dataset)            
+    plot_chord_vs_geodesic_error(
+        operating_angle_deg=rot_stats['chunk_spread_p95'])         
+    analyze_orthonormality(model, val_dataset, DEVICE,
+                           num_steps=NUM_STEPS)                     
+    analyze_inference_steps(model, val_dataset, DEVICE)            
 
     # 7. Worst-case analysis
     worst_seq = df.loc[df['SuccessRate'].idxmin()]

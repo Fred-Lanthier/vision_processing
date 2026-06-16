@@ -9,8 +9,10 @@ import os
 import sys
 import rospkg
 import collections
+import traceback
 import xacro
 import tempfile
+import xml.etree.ElementTree as ET
 from sensor_msgs.msg import JointState, PointCloud2
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
@@ -186,11 +188,15 @@ class CASFGenerativeNode:
         else:
             urdf_path = urdf_path_raw
 
-        # Debug: Check joints in URDF
-        from urdf_parser_py.urdf import URDF as URDFParser
+        # Read only the standard joint fields needed for this debug message.
+        # urdf_parser_py warns about valid Franka-specific URDF extensions.
         with open(urdf_path, 'r') as f:
-            robot_urdf = URDFParser.from_xml_string(f.read())
-            urdf_joints = [j.name for j in robot_urdf.joints if j.type != 'fixed']
+            robot_xml = ET.fromstring(f.read())
+            urdf_joints = [
+                joint.get('name')
+                for joint in robot_xml.findall('joint')
+                if joint.get('type') != 'fixed'
+            ]
             rospy.loginfo(f"🔍 URDF non-fixed joints: {urdf_joints}")
 
         voxel_dir = rospy.get_param("~voxel_dir", pkg_path + '/third_party/RDF/panda_layer/meshes/voxel_128')
@@ -288,8 +294,10 @@ class CASFGenerativeNode:
         self.commanded_q = None
         self.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
         self.obstacle_pts_gpu = None
-        self.obs_queue = collections.deque(maxlen=cfg.get('obs_horizon', 2))
+        self.obs_horizon = cfg.get('obs_horizon', 2)
+        self.obs_queue = collections.deque(maxlen=self.obs_horizon)
         self.num_points_pcd = cfg.get('num_points', 256)
+        self.fm_use_torch_compile = _bool_param("~fm_use_torch_compile", True)
         self.obstacle_pre_sample_max = int(rospy.get_param("~obstacle_pre_sample_max", 2000))
         self.planner_cbf_max_obstacles = int(rospy.get_param("~planner_cbf_max_obstacles", 512))
         self.casf_spatial_max_obstacles = int(rospy.get_param("~casf_spatial_max_obstacles", 100))
@@ -353,7 +361,10 @@ class CASFGenerativeNode:
         )
         self.last_pose_source_log = 0.0
 
-        
+        # 4.5 Compile + CUDA-graph the FM velocity net (shrinks the planner's
+        # GPU burst so the shared GPU is free for the 150 Hz CBF loop).
+        self._setup_fm_compile()
+
         # 5. Subscribers & Publishers
         rospy.Subscriber('/joint_states', JointState, self.joint_callback)
         rospy.Subscriber('/joint_group_position_controller/command', Float64MultiArray, self.command_callback)
@@ -378,6 +389,56 @@ class CASFGenerativeNode:
             self.commit_distance,
             self.enable_casf_correction,
         )
+
+    def _setup_fm_compile(self):
+        """Compile + CUDA-graph the FM velocity net.
+
+        The planner runs at ~8 Hz but each replan does N_PRED forward passes
+        through velocity_net (55-85 ms total, batch-1 launch-overhead bound).
+        That burst monopolizes the GPU the 150 Hz CBF loop shares, inflating
+        its red-point preprocess to 40-52 ms. reduce-overhead mode captures
+        each forward as a CUDA graph (graph trees), collapsing per-kernel
+        launch overhead so the burst drops toward ~15-20 ms and stops
+        colliding with the safety loop. Math is unchanged (same fp32 graph).
+
+        Compilation + capture are forced now via a warmup so the first live
+        replan does not stall. Any failure falls back to the eager net.
+        """
+        self._velocity_net_eager = self.fm_agent.velocity_net
+        if not self.fm_use_torch_compile:
+            rospy.loginfo("FM torch.compile disabled (~fm_use_torch_compile=false).")
+            return
+        if self.device.type != "cuda":
+            rospy.loginfo("FM torch.compile skipped: planner not on CUDA.")
+            return
+        try:
+            t0 = time.perf_counter()
+            self.fm_agent.velocity_net = torch.compile(
+                self.fm_agent.velocity_net, mode="reduce-overhead")
+            # Warm up with prediction-shaped dummy inputs. Shapes MUST match the
+            # live call (B=1, pred_horizon, action_dim) or the graph re-records
+            # on the first real replan.
+            B, H = 1, self.pred_horizon
+            dt_pred = 1.0 / max(self.n_pred, 1)
+            dummy_obs = {
+                'point_cloud': torch.randn(B, self.num_points_pcd, 3, device=self.device),
+                'agent_pos': torch.zeros(B, self.obs_horizon, 9, device=self.device),
+            }
+            with torch.inference_mode():
+                global_cond = self.fm_agent.encode_obs(dummy_obs)
+                for _ in range(3):  # 3 passes: trace, then capture, then replay
+                    A = torch.randn(B, H, self.action_dim, device=self.device)
+                    for i in range(self.n_pred):
+                        t_tensor = torch.full((B,), i * dt_pred, device=self.device)
+                        v = self.fm_agent.velocity_net(A, t_tensor, global_cond)
+                        A = A + v * dt_pred
+            torch.cuda.synchronize()
+            rospy.loginfo(
+                "✅ FM velocity_net compiled (reduce-overhead) + warmed up in %.1fs",
+                time.perf_counter() - t0)
+        except Exception as e:
+            rospy.logwarn("FM torch.compile failed (%s); using eager velocity_net.", e)
+            self.fm_agent.velocity_net = self._velocity_net_eager
 
     def cbf_ready_callback(self, msg):
         if msg.data and not self.cbf_ready:
@@ -689,7 +750,12 @@ class CASFGenerativeNode:
             elif A is not None:
                 rospy.logwarn_throttle(5, "Generated trajectory contains NaNs, skipping...")
         except Exception as e:
-            rospy.logerr_throttle(5, f"Trajectory generation error: {e}")
+            rospy.logerr_throttle(
+                5,
+                "Trajectory generation error: %r\n%s",
+                e,
+                traceback.format_exc(),
+            )
 
     def fork_se3_to_tcp_se3(self, T_world_fork):
         return T_world_fork @ self.T_tcp_fork_tip_inv

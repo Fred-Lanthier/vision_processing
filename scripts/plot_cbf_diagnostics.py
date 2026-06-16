@@ -2,7 +2,7 @@
 """Decode and plot /cbf_safety/diagnostics from a rosbag.
 
 Produces the thesis result figures from one experiment bag:
-  1. h(t) and h_corr(t) with zero line and CBF-active / escape shading
+  1. h_soft(t) with zero line and CBF-active / escape shading
   2. Joint-velocity decomposition |dq_ff|, |dq_fb|, |dq_base|, |dq_cbf_delta|,
      |dq_escape|, |dq_safe|
   3. Pre- vs post-filter safe velocity (low-pass effect)
@@ -29,6 +29,10 @@ import rosbag
 
 DIAG_TOPIC = "/cbf_safety/diagnostics"
 LAYOUT_TOPIC = "/cbf_safety/diagnostics_layout"
+JOINTS_TOPIC = "/joint_states"
+OBSTACLES_TOPIC = "/perception/persistent_obstacles"
+PANDA_JOINTS = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
+                'panda_joint5', 'panda_joint6', 'panda_joint7']
 
 
 def load_bag(path):
@@ -48,7 +52,8 @@ def load_bag(path):
     if not rows:
         sys.exit(f"No {DIAG_TOPIC} messages in {path}.")
     data = np.asarray(rows, dtype=np.float64)
-    t = np.asarray(stamps) - stamps[0]
+    t0 = stamps[0]
+    t = np.asarray(stamps) - t0
 
     vec_fields = layout["vec_fields"]
     vec_dim = int(layout["vec_dim"])
@@ -64,7 +69,62 @@ def load_bag(path):
         series[name] = data[:, i * vec_dim:(i + 1) * vec_dim]
     for i, name in enumerate(scalar_fields):
         series[name] = data[:, n_vec + i]
-    return t, series
+    return t, series, t0
+
+
+def load_motion(path, t0):
+    """Read joint trajectory and obstacle clouds, on the diagnostics timebase.
+
+    Returns (t_q, q, obs_t, obs_clouds) where obs_clouds is a list of [Ni,3]
+    arrays (base frame) and obs_t their timestamps. Used to recompute the true
+    geometric clearance offline. Empty arrays if the topics were not recorded.
+    """
+    import sensor_msgs.point_cloud2 as pc2
+    t_q, q, obs_t, obs = [], [], [], []
+    with rosbag.Bag(path) as bag:
+        for topic, msg, t in bag.read_messages(
+                topics=[JOINTS_TOPIC, OBSTACLES_TOPIC]):
+            ts = t.to_sec() - t0
+            if topic == JOINTS_TOPIC:
+                pos = dict(zip(msg.name, msg.position))
+                if all(j in pos for j in PANDA_JOINTS):
+                    t_q.append(ts)
+                    q.append([pos[j] for j in PANDA_JOINTS])
+            else:
+                pts = np.array(list(pc2.read_points(
+                    msg, field_names=("x", "y", "z"), skip_nans=True)),
+                    dtype=np.float32)
+                obs_t.append(ts)
+                obs.append(pts.reshape(-1, 3))
+    return np.asarray(t_q), np.asarray(q), np.asarray(obs_t), obs
+
+
+def real_clearance_series(path, t0, t, dummy, samples_per_link):
+    """Offline true min distance robot->obstacles, aligned to diagnostics time t.
+
+    Returns an array the same length as t (NaN where it cannot be computed), or
+    None if the inputs/dependencies are missing. Best-effort: any failure logs a
+    warning and returns None so the rest of the figure still renders.
+    """
+    try:
+        import real_distance as rdist
+        t_q, q, obs_t, obs = load_motion(path, t0)
+        if len(t_q) < 2 or len(obs_t) == 0:
+            print("[real_distance] joint_states / persistent_obstacles missing "
+                  "from bag; skipping real-clearance overlay.")
+            return None
+        # Joint angles interpolated onto the diagnostics timestamps.
+        q_at_t = np.stack([np.interp(t, t_q, q[:, j]) for j in range(7)], axis=1)
+        # Nearest obstacle message per diagnostics step.
+        obs_index = np.abs(obs_t[None, :] - t[:, None]).argmin(axis=1)
+        rc = rdist.RealClearance(samples_per_link=samples_per_link)
+        print(f"[real_distance] protected meshes: {rc.found_links}")
+        d = rc.clearance(q_at_t, obs, obs_index)
+        d[dummy] = np.nan
+        return d
+    except Exception as e:
+        print(f"[real_distance] skipped real-clearance overlay: {e!r}")
+        return None
 
 
 def norm(v):
@@ -96,9 +156,26 @@ def main():
     ap.add_argument("--tau-safe", type=float, default=0.2,
                     help="output low-pass constant used to replay the filter "
                          "and reconstruct the repair correction dq_rep")
+    ap.add_argument("--tau-nom", type=float, default=0.05,
+                    help="input low-pass constant (cbf_filter_tau); used only "
+                         "to label the input-filter panel, which is exact "
+                         "because both its input and output are logged")
+    ap.add_argument("--max-joint-velocity", type=float, default=0.7,
+                    help="velocity clamp applied before replaying the output "
+                         "filter, to match the node which filters the clamped "
+                         "solver output (cbf node L1601)")
     ap.add_argument("--smooth", type=float, default=0.25,
                     help="display smoothing window in seconds for the velocity "
                          "decomposition (raw shown faintly behind; 0 = off)")
+    ap.add_argument("--d-safe", type=float, default=0.015,
+                    help="safety margin used at runtime; the offline real "
+                         "clearance is shifted by it to compare with h on the "
+                         "same barrier-value axis (h_real = d_real - d_safe)")
+    ap.add_argument("--real-samples", type=int, default=1500,
+                    help="surface samples per protected link for the offline "
+                         "true-clearance overlay on h_evolution")
+    ap.add_argument("--no-real-distance", action="store_true",
+                    help="skip the offline true-clearance overlay on h_evolution")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -106,7 +183,7 @@ def main():
     ts.apply()
     import matplotlib.pyplot as plt
 
-    t, s = load_bag(args.bag)
+    t, s, t0 = load_bag(args.bag)
     outdir = args.outdir or os.path.splitext(args.bag)[0] + "_diag"
     os.makedirs(outdir, exist_ok=True)
 
@@ -146,28 +223,49 @@ def main():
     repair_only = repaired & ~cbf_active
     escape = s["escape_active"] > 0.5
 
-    # The repair correction is not logged. Replay the output low-pass on the
-    # logged solver output (dq_pre_filter) and subtract from the published
-    # velocity: dq_rep = dq_final - LP(dq_pre_filter). Validated on run3:
-    # residual where repair_applied == 0 has median ~1e-4 rad/s.
+    # The pure output-filter command is consumed in place by the node (it is
+    # overwritten by the repaired command at cbf node L1612-1648), so it is the
+    # ONE signal in the chain that is not logged. Reconstruct it by replaying
+    # the output low-pass F_tau_safe on the logged solver output. The node
+    # filters the CLAMPED solver output (cbf node L1601), so clamp dq_pre_filter
+    # to +-max_joint_velocity first to match it faithfully.
+    #   dq_post_filter = F_tau_safe[ sat(dq_pre_filter) ]   (pure filter output)
+    #   dq_rep         = dq_final - dq_post_filter          (repair + saturation)
+    # Validated on run3: residual where repair_applied == 0 has median ~1e-4.
+    vmax = args.max_joint_velocity
+    dq_post_filter = None
     dq_rep_norm = np.zeros_like(t)
-    if "dt" in s and "repair_applied" in s:
+    if "dt" in s:
         dts = np.nan_to_num(s["dt"], nan=0.0).copy()
         good = dts > 0
         dts[~good] = np.median(dts[good]) if good.any() else 1e-2
-        state = s["dq_pre_filter"][0].copy()
-        lp = np.empty_like(s["dq_pre_filter"])
+        u = np.clip(s["dq_pre_filter"], -vmax, vmax)
+        state = u[0].copy()
+        dq_post_filter = np.empty_like(u)
         for k in range(len(t)):
             g = dts[k] / (dts[k] + args.tau_safe)
-            state = (1.0 - g) * state + g * s["dq_pre_filter"][k]
-            lp[k] = state
-        dq_rep_norm = np.linalg.norm(s["dq_final"] - lp, axis=1)
-        dq_rep_norm[~repaired] = 0.0
+            state = (1.0 - g) * state + g * u[k]
+            dq_post_filter[k] = state
+        if "repair_applied" in s:
+            dq_rep_norm = np.linalg.norm(s["dq_final"] - dq_post_filter, axis=1)
+            dq_rep_norm[~repaired] = 0.0
+
+    # Offline ground-truth barrier value: true min distance of the protected
+    # meshes to the FULL obstacle cloud, shifted by d_safe so it lives on the
+    # same axis as h. The gap to h_soft is the combined effect of the soft-min
+    # bias, the basis-SDF approximation and the runtime obstacle pruning.
+    h_real = None
+    if not args.no_real_distance:
+        d_real = real_clearance_series(args.bag, t0, t, dummy, args.real_samples)
+        if d_real is not None:
+            h_real = d_real - args.d_safe
 
     # 1. Barrier value -----------------------------------------------------
     fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))
-    ax.plot(t, s["h"], color=ts.GREY, label=r"$h_{\mathrm{soft}}$ (brute)", lw=1.0)
-    ax.plot(t, s["h_corr"], color=ts.BLUE, label=r"$h_{\mathrm{corr}}$", lw=1.0)
+    ax.plot(t, s["h"], color=ts.BLUE, label=r"$h_{\mathrm{soft}}$", lw=1.0)
+    if h_real is not None:
+        ax.plot(t, h_real, color=ts.ORANGE, lw=1.0,
+                label=r"$h_{\mathrm{réel}}$ (maillages, nuage complet)")
     ax.axhline(0.0, color="k", lw=0.8, ls="--")
     shade_active(ax, t, cbf_active, ts.GREEN, "projection CBF")
     shade_active(ax, t, repair_only, ts.YELLOW, "réparation seule")
@@ -260,19 +358,55 @@ def main():
     fig.tight_layout()
     ts.save(fig, outdir, "cbf_action")
 
-    # 3. Filter effect ------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))
-    ax.plot(t, norm(s["dq_pre_filter"]), color=ts.GREY, label="avant filtre (brute)", lw=0.9)
-    ax.plot(t, norm(s["dq_final"]), color=ts.BLUE, label="après filtre", lw=0.9)
+    # 3. Filter effects -----------------------------------------------------
+    # The command passes through TWO low-pass filters at different stages.
+    # (a) Input filter F_tau_nom, on the nominal command BEFORE the QP: both its
+    #     input (dq_ff + dq_fb) and output (dq_base) are logged, so the panel is
+    #     exact. It removes the velocity steps of the piecewise-linear waypoint
+    #     interpolation so the solver tracks a smooth reference.
+    # (b) Output filter F_tau_safe, on the safe command AFTER the QP: its input
+    #     (dq_pre_filter) is logged but its pure output is consumed in place, so
+    #     it is reconstructed (dq_post_filter). It smooths the discontinuous CBF
+    #     correction that jumps as the active obstacle set switches. dq_final
+    #     (filter + repair + saturation) is shown faintly so the filter's effect
+    #     is not conflated with the post-filter repair.
+    dq_nom_raw = s["dq_ff"] + s["dq_fb"]
+    fig, axes = plt.subplots(2, 1, figsize=(ts.TEXTWIDTH, 4.4), sharex=True)
+
+    ax = axes[0]
+    ax.plot(t, norm(dq_nom_raw), color=ts.ORANGE, lw=0.9,
+            label=r"avant : $|\dot{q}_{\mathrm{ff}}+\dot{q}_{\mathrm{fb}}|$")
+    ax.plot(t, norm(s["dq_base"]), color=ts.BLUE, lw=1.1,
+            label=r"après : $|\dot{q}_{\mathrm{base}}|$")
+    ax.set_ylabel("[rad/s]")
+    ax.set_ylim(bottom=0.0)
+    ts.legend_top(ax)
+    ts.panel_label(
+        ax, rf"(a) filtre d'entrée $F_{{\tau_{{\mathrm{{nom}}}}}}$ "
+            rf"($\tau={args.tau_nom:g}$ s)")
+
+    ax = axes[1]
+    ax.plot(t, norm(s["dq_pre_filter"]), color=ts.ORANGE, lw=0.9,
+            label=r"avant : $|\dot{q}_{\mathrm{pre}}|$ (sortie solveur)")
+    if dq_post_filter is not None:
+        ax.plot(t, norm(dq_post_filter), color=ts.BLUE, lw=1.1,
+                label=r"après : $|F_{\tau_{\mathrm{safe}}}[\dot{q}_{\mathrm{pre}}]|$")
+    ax.plot(t, norm(s["dq_final"]), color=ts.LIGHTGREY, lw=0.9, zorder=0,
+            label=r"$|\dot{q}_{\mathrm{final}}|$ (+ réparation, saturation)")
     ax.set_xlabel("t [s]")
     ax.set_ylabel("[rad/s]")
+    ax.set_ylim(bottom=0.0)
     ts.legend_top(ax)
+    ts.panel_label(
+        ax, rf"(b) filtre de sortie $F_{{\tau_{{\mathrm{{safe}}}}}}$ "
+            rf"($\tau={args.tau_safe:g}$ s)")
+
     fig.tight_layout()
     ts.save(fig, outdir, "filter_effect")
 
     # 4. Constraint residuals ----------------------------------------------
     fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))
-    ax.plot(t, s["constr_pre"], color=ts.GREY, label="avant projection (brute)", lw=0.9)
+    ax.plot(t, s["constr_pre"], color=ts.ORANGE, label="avant projection (brute)", lw=0.9)
     ax.plot(t, s["constr_final"], color=ts.BLUE, label="après réparation", lw=0.9)
     ax.axhline(0.0, color="k", lw=0.8, ls="--")
     ax.set_xlabel("t [s]")
@@ -288,7 +422,7 @@ def main():
                     showfliers=False, patch_artist=True,
                     medianprops=dict(color=ts.ORANGE))
     for box in bp["boxes"]:
-        box.set(facecolor="white", edgecolor=ts.GREY)
+        box.set(facecolor="white", edgecolor=ts.BLUE)
     ax.set_xticklabels(["CBF", "commande", "total"])
     ax.set_ylabel("temps de cycle [ms]")
     fig.tight_layout()
@@ -314,7 +448,9 @@ def main():
         ax.plot(t, s["real_hdot"], color=ts.ORANGE,
                 label=r"$\dot{h}$ exécuté (vitesse mesurée)", lw=0.9)
         ax.axhline(0.0, color="k", lw=0.8, ls="--")
-        shade_active(ax, t, intervened, ts.ORANGE, "CBF actif")
+        shade_active(ax, t, cbf_active, ts.GREEN, "projection CBF")
+        shade_active(ax, t, repair_only, ts.YELLOW, "réparation seule")
+        shade_active(ax, t, escape, ts.PURPLE, "échappement")
         ax.set_xlabel("t [s]")
         ax.set_ylabel(r"$\dot{h}$ [m/s]")
         ts.legend_top(ax)
@@ -345,6 +481,41 @@ def main():
         "p99_total_ms": float(np.nanpercentile(
             s["total_ms"][~np.isnan(s["total_ms"])], 99)),
     }
+    # Necessity of each low-pass: ratio of commanded-acceleration RMS before vs
+    # after the filter (a chatter/jerk proxy). >1 means the filter smooths the
+    # command; the larger the ratio the more the unfiltered command would have
+    # jerked the controller.
+    def accel_rms(v):
+        dtt = np.diff(t)
+        pos = dtt > 0
+        dtt[~pos] = np.median(dtt[pos]) if pos.any() else 1e-2
+        a = np.linalg.norm(np.diff(v, axis=0), axis=1) / dtt
+        return float(np.sqrt(np.nanmean(a ** 2)))
+
+    a_in_before, a_in_after = accel_rms(dq_nom_raw), accel_rms(s["dq_base"])
+    summary["accel_rms_in_before"] = a_in_before
+    summary["accel_rms_in_after"] = a_in_after
+    summary["accel_rms_in_reduction"] = (
+        a_in_before / a_in_after if a_in_after > 1e-9 else float('nan'))
+    if dq_post_filter is not None:
+        a_out_before = accel_rms(np.clip(s["dq_pre_filter"], -vmax, vmax))
+        a_out_after = accel_rms(dq_post_filter)
+        summary["accel_rms_out_before"] = a_out_before
+        summary["accel_rms_out_after"] = a_out_after
+        summary["accel_rms_out_reduction"] = (
+            a_out_before / a_out_after if a_out_after > 1e-9 else float('nan'))
+
+    # Validation of the SDF barrier against the offline true clearance: the gap
+    # justifies using h alone (fast, logged) everywhere else. Computed on valid
+    # cycles where both are finite.
+    if h_real is not None:
+        both = valid & np.isfinite(h_real) & np.isfinite(s["h"])
+        if both.any():
+            gap = np.abs(s["h"][both] - h_real[both])
+            summary["min_h_real"] = float(np.nanmin(h_real[both]))
+            summary["median_abs_gap_h_real_soft"] = float(np.median(gap))
+            summary["p95_abs_gap_h_real_soft"] = float(np.percentile(gap, 95))
+            summary["max_abs_gap_h_real_soft"] = float(np.max(gap))
     if "real_hdot" in s and not np.all(np.isnan(s["real_hdot"])):
         act = cbf_active & valid
         if act.any():

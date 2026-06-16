@@ -156,8 +156,14 @@ class PersistentCloudNode:
         # This adapts automatically to the target's physical size so neither the
         # cube surface nor the close bowl rim are treated as obstacles.
         self.target_exclusion_radius_min = float(rospy.get_param("~target_exclusion_radius", 0.005))
-        self._tgt_exclusion_radius = self.target_exclusion_radius_min  # updated each target frame
         self._tgt_centroid = None   # latest target centroid in world frame
+        # Carve obstacle points coincident with the target by point-to-point
+        # proximity to the actual target cloud, NOT a centroid sphere. A sphere
+        # large enough to cover the target also deletes nearby obstacles (e.g.
+        # the walls of a slim container the target sits in). Only points within
+        # this margin of a real target point are removed.
+        self._tgt_carve_margin = max(
+            self.target_exclusion_radius_min, obs_voxel_size)
 
         # Synthetic floor under the target: fills the depth-occluded region
         # below the food so the CBF cannot drive the fork too deep.
@@ -288,9 +294,8 @@ class PersistentCloudNode:
         # Integration-time target exclusion: never store target-region points in
         # obs_world.  The freespace eviction cannot remove them once committed
         # because the target itself keeps the depth value occupied.
-        if len(pts) > 0 and self._tgt_centroid is not None:
-            dists = np.linalg.norm(pts - self._tgt_centroid, axis=1)
-            pts = pts[dists > self._tgt_exclusion_radius]
+        if len(pts) > 0:
+            pts = self._carve_against_target(pts)
 
         self._live_obs = pts
         if len(pts) > 0:
@@ -310,30 +315,53 @@ class PersistentCloudNode:
             self._tgt_world.integrate(pts)
             new_centroid = pts.mean(axis=0).astype(np.float32)
 
-            # Dynamic exclusion radius: 95th-percentile distance from centroid to
-            # target cloud points, plus one voxel.  Covers the full target surface
-            # regardless of object size without hardcoding the cube dimensions.
-            # Using a percentile (not max) keeps SAM2 mask outliers from bloating
-            # the radius and accidentally excluding close bowl-rim points.
-            dists_tgt = np.linalg.norm(pts - new_centroid, axis=1)
-            dynamic_r = float(np.percentile(dists_tgt, 95)) + self.obs_voxel_size
-            self._tgt_exclusion_radius = max(dynamic_r, self.target_exclusion_radius_min)
-
-            # Evict any obs_world voxels inside the exclusion sphere.  Necessary
+            # Evict obs_world voxels coincident with the target cloud.  Necessary
             # on first target acquisition and whenever the target shifts.
             if self._tgt_centroid is None or \
                     np.linalg.norm(new_centroid - self._tgt_centroid) > self.obs_voxel_size:
-                self._evict_target_region(new_centroid)
+                self._evict_target_region(pts)
             self._tgt_centroid = new_centroid
         self._last_pub_stamp = msg.header.stamp
 
-    def _evict_target_region(self, centroid):
-        """Remove obs_world voxels within _tgt_exclusion_radius of centroid."""
+    def _carve_against_target(self, obs_pts):
+        """Remove obstacle points coincident with the actual target cloud.
+
+        Point-to-point margin against the target points (see _tgt_carve_margin),
+        not a sphere around the centroid, so obstacles near the target (e.g. a
+        slim container's walls) are preserved.
+        """
+        if obs_pts is None or len(obs_pts) == 0:
+            return obs_pts
+        tgt = self._tgt_world.get_points(min_confidence=1)
+        if tgt is None or len(tgt) == 0:
+            tgt = self._live_target
+        if tgt is None or len(tgt) == 0:
+            return obs_pts
+        try:
+            from scipy.spatial import cKDTree
+            d, _ = cKDTree(tgt).query(obs_pts, k=1)
+            return obs_pts[d >= self._tgt_carve_margin]
+        except Exception:
+            keep = np.ones(len(obs_pts), dtype=bool)
+            for p in tgt:
+                keep &= np.linalg.norm(obs_pts - p, axis=1) >= self._tgt_carve_margin
+            return obs_pts[keep]
+
+    def _evict_target_region(self, tgt_pts):
+        """Evict obs_world voxels coincident with the target cloud (point-to-point
+        margin, not a centroid sphere)."""
         pts, hashes = self.obs_world.get_points_and_hashes(min_confidence=1)
-        if pts is None:
+        if pts is None or tgt_pts is None or len(tgt_pts) == 0:
             return
-        dists = np.linalg.norm(pts - centroid, axis=1)
-        contaminated = hashes[dists < self._tgt_exclusion_radius]
+        try:
+            from scipy.spatial import cKDTree
+            d, _ = cKDTree(tgt_pts).query(pts, k=1)
+            contaminated = hashes[d < self._tgt_carve_margin]
+        except Exception:
+            mask = np.zeros(len(pts), dtype=bool)
+            for p in tgt_pts:
+                mask |= np.linalg.norm(pts - p, axis=1) < self._tgt_carve_margin
+            contaminated = hashes[mask]
         if len(contaminated) > 0:
             self.obs_world.evict_hashes(np.sort(contaminated))
 
@@ -378,15 +406,25 @@ class PersistentCloudNode:
             return None
 
         cx, cy, cz = self._tgt_centroid
-        dx = obs_pts[:, 0] - cx
-        dy = obs_pts[:, 1] - cy
-        horiz_sq = dx * dx + dy * dy
-        ring_mask = (horiz_sq < self.floor_sample_radius ** 2) & (obs_pts[:, 2] < cz)
-
-        if ring_mask.sum() < 5:
-            return None
-
-        floor_z = float(np.percentile(obs_pts[ring_mask, 2], self.floor_height_percentile))
+        # Floor height = bottom of the target itself (the food resting on the
+        # container base), NOT the percentile of surrounding ring obstacle
+        # points: those pick up the table/floor at z~0 and place the synthetic
+        # floor far below a tall container's interior. A low percentile of the
+        # target Z is robust to SAM2 mask outliers. Fall back to the ring
+        # estimate only when no target cloud is available.
+        tgt = self._tgt_world.get_points(min_confidence=1)
+        if tgt is None or len(tgt) == 0:
+            tgt = self._live_target
+        if tgt is not None and len(tgt) >= 5:
+            floor_z = float(np.percentile(tgt[:, 2], 5.0))
+        else:
+            dx = obs_pts[:, 0] - cx
+            dy = obs_pts[:, 1] - cy
+            horiz_sq = dx * dx + dy * dy
+            ring_mask = (horiz_sq < self.floor_sample_radius ** 2) & (obs_pts[:, 2] < cz)
+            if ring_mask.sum() < 5:
+                return None
+            floor_z = float(np.percentile(obs_pts[ring_mask, 2], self.floor_height_percentile))
 
         # Regular grid at floor_z covering the target footprint
         res = self.floor_grid_resolution
@@ -418,9 +456,8 @@ class PersistentCloudNode:
         # Publish-time target exclusion: O(N) centroid-sphere guard.
         # Belt-and-suspenders on top of the integration-time filter — catches
         # any live_obs fallback points and handles centroid drift between evictions.
-        if obs_pts is not None and len(obs_pts) > 0 and self._tgt_centroid is not None:
-            dists = np.linalg.norm(obs_pts - self._tgt_centroid, axis=1)
-            obs_pts = obs_pts[dists >= self._tgt_exclusion_radius]
+        if obs_pts is not None and len(obs_pts) > 0:
+            obs_pts = self._carve_against_target(obs_pts)
 
         # Synthetic floor: infer floor height from ring obstacle points and fill
         # the depth-occluded region below the target so the CBF cannot drive the

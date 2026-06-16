@@ -50,6 +50,13 @@ class Sam3Sam2Node:
         self.target_prompt = rospy.get_param("~target_prompt", "green cube")
         self.obstacle_prompt = rospy.get_param("~obstacle_prompt", "person")
         self.tracking_rate_hz = float(rospy.get_param("~tracking_rate_hz", 5.0))
+        self.sam3_init_retry_period = max(
+            0.1, float(rospy.get_param("~sam3_init_retry_period", 8.0)))
+        self.sam3_init_backoff_after_failures = int(rospy.get_param(
+            "~sam3_init_backoff_after_failures", 2))
+        self.sam3_init_backoff_period = max(
+            self.sam3_init_retry_period,
+            float(rospy.get_param("~sam3_init_backoff_period", 30.0)))
         self.sam2_max_side_length = rospy.get_param("~sam2_max_side_length", None)
         self.log_timing = bool(rospy.get_param("~log_timing", True))
         
@@ -86,6 +93,8 @@ class Sam3Sam2Node:
         
         self.frame_idx = 0
         self.last_init_time = 0
+        self.next_init_time = 0.0
+        self.init_fail_count = 0
         
         self.latest_frame = None
         self.frame_lock = threading.Lock()
@@ -142,6 +151,29 @@ class Sam3Sam2Node:
                 self.obj_mem_obstacle = SAMVideoObjectResults.create().store_prompt_result(self.frame_idx, init_mem, init_ptr)
                 rospy.loginfo(f"🚧 Obstacle '{self.obstacle_prompt}' initialisé.")
 
+        return self.obj_mem_target is not None
+
+    def _record_sam3_init_result(self, success):
+        now = time.time()
+        self.last_init_time = now
+        if success:
+            self.init_fail_count = 0
+            self.next_init_time = 0.0
+            return
+
+        self.init_fail_count += 1
+        retry_period = self.sam3_init_retry_period
+        max_fast_failures = self.sam3_init_backoff_after_failures
+        if max_fast_failures > 0 and self.init_fail_count >= max_fast_failures:
+            retry_period = self.sam3_init_backoff_period
+            rospy.logwarn_throttle(
+                10.0,
+                "SAM3 target init failed %d times; backing off retries to %.1fs.",
+                self.init_fail_count,
+                retry_period,
+            )
+        self.next_init_time = now + retry_period
+
     def ai_worker(self):
         rate = rospy.Rate(max(self.tracking_rate_hz, 0.1))
         while not rospy.is_shutdown():
@@ -159,9 +191,14 @@ class Sam3Sam2Node:
                 needs_init = True
                 
             if needs_init:
-                if time.time() - self.last_init_time > 2.0:
-                    self.last_init_time = time.time()
-                    self.init_with_sam3(rgb_cv)
+                now = time.time()
+                if now >= self.next_init_time:
+                    try:
+                        success = self.init_with_sam3(rgb_cv)
+                    except Exception as e:
+                        rospy.logerr_throttle(5.0, f"SAM3 initialization error: {e}")
+                        success = False
+                    self._record_sam3_init_result(success)
                 if self.obj_mem_target is None:
                     # Publish empty mask if not initialized
                     empty_mask = np.zeros((rgb_cv.shape[0], rgb_cv.shape[1]), dtype=np.uint8)
@@ -195,6 +232,7 @@ class Sam3Sam2Node:
                         self.pub_debug.publish(msg_out)
                     else:
                         self.obj_mem_target = None
+                        self.next_init_time = 0.0
                         # Publish empty mask if tracking lost
                         empty_mask = np.zeros((rgb_cv.shape[0], rgb_cv.shape[1]), dtype=np.uint8)
                         msg_out = self.bridge.cv2_to_imgmsg(empty_mask, encoding="mono8")
