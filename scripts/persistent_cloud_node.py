@@ -130,6 +130,12 @@ class PersistentCloudNode:
         self.camera_frame      = rospy.get_param("~camera_frame", "camera_wrist_optical_frame")
         self.world_frame       = rospy.get_param("~world_frame",  "world")
         self.log_counts        = bool(rospy.get_param("~log_counts", True))
+        self.freespace_evict_enabled = bool(rospy.get_param(
+            "~freespace_evict_enabled", True))
+        self.publish_evicted_debug = bool(rospy.get_param(
+            "~publish_evicted_debug", False))
+        self.log_freespace_evictions = bool(rospy.get_param(
+            "~log_freespace_evictions", False))
 
         # ── Robot self-filter ─────────────────────────────────────────────────
         # Removes depth-projected points on robot body links before integration.
@@ -163,18 +169,31 @@ class PersistentCloudNode:
         # the walls of a slim container the target sits in). Only points within
         # this margin of a real target point are removed.
         self._tgt_carve_margin = max(
-            self.target_exclusion_radius_min, obs_voxel_size)
+            self.target_exclusion_radius_min, obs_voxel_size // 2)
 
         # Synthetic floor under the target: fills the depth-occluded region
         # below the food so the CBF cannot drive the fork too deep.
-        # Height is inferred from obstacle ring points just outside the exclusion
-        # sphere at the base of the target.  Points are added only to the
-        # published cloud — obs_world is never modified.
+        # Height is inferred from the low target Z percentile when possible,
+        # with the obstacle-ring estimate kept as a fallback. Points are added
+        # only to the published cloud — obs_world is never modified.
         self.generate_synthetic_floor  = bool(rospy.get_param("~generate_synthetic_floor", True))
         self.floor_sample_radius       = float(rospy.get_param("~floor_sample_radius",    0.12))
         self.floor_grid_radius         = float(rospy.get_param("~floor_grid_radius",      0.05))
         self.floor_grid_resolution     = float(rospy.get_param("~floor_grid_resolution",  obs_voxel_size))
         self.floor_height_percentile   = float(rospy.get_param("~floor_height_percentile", 15.0))
+        self.floor_footprint_mode      = str(rospy.get_param("~floor_footprint_mode", "target")).lower()
+        self.floor_footprint_margin    = float(rospy.get_param("~floor_footprint_margin", 0.0))
+        self.floor_height_filter_tau   = max(
+            0.0, float(rospy.get_param("~floor_height_filter_tau", 0.0)))
+        self.floor_height_max_step     = max(
+            0.0, float(rospy.get_param("~floor_height_max_step", 0.0)))
+        self._floor_z_filtered         = None
+        self._floor_z_stamp            = None
+        if self.floor_footprint_mode not in ("target", "circle"):
+            rospy.logwarn(
+                "Unknown floor_footprint_mode=%s, falling back to target",
+                self.floor_footprint_mode)
+            self.floor_footprint_mode = "target"
 
         self._body_link_pos    = None   # [K, 3], updated each depth frame
 
@@ -210,6 +229,8 @@ class PersistentCloudNode:
 
         self.pub        = rospy.Publisher('/perception/persistent_obstacles', PointCloud2, queue_size=1)
         self.target_pub = rospy.Publisher('/perception/persistent_target',    PointCloud2, queue_size=1)
+        self.evicted_pub = rospy.Publisher(
+            '/perception/persistent_evicted_freespace', PointCloud2, queue_size=1)
 
         # Publish the current map state at a fixed rate, independent of the
         # obstacle-cloud input rate (which is capped at the SAM2 tracking rate,
@@ -221,9 +242,9 @@ class PersistentCloudNode:
         rospy.loginfo(
             "Persistent Cloud Node ready | "
             "obs: %.1fmm voxel, commit=%d, free_margin=%.1fmm | "
-            "self-filter radius=%.0fcm | device=%s",
+            "freespace_evict=%s | self-filter radius=%.0fcm | device=%s",
             obs_voxel_size * 1000, obs_commit_thresh, obs_free_margin * 1000,
-            self.robot_body_radius * 100, device)
+            self.freespace_evict_enabled, self.robot_body_radius * 100, device)
 
     # ── Robot link position helper ────────────────────────────────────────────
 
@@ -265,6 +286,9 @@ class PersistentCloudNode:
         # Refresh cached robot link positions (also used by _obs_cb self-filter)
         self._body_link_pos = self._get_link_positions(self._body_link_frames)
 
+        if not self.freespace_evict_enabled:
+            return
+
         # Freespace eviction: immediately remove voxels where camera sees background
         pts, hashes = self.obs_world.get_points_and_hashes(min_confidence=1)
         if pts is not None:
@@ -273,7 +297,16 @@ class PersistentCloudNode:
                 self.fx, self.fy, self.cx, self.cy,
                 self.obs_free_margin, self.device)
             if is_free.any():
+                evicted_pts = pts[is_free]
                 self.obs_world.evict_hashes(np.sort(hashes[is_free]))
+                if self.publish_evicted_debug:
+                    header = Header(stamp=msg.header.stamp, frame_id=self.world_frame)
+                    self.evicted_pub.publish(_make_cloud_msg(header, evicted_pts))
+                if self.log_freespace_evictions:
+                    rospy.loginfo_throttle(
+                        1.0,
+                        "Persistent freespace eviction: evicted=%d / checked=%d",
+                        int(is_free.sum()), int(len(is_free)))
 
     # ── Cloud callbacks ───────────────────────────────────────────────────────
 
@@ -388,21 +421,142 @@ class PersistentCloudNode:
 
     # ── Synthetic floor ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _points_in_polygon(points_xy, poly_xy):
+        """Vectorized ray-casting test for a convex or non-convex 2D polygon."""
+        if points_xy is None or len(points_xy) == 0 or poly_xy is None or len(poly_xy) < 3:
+            return np.zeros(0, dtype=bool)
+        x = points_xy[:, 0]
+        y = points_xy[:, 1]
+        inside = np.zeros(len(points_xy), dtype=bool)
+        xj, yj = poly_xy[-1]
+        eps = 1e-12
+        for xi, yi in poly_xy:
+            crosses = ((yi > y) != (yj > y))
+            x_intersect = (xj - xi) * (y - yi) / (yj - yi + eps) + xi
+            inside ^= crosses & (x < x_intersect)
+            xj, yj = xi, yi
+        return inside
+
+    def _generate_target_footprint_patch(self, tgt_pts, floor_z):
+        """Generate floor points only below the target's projected XY support."""
+        if tgt_pts is None or len(tgt_pts) < 3:
+            return None
+
+        cx, cy, _ = self._tgt_centroid
+        xy = tgt_pts[:, :2].astype(np.float32)
+
+        # Keep the support bounded by the same radius used by the old disk mode.
+        # This prevents a single target outlier from creating a large synthetic
+        # obstacle while still allowing the footprint mode to replace the circle.
+        if self.floor_grid_radius > 0.0:
+            d2 = (xy[:, 0] - cx) ** 2 + (xy[:, 1] - cy) ** 2
+            bounded = xy[d2 <= self.floor_grid_radius ** 2]
+            if len(bounded) >= 3:
+                xy = bounded
+
+        res = max(self.floor_grid_resolution, 1e-4)
+        margin = max(self.floor_footprint_margin, 0.0)
+        xy_min = xy.min(axis=0) - margin
+        xy_max = xy.max(axis=0) + margin
+
+        xs = np.arange(xy_min[0], xy_max[0] + res * 0.5, res, dtype=np.float32)
+        ys = np.arange(xy_min[1], xy_max[1] + res * 0.5, res, dtype=np.float32)
+        if len(xs) == 0 or len(ys) == 0:
+            return None
+
+        xx, yy = np.meshgrid(xs, ys)
+        grid_xy = np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float32)
+
+        try:
+            from scipy.spatial import ConvexHull
+            if np.linalg.matrix_rank(xy - xy.mean(axis=0, keepdims=True)) < 2:
+                raise ValueError("Target footprint is nearly collinear.")
+            hull = ConvexHull(xy)
+            poly = xy[hull.vertices]
+            keep = self._points_in_polygon(grid_xy, poly)
+        except Exception:
+            # Degenerate footprint: fall back to occupied target XY voxels.
+            idx = np.floor(grid_xy / res).astype(np.int64)
+            tgt_idx = np.floor(xy / res).astype(np.int64)
+            keep = np.isin(
+                idx[:, 0].astype(np.int64) * 73856093
+                ^ idx[:, 1].astype(np.int64) * 19349663,
+                tgt_idx[:, 0].astype(np.int64) * 73856093
+                ^ tgt_idx[:, 1].astype(np.int64) * 19349663)
+
+        if margin > 0.0:
+            try:
+                from scipy.spatial import cKDTree
+                nearest, _ = cKDTree(xy).query(grid_xy, k=1)
+                keep |= nearest <= margin
+            except Exception:
+                pass
+
+        grid_xy = grid_xy[keep]
+        if len(grid_xy) == 0:
+            return None
+
+        zz = np.full(len(grid_xy), floor_z, dtype=np.float32)
+        return np.column_stack([grid_xy[:, 0], grid_xy[:, 1], zz]).astype(np.float32)
+
+    def _generate_circular_floor_patch(self, floor_z):
+        """Generate the legacy circular floor patch centered under the target."""
+        cx, cy, _ = self._tgt_centroid
+        res = max(self.floor_grid_resolution, 1e-4)
+        r = self.floor_grid_radius
+        xs = np.arange(cx - r, cx + r + res * 0.5, res, dtype=np.float32)
+        ys = np.arange(cy - r, cy + r + res * 0.5, res, dtype=np.float32)
+        xx, yy = np.meshgrid(xs, ys)
+        xx = xx.ravel()
+        yy = yy.ravel()
+        in_circle = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+        xx = xx[in_circle]
+        yy = yy[in_circle]
+        zz = np.full(len(xx), floor_z, dtype=np.float32)
+        return np.column_stack([xx, yy, zz])
+
+    def _stabilize_floor_z(self, floor_z):
+        if self.floor_height_filter_tau <= 0.0 and self.floor_height_max_step <= 0.0:
+            return floor_z
+
+        now = rospy.get_time()
+        if self._floor_z_filtered is None:
+            self._floor_z_filtered = float(floor_z)
+            self._floor_z_stamp = now
+            return self._floor_z_filtered
+
+        prev = float(self._floor_z_filtered)
+        dt = max(0.0, now - float(self._floor_z_stamp or now))
+        z = float(floor_z)
+
+        if self.floor_height_filter_tau > 0.0 and dt > 0.0:
+            alpha = dt / (self.floor_height_filter_tau + dt)
+            z = prev + alpha * (z - prev)
+
+        if self.floor_height_max_step > 0.0:
+            dz = np.clip(z - prev, -self.floor_height_max_step,
+                         self.floor_height_max_step)
+            z = prev + float(dz)
+
+        self._floor_z_filtered = z
+        self._floor_z_stamp = now
+        return z
+
     def _generate_floor_patch(self, obs_pts):
         """
         Return a [N,3] float32 grid of synthetic floor points below the target.
 
         Algorithm:
-          1. Collect obstacle ring points within floor_sample_radius (horizontal)
-             of the target centroid that are below the centroid.
-          2. Estimate floor height as the floor_height_percentile of their Z.
-          3. Fill a circular grid at that height under the target footprint.
+          1. Estimate floor height from the low target Z percentile.
+          2. Fall back to nearby obstacle-ring points if the target cloud is absent.
+          3. Fill either the target XY footprint or the legacy circular patch.
 
         Returns None when there is insufficient ring data to infer the floor.
         """
         if not self.generate_synthetic_floor:
             return None
-        if self._tgt_centroid is None or obs_pts is None or len(obs_pts) == 0:
+        if self._tgt_centroid is None:
             return None
 
         cx, cy, cz = self._tgt_centroid
@@ -416,8 +570,10 @@ class PersistentCloudNode:
         if tgt is None or len(tgt) == 0:
             tgt = self._live_target
         if tgt is not None and len(tgt) >= 5:
-            floor_z = float(np.percentile(tgt[:, 2], 5.0))
+            floor_z = float(np.percentile(tgt[:, 2], 20.0))
         else:
+            if obs_pts is None or len(obs_pts) == 0:
+                return None
             dx = obs_pts[:, 0] - cx
             dy = obs_pts[:, 1] - cy
             horiz_sq = dx * dx + dy * dy
@@ -426,19 +582,14 @@ class PersistentCloudNode:
                 return None
             floor_z = float(np.percentile(obs_pts[ring_mask, 2], self.floor_height_percentile))
 
-        # Regular grid at floor_z covering the target footprint
-        res = self.floor_grid_resolution
-        r   = self.floor_grid_radius
-        xs  = np.arange(cx - r, cx + r + res * 0.5, res, dtype=np.float32)
-        ys  = np.arange(cy - r, cy + r + res * 0.5, res, dtype=np.float32)
-        xx, yy = np.meshgrid(xs, ys)
-        xx = xx.ravel()
-        yy = yy.ravel()
-        in_circle = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
-        xx = xx[in_circle]
-        yy = yy[in_circle]
-        zz = np.full(len(xx), floor_z, dtype=np.float32)
-        return np.column_stack([xx, yy, zz])
+        floor_z = self._stabilize_floor_z(floor_z)
+
+        if self.floor_footprint_mode == "target" and tgt is not None:
+            patch = self._generate_target_footprint_patch(tgt, floor_z)
+            if patch is not None:
+                return patch
+
+        return self._generate_circular_floor_patch(floor_z)
 
     # ── Publishing ────────────────────────────────────────────────────────────
 

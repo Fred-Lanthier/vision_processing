@@ -54,6 +54,9 @@ class ConditionPcdFromPerception:
         # Publishers
         self.pub_merged = rospy.Publisher('/vision/merged_cloud', PointCloud2, queue_size=1)
         self.pub_dist = rospy.Publisher('/vision/fork_food_distance', Float32, queue_size=1)
+        # Fork mesh point cloud (world frame), published on its own so the grasp
+        # node can measure fork-to-target contact without re-deriving fork geometry.
+        self.pub_fork = rospy.Publisher('/vision/fork_cloud', PointCloud2, queue_size=1)
         
         # Subscribers
         rospy.Subscriber('/perception/target', PointCloud2, self.target_callback)
@@ -123,10 +126,21 @@ class ConditionPcdFromPerception:
             cloud_msg = pc2.create_cloud_xyz32(header, points)
         self.pub_merged.publish(cloud_msg)
 
+    def publish_fork_cloud(self, points, frame_id="world"):
+        header = Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = frame_id
+        self.pub_fork.publish(pc2.create_cloud_xyz32(header, points))
+
     def run(self):
         pts_per_object = self.num_points // 2
-        
+
         while not rospy.is_shutdown():
+            # Publish the fork cloud on its own whenever available (independent
+            # of target detection) for the grasp/contact node.
+            if self.fork_cloud_cache is not None:
+                self.publish_fork_cloud(self.fork_cloud_cache)
+
             # Expire stale target unless the launch explicitly asks to keep using
             # the last valid target cloud while SAM2/SAM3 tracking is lost.
             if self.target_stamp is not None and self.target_timeout > 0.0:

@@ -12,7 +12,7 @@
 
     <collision>
       <geometry>
-        <box size="0.025 0.025 0.025"/>
+        <box size="0.03 0.03 0.03"/>
       </geometry>
     </collision>
 

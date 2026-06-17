@@ -34,6 +34,14 @@
     <child link="fork_tip"/>
   </joint>
 
+  <!-- Keep fork_tip as a standalone Gazebo link (do not lump it into its
+       fixed-joint parent) so gazebo_ros_link_attacher can weld the food cube
+       to it. The fixed joint stays a rigid (zero-DOF) weld to panda_TCP. -->
+  <gazebo reference="fork_tip_joint">
+    <disableFixedJointLumping>true</disableFixedJointLumping>
+    <preserveFixedJoint>true</preserveFixedJoint>
+  </gazebo>
+
   <!-- Physical tine tip: centroid of fork tine endpoints in fork_tip frame.
        Computed from fork_tip.stl bounding box (top-1% Z vertices, scale 0.001):
          STL tip ~ [30.5, 19.8, 180.0] mm → R_y(27.5°) × tip_m + visual_offset

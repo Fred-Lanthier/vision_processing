@@ -11,30 +11,36 @@
   <arg name="casf_model_name" default="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
-  <arg name="planner_rate_hz" default="1.5" />
+  <arg name="planner_rate_hz" default="10" />
   <arg name="trajectory_waypoint_rate_hz" default="10.0" />
-  <arg name="control_rate_hz" default="80.0" />
-  <arg name="cbf_preprocess_rate_hz" default="50.0" />
+  <arg name="control_rate_hz" default="100.0" />
+  <arg name="cbf_preprocess_rate_hz" default="40.0" />
   <arg name="viz_rate_hz" default="5.0" />
   <arg name="bridge_rate_hz" default="60.0" />
   <arg name="bridge_horizon_points" default="1" />
   <arg name="bridge_point_dt" default="0.02" />
   <arg name="bridge_lead_time" default="0.01" />
   <arg name="cbf_graph_points" default="100" />
-  <arg name="cbf_preprocess_max_points" default="1024" />
+  <arg name="cbf_preprocess_max_points" default="2048" />
   <arg name="cbf_candidate_filter" default="sdf" />
   <arg name="cbf_link_filter_radius" default="0.35" />
-  <arg name="cbf_link_prefilter_points" default="256" />
+  <arg name="cbf_link_prefilter_points" default="2048" />
   <arg name="cbf_sdf_candidate_max_dist" default="0.35" />
   <arg name="cbf_sdf_prune_chunk_size" default="2048" />
   <arg name="cbf_sdf_self_filter_margin" default="-0.05" />
-  <arg name="cbf_sdf_prefilter_radius" default="0.35" />
-  <arg name="cbf_sdf_prefilter_max_points" default="500" />
+  <arg name="cbf_sdf_prefilter_radius" default="0.4" />
+  <arg name="cbf_sdf_prefilter_max_points" default="2048" />
   <arg name="cbf_selection_metric" default="sdf" />
   <arg name="cbf_cluster_mode" default="topk" />
   <arg name="cbf_fork_mesh_selection_points" default="512" />
   <arg name="cbf_publish_yellow_points" default="false" />
   <arg name="cbf_selected_obstacle_hold_time" default="0.1" />
+  <arg name="cbf_selection_sticky_points" default="25" />
+  <arg name="cbf_selection_sticky_radius" default="0.03" />
+  <arg name="cbf_selection_sticky_score_margin" default="0.002" />
+  <arg name="cbf_selection_duplicate_radius" default="0.003" />
+  <arg name="cbf_selection_new_point_penalty" default="0.0" />
+  <arg name="cbf_selection_sticky_force_keep" default="true" />
   <arg name="obstacle_pre_sample_max" default="2000" />
   <arg name="planner_cbf_max_obstacles" default="256" />
   <arg name="casf_spatial_max_obstacles" default="100" />
@@ -53,6 +59,18 @@
   <arg name="trajectory_retime_joint_speed" default="0.25" />
   <arg name="trajectory_retime_joint_weights" default="1 1 1 1 1 1 1" />
   <arg name="trajectory_retime_min_segment_fraction" default="0.02" />
+  <arg name="planner_exit_lift_enabled" default="false" />
+  <arg name="planner_exit_lift_radius_xy" default="0.16" />
+  <arg name="planner_exit_lift_release_radius_xy" default="0.12" />
+  <arg name="planner_exit_lift_clearance" default="0.025" />
+  <arg name="planner_exit_lift_trigger_depth" default="0.008" />
+  <arg name="planner_exit_lift_max_lift" default="0.12" />
+  <arg name="planner_exit_lift_waypoints" default="6" />
+  <arg name="planner_exit_lift_hold_fraction" default="0.70" />
+  <arg name="planner_exit_lift_min_obstacles" default="12" />
+  <arg name="planner_exit_lift_z_quantile" default="0.95" />
+  <arg name="planner_exit_lift_below_margin" default="0.05" />
+  <arg name="log_planner_exit_lift" default="true" />
   <arg name="n_pred" default="5" />
   <arg name="n_corr" default="5" />
   <arg name="alpha_corr" default="2.0" />
@@ -70,7 +88,7 @@
   <arg name="cbf_max_command_lead" default="0.05" />
   <arg name="cbf_gradient_check_period" default="0.0" />
   <arg name="cbf_gradient_check_eps" default="0.001" />
-  <arg name="barrier_alpha" default="0.001" />
+  <arg name="barrier_alpha" default="0.005" />
   <arg name="d_safe" default="0.015" />
   <arg name="cbf_publish_safety_envelope" default="true" />
   <arg name="cbf_safety_envelope_resolution" default="40" />
@@ -78,14 +96,14 @@
   <arg name="cbf_kp" default="5.0" />
   <arg name="max_feedback_velocity" default="0.5" />
   <arg name="cbf_filter_tau" default="0.05" />
-  <arg name="cbf_velocity_filter_tau" default="0.2" />
+  <arg name="cbf_velocity_filter_tau" default="0.05" />
   <arg name="cbf_use_nominal_velocity_topic" default="true" />
   <arg name="cbf_nominal_velocity_timeout" default="0.25" />
   <arg name="cbf_nominal_feedforward_gain" default="1.0" />
-  <arg name="cbf_escape_enabled" default="true" />
+  <arg name="cbf_escape_enabled" default="false" />
   <arg name="cbf_escape_h_trigger" default="0.006" />
   <arg name="cbf_escape_h_release" default="0.012" />
-  <arg name="cbf_escape_use_bias_corrected_h" default="true" />
+  <arg name="cbf_escape_use_bias_corrected_h" default="false" />
   <arg name="cbf_escape_activation_cycles" default="2" />
   <arg name="cbf_escape_min_cbf_delta" default="0.02" />
   <arg name="cbf_escape_tangent_gain" default="1.5" />
@@ -111,6 +129,8 @@
        reaches h < 0 at true contact and contact_stop fires anywhere on the
        robot, not just the fork tip. -->
   <arg name="persistent_free_margin" default="0.02" />
+  <arg name="persistent_freespace_evict_enabled" default="true" />
+  <arg name="persistent_publish_evicted_debug" default="false" />
   <arg name="persistent_commit_threshold" default="1" />
   <arg name="persistent_max_voxels" default="100000" />
   <arg name="persistent_robot_body_radius" default="-0.03" />
@@ -122,6 +142,10 @@
   <arg name="persistent_floor_grid_radius"        default="0.05" />
   <arg name="persistent_floor_grid_resolution"    default="0.005" />
   <arg name="persistent_floor_height_percentile"  default="15.0" />
+  <arg name="persistent_floor_footprint_mode"     default="target" />
+  <arg name="persistent_floor_footprint_margin"   default="0.0" />
+  <arg name="persistent_floor_height_filter_tau"  default="0.0" />
+  <arg name="persistent_floor_height_max_step"    default="0.0" />
   <arg name="condition_num_points" default="256" />
   <arg name="condition_target_timeout" default="5.0" />
   <arg name="condition_hold_last_target_on_loss" default="true" />
@@ -141,11 +165,13 @@
   <arg name="log_projector_events" default="false" />
   <arg name="log_perception_timing" default="false" />
   <arg name="log_persistent_counts" default="false" />
+  <arg name="log_persistent_evictions" default="false" />
   <arg name="log_cbf_events" default="false" />
   <arg name="log_cbf_command_timing" default="true" />
   <arg name="log_cbf_preprocess_breakdown" default="false" />
   <arg name="cbf_profile_sync" default="false" />
   <arg name="cbf_publish_diagnostics" default="true" />
+  <arg name="cbf_diagnostics_decimation" default="4" />
   <arg name="fm_use_torch_compile" default="false" />
   <!-- CBF node selection: cbf_safety_node_Bernstein.py (single soft-min
        constraint, CUDA graph) or cbf_safety_node_Bernstein_multicbf.py.
@@ -153,11 +179,14 @@
   <arg name="cbf_node_type" default="cbf_safety_node_Bernstein.py" />
   <arg name="cbf_solver_mode" default="fast_tangent" />
   <arg name="cbf_active_constraints" default="4" />
-  <arg name="cbf_h_activate" default="0.006" />
+  <arg name="cbf_multi_gradient_mode" default="finite_difference" />
+  <arg name="cbf_multi_fd_eps" default="0.001" />
+  <arg name="cbf_h_activate" default="0.00" />
   <arg name="cbf_max_inward_speed" default="0.20" />
   <arg name="cbf_recovery_speed" default="0.0" />
   <arg name="cbf_recovery_depth" default="0.01" />
   <arg name="cbf_max_correction_speed" default="0.35" />
+  <arg name="cbf_recovery_max_correction_speed" default="0.0" />
   <arg name="cbf_projection_iters" default="3" />
   <arg name="cbf_projection_relaxation" default="1.0" />
   <arg name="cbf_tracking_feedback_mode" default="tangent_near" />
@@ -256,12 +285,15 @@
          commit_threshold — obs frames before a voxel is published (2 = fast, 3 = robust)
          free_margin      — depth band (m); camera must see this far beyond voxel to evict
                             (default 2×voxel_size = 10 mm)
+         freespace_evict_enabled — disable for A/B tests against camera-view eviction
          robot_body_radius — filter radius around each body link to remove self-projections -->
   <node name="persistent_cloud" pkg="vision_processing" type="persistent_cloud_node.py" output="screen" cwd="node">
         <param name="depth_topic"         value="$(arg depth_topic)" />
         <param name="info_topic"          value="$(arg info_topic)" />
         <param name="voxel_size"          value="$(arg persistent_voxel_size)" />
         <param name="free_margin"         value="$(arg persistent_free_margin)" />
+        <param name="freespace_evict_enabled" value="$(arg persistent_freespace_evict_enabled)" />
+        <param name="publish_evicted_debug"   value="$(arg persistent_publish_evicted_debug)" />
         <param name="commit_threshold"    value="$(arg persistent_commit_threshold)" />
         <param name="max_voxels"          value="$(arg persistent_max_voxels)" />
         <param name="robot_body_radius"   value="$(arg persistent_robot_body_radius)" />
@@ -273,7 +305,12 @@
         <param name="floor_grid_radius"             value="$(arg persistent_floor_grid_radius)" />
         <param name="floor_grid_resolution"         value="$(arg persistent_floor_grid_resolution)" />
         <param name="floor_height_percentile"       value="$(arg persistent_floor_height_percentile)" />
+        <param name="floor_footprint_mode"          value="$(arg persistent_floor_footprint_mode)" />
+        <param name="floor_footprint_margin"        value="$(arg persistent_floor_footprint_margin)" />
+        <param name="floor_height_filter_tau"       value="$(arg persistent_floor_height_filter_tau)" />
+        <param name="floor_height_max_step"         value="$(arg persistent_floor_height_max_step)" />
         <param name="log_counts"          value="$(arg log_persistent_counts)" />
+        <param name="log_freespace_evictions" value="$(arg log_persistent_evictions)" />
   </node>
 
   <!-- 5. Condition Merger (Target + Fork Mesh) -->
@@ -317,6 +354,18 @@
         <param name="trajectory_retime_joint_speed" value="$(arg trajectory_retime_joint_speed)" />
         <param name="trajectory_retime_joint_weights" value="$(arg trajectory_retime_joint_weights)" />
         <param name="trajectory_retime_min_segment_fraction" value="$(arg trajectory_retime_min_segment_fraction)" />
+        <param name="planner_exit_lift_enabled" value="$(arg planner_exit_lift_enabled)" />
+        <param name="planner_exit_lift_radius_xy" value="$(arg planner_exit_lift_radius_xy)" />
+        <param name="planner_exit_lift_release_radius_xy" value="$(arg planner_exit_lift_release_radius_xy)" />
+        <param name="planner_exit_lift_clearance" value="$(arg planner_exit_lift_clearance)" />
+        <param name="planner_exit_lift_trigger_depth" value="$(arg planner_exit_lift_trigger_depth)" />
+        <param name="planner_exit_lift_max_lift" value="$(arg planner_exit_lift_max_lift)" />
+        <param name="planner_exit_lift_waypoints" value="$(arg planner_exit_lift_waypoints)" />
+        <param name="planner_exit_lift_hold_fraction" value="$(arg planner_exit_lift_hold_fraction)" />
+        <param name="planner_exit_lift_min_obstacles" value="$(arg planner_exit_lift_min_obstacles)" />
+        <param name="planner_exit_lift_z_quantile" value="$(arg planner_exit_lift_z_quantile)" />
+        <param name="planner_exit_lift_below_margin" value="$(arg planner_exit_lift_below_margin)" />
+        <param name="log_planner_exit_lift" value="$(arg log_planner_exit_lift)" />
         <param name="commit_distance" value="$(arg commit_distance)" />
         <param name="merged_cloud_contains_fork" value="true" />
         <param name="obstacle_pre_sample_max" value="$(arg obstacle_pre_sample_max)" />
@@ -404,6 +453,12 @@
         <param name="fork_mesh_selection_points" value="$(arg cbf_fork_mesh_selection_points)" />
         <param name="publish_yellow_points" value="$(arg cbf_publish_yellow_points)" />
         <param name="selected_obstacle_hold_time" value="$(arg cbf_selected_obstacle_hold_time)" />
+        <param name="cbf_selection_sticky_points" value="$(arg cbf_selection_sticky_points)" />
+        <param name="cbf_selection_sticky_radius" value="$(arg cbf_selection_sticky_radius)" />
+        <param name="cbf_selection_sticky_score_margin" value="$(arg cbf_selection_sticky_score_margin)" />
+        <param name="cbf_selection_duplicate_radius" value="$(arg cbf_selection_duplicate_radius)" />
+        <param name="cbf_selection_new_point_penalty" value="$(arg cbf_selection_new_point_penalty)" />
+        <param name="cbf_selection_sticky_force_keep" value="$(arg cbf_selection_sticky_force_keep)" />
         <param name="cbf_kappa"    value="$(arg cbf_kappa)" />
         <param name="cbf_recovery_kappa" value="$(arg cbf_recovery_kappa)" />
         <param name="cbf_constraint_margin" value="$(arg cbf_constraint_margin)" />
@@ -420,14 +475,18 @@
         <param name="log_cbf_events" value="$(arg log_cbf_events)" />
         <param name="log_cbf_command_timing" value="$(arg log_cbf_command_timing)" />
         <param name="publish_diagnostics" value="$(arg cbf_publish_diagnostics)" />
+        <param name="cbf_diagnostics_decimation" value="$(arg cbf_diagnostics_decimation)" />
         <!-- multicbf-only parameters (unread by the Bernstein node) -->
         <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)" />
         <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)" />
+        <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)" />
+        <param name="cbf_multi_fd_eps" value="$(arg cbf_multi_fd_eps)" />
         <param name="cbf_h_activate" value="$(arg cbf_h_activate)" />
         <param name="cbf_max_inward_speed" value="$(arg cbf_max_inward_speed)" />
         <param name="cbf_recovery_speed" value="$(arg cbf_recovery_speed)" />
         <param name="cbf_recovery_depth" value="$(arg cbf_recovery_depth)" />
         <param name="cbf_max_correction_speed" value="$(arg cbf_max_correction_speed)" />
+        <param name="cbf_recovery_max_correction_speed" value="$(arg cbf_recovery_max_correction_speed)" />
         <param name="cbf_projection_iters" value="$(arg cbf_projection_iters)" />
         <param name="cbf_projection_relaxation" value="$(arg cbf_projection_relaxation)" />
         <param name="cbf_tracking_feedback_mode" value="$(arg cbf_tracking_feedback_mode)" />
@@ -495,6 +554,27 @@
         <param name="hold_when_stale" value="true" />
         <param name="hold_duration"   value="$(arg bridge_hold_duration)" />
         <param name="log_events"      value="$(arg log_bridge_events)" />
+  </node>
+
+  <!-- 9.5. Fork Grasp (Gazebo spike-and-hold) -->
+  <!-- Welds the food to the fork via gazebo_ros_link_attacher when any fork
+       point (/vision/fork_cloud) touches any target point
+       (/perception/persistent_target). Contact anywhere on the fork / anywhere
+       on the target triggers the weld. Disable with grasp_enabled:=false. -->
+  <arg name="grasp_enabled" default="true" />
+  <arg name="grasp_contact_distance" default="0.012" />
+  <arg name="grasp_contact_cycles" default="2" />
+  <node name="fork_grasp" pkg="vision_processing" type="fork_grasp_node.py"
+        output="screen" if="$(arg grasp_enabled)">
+        <param name="robot_model" value="panda" />
+        <param name="fork_link" value="fork_tip" />
+        <param name="food_model" value="food_cube" />
+        <param name="food_link" value="base_link" />
+        <param name="fork_topic" value="/vision/fork_cloud" />
+        <param name="target_topic" value="/perception/persistent_target" />
+        <param name="contact_distance" value="$(arg grasp_contact_distance)" />
+        <param name="contact_cycles" value="$(arg grasp_contact_cycles)" />
+        <param name="auto_attach" value="true" />
   </node>
 
   <!-- 10. RViz Visualization -->

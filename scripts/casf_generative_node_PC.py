@@ -334,6 +334,28 @@ class CASFGenerativeNode:
             "~trajectory_retime_min_segment_fraction", 0.02))
         self.trajectory_retime_joint_weights = self._parse_joint_weights(
             rospy.get_param("~trajectory_retime_joint_weights", "1 1 1 1 1 1 1"))
+        self.exit_lift_enabled = _bool_param("~planner_exit_lift_enabled", False)
+        self.exit_lift_radius_xy = float(rospy.get_param(
+            "~planner_exit_lift_radius_xy", 0.16))
+        self.exit_lift_release_radius_xy = float(rospy.get_param(
+            "~planner_exit_lift_release_radius_xy", 0.12))
+        self.exit_lift_clearance = float(rospy.get_param(
+            "~planner_exit_lift_clearance", 0.025))
+        self.exit_lift_trigger_depth = float(rospy.get_param(
+            "~planner_exit_lift_trigger_depth", 0.008))
+        self.exit_lift_max_lift = float(rospy.get_param(
+            "~planner_exit_lift_max_lift", 0.12))
+        self.exit_lift_waypoints = max(2, int(rospy.get_param(
+            "~planner_exit_lift_waypoints", 6)))
+        self.exit_lift_hold_fraction = float(rospy.get_param(
+            "~planner_exit_lift_hold_fraction", 0.70))
+        self.exit_lift_min_obstacles = max(1, int(rospy.get_param(
+            "~planner_exit_lift_min_obstacles", 12)))
+        self.exit_lift_z_quantile = float(rospy.get_param(
+            "~planner_exit_lift_z_quantile", 0.95))
+        self.exit_lift_below_margin = float(rospy.get_param(
+            "~planner_exit_lift_below_margin", 0.05))
+        self.log_planner_exit_lift = _bool_param("~log_planner_exit_lift", True)
         self.ensembler_buffer_size = max(1, int(rospy.get_param("~ensembler_buffer_size", 3)))
         self.ensembler_decay = float(rospy.get_param("~ensembler_decay", 1.0))
         self.use_temporal_ensembler = _bool_param("~use_temporal_ensembler", False)
@@ -818,6 +840,89 @@ class CASFGenerativeNode:
                 )
                 P_eval = P_eval[:new_count]
 
+    def apply_container_exit_lift(self, traj_np, current_fork_pos):
+        """Lift fork-tip waypoints above the local rim before lateral exit."""
+        if (
+            not self.exit_lift_enabled
+            or traj_np is None
+            or traj_np.shape[0] < 2
+            or self.obstacle_pts_gpu is None
+            or self.obstacle_pts_gpu.shape[0] < self.exit_lift_min_obstacles
+        ):
+            return traj_np
+
+        obs = self.obstacle_pts_gpu.detach()
+        if obs.shape[1] < 3:
+            return traj_np
+
+        current = torch.as_tensor(
+            current_fork_pos, dtype=obs.dtype, device=obs.device)
+        with torch.no_grad():
+            dxy = torch.norm(obs[:, :2] - current[:2], dim=1)
+            z = obs[:, 2]
+            keep = (
+                (dxy <= self.exit_lift_radius_xy)
+                & (z >= current[2] - self.exit_lift_below_margin)
+            )
+            local_z = z[keep]
+            if int(local_z.numel()) < self.exit_lift_min_obstacles:
+                return traj_np
+            local_z_np = local_z.float().cpu().numpy()
+
+        q = float(np.clip(self.exit_lift_z_quantile, 0.50, 1.0))
+        rim_z = float(np.quantile(local_z_np, q))
+        current_z = float(current_fork_pos[2])
+        target_z = rim_z + self.exit_lift_clearance
+        if self.exit_lift_max_lift > 0.0:
+            target_z = min(target_z, current_z + self.exit_lift_max_lift)
+        lift_dz = target_z - current_z
+        if lift_dz < self.exit_lift_trigger_depth:
+            return traj_np
+
+        out = traj_np.copy()
+        original = traj_np.copy()
+        h = int(out.shape[0])
+        n_lift = min(h, self.exit_lift_waypoints)
+        hold_fraction = float(np.clip(self.exit_lift_hold_fraction, 0.0, 0.95))
+        release_radius = max(0.0, self.exit_lift_release_radius_xy)
+
+        for i in range(n_lift):
+            s = float(i + 1) / float(n_lift)
+            smooth = s * s * (3.0 - 2.0 * s)
+            z_min = current_z + smooth * lift_dz
+            out[i, 2] = max(out[i, 2], z_min)
+
+            if hold_fraction > 0.0:
+                if s <= hold_fraction:
+                    xy_release = 0.0
+                else:
+                    xy_release = (s - hold_fraction) / (1.0 - hold_fraction)
+                    xy_release = xy_release * xy_release
+                out[i, :2] = (
+                    current_fork_pos[:2]
+                    + xy_release * (original[i, :2] - current_fork_pos[:2])
+                )
+
+        if release_radius > 0.0:
+            for i in range(n_lift, h):
+                if np.linalg.norm(out[i, :2] - current_fork_pos[:2]) <= release_radius:
+                    out[i, 2] = max(out[i, 2], target_z)
+
+        if self.log_planner_exit_lift:
+            rospy.loginfo_throttle(
+                1.0,
+                "Planner exit lift applied | obs=%d rim_z=%.3f fork_z=%.3f "
+                "target_z=%.3f dz=%.3f waypoints=%d max_delta=%.3fm",
+                int(local_z_np.shape[0]),
+                rim_z,
+                current_z,
+                target_z,
+                lift_dz,
+                n_lift,
+                float(np.linalg.norm(out[:, :3] - original[:, :3], axis=1).max()),
+            )
+        return out
+
     def generate_safe_trajectory(self, obs_dict, curr_pos, P_obs, q_source, lam=1e-5):
         """PC-CASF: Prediction-Correction with CASF Metric Warping."""
         B = 1
@@ -1087,6 +1192,9 @@ class CASFGenerativeNode:
                 decay = 1.0 - float(i) / float(H_traj)
                 smoothed_traj_np[i, :3] -= start_offset * decay
         anchored_traj_np = smoothed_traj_np.copy()
+        smoothed_traj_np = self.apply_container_exit_lift(
+            smoothed_traj_np, current_fork_pos)
+        lifted_traj_np = smoothed_traj_np.copy()
 
         if self.log_planner_cartesian_debug:
             rospy.loginfo_throttle(
@@ -1094,7 +1202,8 @@ class CASFGenerativeNode:
                 "FM CART DEBUG | use_ens=%s cart_anchor=%s fork=[%.3f %.3f %.3f] "
                 "raw0=[%.3f %.3f %.3f] rawN=[%.3f %.3f %.3f] "
                 "ens0=[%.3f %.3f %.3f] ensN=[%.3f %.3f %.3f] "
-                "anch0=[%.3f %.3f %.3f] anchN=[%.3f %.3f %.3f]",
+                "anch0=[%.3f %.3f %.3f] anchN=[%.3f %.3f %.3f] "
+                "lift0=[%.3f %.3f %.3f] liftN=[%.3f %.3f %.3f]",
                 use_ensembler,
                 self.anchor_cartesian_start,
                 current_fork_pos[0], current_fork_pos[1], current_fork_pos[2],
@@ -1104,6 +1213,8 @@ class CASFGenerativeNode:
                 ensembled_traj_np[-1, 0], ensembled_traj_np[-1, 1], ensembled_traj_np[-1, 2],
                 anchored_traj_np[0, 0], anchored_traj_np[0, 1], anchored_traj_np[0, 2],
                 anchored_traj_np[-1, 0], anchored_traj_np[-1, 1], anchored_traj_np[-1, 2],
+                lifted_traj_np[0, 0], lifted_traj_np[0, 1], lifted_traj_np[0, 2],
+                lifted_traj_np[-1, 0], lifted_traj_np[-1, 1], lifted_traj_np[-1, 2],
             )
             
         # ================= NO INTERPOLATION =================

@@ -20,5 +20,12 @@
       <shadows>false</shadows>
     </scene>
 
+    <!-- Dynamic fixed-joint "grasp" plugin. fork_grasp_node calls
+         /link_attacher_node/attach to weld the food to the fork (the fork has
+         no collision geometry, so it cannot hold the cube physically) and
+         /detach to release it. Requires the gazebo_ros_link_attacher package
+         to be built and sourced in the workspace. -->
+    <plugin name="link_attacher" filename="libgazebo_ros_link_attacher.so"/>
+
   </world>
 </sdf>

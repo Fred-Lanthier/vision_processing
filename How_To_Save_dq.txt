@@ -6,6 +6,8 @@ ou
 
 roslaunch vision_processing green_cube_feeding_casf.launch       cbf_node_type:=cbf_safety_node_Bernstein_multicbf.py       cbf_direct_position_mode:=integrated
 
+roslaunch vision_processing green_cube_feeding_casf.launch     cbf_node_type:=cbf_safety_node_Bernstein_multicbf.py     cbf_direct_position_mode:=integrated     cbf_solver_mode:=fast_tangent     cbf_recovery_speed:=0.02     cbf_recovery_max_correction_speed:=0.55
+
 Pour sans CBF :
 
 roslaunch vision_processing green_cube_feeding_casf.launch       cbf_node_type:=cbf_safety_node_Bernstein_multicbf.py       cbf_direct_position_mode:=integrated       cbf_monitor_only:=true       contact_stop_enabled:=true       contact_stop_clearance:=0.0005
@@ -16,11 +18,11 @@ rosbag record -O run1.bag /cbf_safety/diagnostics /cbf_safety/diagnostics_layout
 
 pour les trajectoires, ajouté :
 
-rosbag record -O run4.bag /cbf_safety/diagnostics /cbf_safety/diagnostics_layout /joint_states /perception/persistent_obstacles
+rosbag record -O run12.bag /cbf_safety/diagnostics /cbf_safety/diagnostics_layout /joint_states /perception/persistent_obstacles
 
 When it is done, run :
 
-python3 scripts/plot_cbf_diagnostics.py run4.bag --csv for the plots of one bag
+python3 scripts/plot_cbf_diagnostics.py run12.bag --csv for the plots of one bag
 
 For comparison : 
 
