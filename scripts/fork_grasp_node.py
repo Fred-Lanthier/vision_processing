@@ -12,6 +12,12 @@ contact_distance, it welds the food to the fork with a dynamic fixed joint via
 gazebo_ros_link_attacher (/link_attacher_node/attach). This fires for contact
 anywhere on the fork and anywhere on the target. Release with /fork_grasp/release.
 
+On grasp it also snapshots the target's point cloud into the fork (`box_frame`)
+frame and republishes it each tick on /fork_grasp/grasped_cloud. The CBF turns
+that cloud into an extra protected + self-filtered "link" (distance-to-nearest-
+grasped-point SDF) that conforms to the real target shape and rides the fork.
+RViz can display the same topic to visualise the protected geometry.
+
 Requirements:
   * gazebo_ros_link_attacher built/sourced; its world plugin
     (libgazebo_ros_link_attacher.so) loaded in worlds/feeding.world.
@@ -23,9 +29,14 @@ Services:
 """
 import numpy as np
 import rospy
+import tf2_ros
+from geometry_msgs.msg import Point
+from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs.point_cloud2 as pc2
+from std_msgs.msg import Header
 from std_srvs.srv import Trigger, TriggerResponse
+from visualization_msgs.msg import Marker
 
 try:
     from scipy.spatial import cKDTree
@@ -66,12 +77,39 @@ class ForkGraspNode:
         self.auto_attach = bool(rospy.get_param("~auto_attach", True))
         self.rate_hz = float(rospy.get_param("~rate_hz", 30.0))
 
+        # Grasped object = the target's own point cloud, snapshotted in the fork
+        # frame at attach and re-published each tick (fresh stamp) so RViz and the
+        # CBF follow the fork via TF instead of freezing at the attach pose.
+        self.grasp_cloud_topic = rospy.get_param(
+            "~grasp_cloud_topic", "/fork_grasp/grasped_cloud")
+        self.box_frame = rospy.get_param("~box_frame", "fork_tip")
+        self.world_frame = rospy.get_param("~world_frame", "world")
+        # Snapshot source: the LIVE target (tight, current), not the accumulated
+        # persistent target (which smears since it is never freespace-evicted).
+        self.grasp_fit_topic = rospy.get_param("~box_fit_topic", "/perception/target")
+        # Drop snapshot points farther than this from the cloud median (smear).
+        self.grasp_crop_radius = float(rospy.get_param("~grasp_crop_radius", 0.05))
+        self.publish_viz = bool(rospy.get_param("~publish_viz", True))
+        # SDF envelope viz: one sphere per grasped point of radius
+        # grasp_point_radius (the CBF's SDF=0 surface). Set envelope_radius to
+        # grasp_point_radius + d_safe to instead see the CBF keep-out boundary.
+        self.envelope_radius = float(rospy.get_param("~envelope_radius", 0.012))
+        self.pub_grasp_cloud = rospy.Publisher(
+            self.grasp_cloud_topic, PointCloud2, queue_size=1, latch=True)
+        self.pub_envelope = rospy.Publisher(
+            "/viz/grasp_sdf_envelope", Marker, queue_size=1, latch=True)
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
         self.attached = False
         self._near_count = 0
         self._fork_pts = None
         self._fork_stamp = 0.0
         self._target_pts = None
         self._target_stamp = 0.0
+        self._fit_pts = None              # live target cloud (world frame)
+        self._fit_stamp = 0.0
+        self._grasp_cloud_fork = None     # snapshot in fork frame [M,3] (cached)
 
         self._attach_srv = None
         self._detach_srv = None
@@ -80,6 +118,9 @@ class ForkGraspNode:
         rospy.Subscriber(self.fork_topic, PointCloud2, self._fork_cb, queue_size=1)
         rospy.Subscriber(self.target_topic, PointCloud2, self._target_cb,
                          queue_size=1)
+        if self.grasp_fit_topic and self.grasp_fit_topic != self.target_topic:
+            rospy.Subscriber(self.grasp_fit_topic, PointCloud2, self._fit_cb,
+                             queue_size=1)
         rospy.Service("/fork_grasp/grab", Trigger, self._grab_srv)
         rospy.Service("/fork_grasp/release", Trigger, self._release_srv)
 
@@ -128,6 +169,10 @@ class ForkGraspNode:
         self._target_pts = _cloud_to_np(msg)
         self._target_stamp = rospy.get_time()
 
+    def _fit_cb(self, msg):
+        self._fit_pts = _cloud_to_np(msg)
+        self._fit_stamp = rospy.get_time()
+
     def _contact_distance(self):
         """Min distance between any fork point and any target point, or None if
         either cloud is missing or stale."""
@@ -159,6 +204,7 @@ class ForkGraspNode:
             rospy.loginfo("Spiked food: welded %s/%s to %s/%s.",
                           self.food_model, self.food_link,
                           self.robot_model, self.fork_link)
+            self._snapshot_grasp_cloud()
             return True
         except rospy.ServiceException as e:
             rospy.logwarn("attach failed: %s", e)
@@ -175,10 +221,85 @@ class ForkGraspNode:
             self._near_count = 0
             rospy.loginfo("Released food: detached %s from %s.",
                           self.food_model, self.robot_model)
+            self._clear_grasp_cloud()
             return True
         except rospy.ServiceException as e:
             rospy.logwarn("detach failed: %s", e)
             return False
+
+    # -- grasped cloud (protected/self-filtered by the CBF) ------------------
+    def _snapshot_grasp_cloud(self):
+        """Snapshot the target into the fork frame so it rides the fork. Uses the
+        live target (tight) and crops smear/outliers around the cloud median."""
+        now = rospy.get_time()
+        if self._fit_pts is not None and (now - self._fit_stamp) <= self.cloud_timeout:
+            pts = self._fit_pts                       # live target: tight, current
+        else:
+            pts = self._target_pts                    # fallback: persistent target
+        if pts is None or len(pts) < 3:
+            rospy.logwarn("No target points at grasp; skipping protected cloud.")
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.box_frame, self.world_frame, rospy.Time(0),
+                rospy.Duration(0.2))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn("Grasp cloud TF lookup failed (%s); skipping.", e)
+            return
+        q = tf.transform.rotation
+        t = tf.transform.translation
+        R = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+        t = np.array([t.x, t.y, t.z], dtype=np.float32)
+        p_fork = ((R @ pts.T).T + t).astype(np.float32)   # world -> fork frame
+
+        med = np.median(p_fork, axis=0)
+        keep = np.linalg.norm(p_fork - med, axis=1) <= self.grasp_crop_radius
+        if keep.sum() >= 3:
+            p_fork = p_fork[keep]
+
+        self._grasp_cloud_fork = p_fork
+        self._publish_grasp_cloud()
+        rospy.loginfo("Protected grasp cloud: %d pts in %s frame.",
+                      len(p_fork), self.box_frame)
+
+    def _publish_grasp_cloud(self):
+        """(Re)publish the cached snapshot in the fork frame with a fresh stamp,
+        so the CBF and RViz transform it through the live fork TF."""
+        if self._grasp_cloud_fork is None:
+            return
+        header = Header(stamp=rospy.Time.now(), frame_id=self.box_frame)
+        self.pub_grasp_cloud.publish(
+            pc2.create_cloud_xyz32(header, self._grasp_cloud_fork))
+        if self.publish_viz:
+            self._publish_envelope(Marker.ADD)
+
+    def _publish_envelope(self, action):
+        """SPHERE_LIST envelope of the grasped-cloud SDF: one sphere per point of
+        diameter 2*envelope_radius (the union = the SDF=0 isosurface)."""
+        m = Marker()
+        m.header.frame_id = self.box_frame
+        m.header.stamp = rospy.Time.now()
+        m.ns = "grasp_sdf_envelope"
+        m.id = 0
+        m.type = Marker.SPHERE_LIST
+        m.action = action
+        m.pose.orientation.w = 1.0
+        d = 2.0 * self.envelope_radius
+        m.scale.x, m.scale.y, m.scale.z = d, d, d
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.9, 0.3, 0.35
+        if action == Marker.ADD and self._grasp_cloud_fork is not None:
+            m.points = [Point(float(p[0]), float(p[1]), float(p[2]))
+                        for p in self._grasp_cloud_fork]
+        self.pub_envelope.publish(m)
+
+    def _clear_grasp_cloud(self):
+        self._grasp_cloud_fork = None
+        header = Header(stamp=rospy.Time.now(), frame_id=self.box_frame)
+        self.pub_grasp_cloud.publish(
+            pc2.create_cloud_xyz32(header, np.empty((0, 3), dtype=np.float32)))
+        if self.publish_viz:
+            self._publish_envelope(Marker.DELETE)
 
     def _grab_srv(self, _req):
         ok = self.attach()
@@ -192,7 +313,13 @@ class ForkGraspNode:
 
     # -- main loop -----------------------------------------------------------
     def _tick(self, _evt):
-        if self.attached or not self.auto_attach:
+        if self.attached:
+            # Republish the snapshot each tick (fresh stamp) so the CBF and RViz
+            # keep transforming it through the live fork TF. A once-latched cloud
+            # would freeze at its attach-time stamp and appear static.
+            self._publish_grasp_cloud()
+            return
+        if not self.auto_attach:
             return
         dist = self._contact_distance()
         if dist is not None and dist < self.contact_distance:

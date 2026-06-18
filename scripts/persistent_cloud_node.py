@@ -119,6 +119,11 @@ class PersistentCloudNode:
         tgt_voxel_size    = float(rospy.get_param("~target_voxel_size",       0.005))
         tgt_commit_thresh = int(rospy.get_param("~target_commit_threshold",   2))
         tgt_max_voxels    = int(rospy.get_param("~target_max_voxels",         20000))
+        # The target is rigid and small, but _tgt_world accumulates every frame
+        # with no freespace eviction, so it smears/grows over time/poses. Evict
+        # persistent target voxels farther than this from the current (live)
+        # target centroid to keep the cloud tight (<=0 disables the bound).
+        self.target_max_radius = float(rospy.get_param("~target_max_radius",  0.04))
 
         # ── Shared ────────────────────────────────────────────────────────────
         self.obs_voxel_size    = obs_voxel_size
@@ -347,6 +352,7 @@ class PersistentCloudNode:
         if len(pts) > 0:
             self._tgt_world.integrate(pts)
             new_centroid = pts.mean(axis=0).astype(np.float32)
+            self._bound_target(new_centroid)
 
             # Evict obs_world voxels coincident with the target cloud.  Necessary
             # on first target acquisition and whenever the target shifts.
@@ -379,6 +385,19 @@ class PersistentCloudNode:
             for p in tgt:
                 keep &= np.linalg.norm(obs_pts - p, axis=1) >= self._tgt_carve_margin
             return obs_pts[keep]
+
+    def _bound_target(self, centroid):
+        """Evict persistent target voxels farther than target_max_radius from the
+        current target centroid, so the accumulated cloud cannot smear/grow far
+        beyond the real (small, rigid) target."""
+        if self.target_max_radius <= 0.0:
+            return
+        pts, hashes = self._tgt_world.get_points_and_hashes(min_confidence=1)
+        if pts is None or len(pts) == 0:
+            return
+        far = np.linalg.norm(pts - centroid, axis=1) > self.target_max_radius
+        if far.any():
+            self._tgt_world.evict_hashes(np.sort(hashes[far]))
 
     def _evict_target_region(self, tgt_pts):
         """Evict obs_world voxels coincident with the target cloud (point-to-point

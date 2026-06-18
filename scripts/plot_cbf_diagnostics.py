@@ -171,6 +171,10 @@ def main():
                     help="safety margin used at runtime; the offline real "
                          "clearance is shifted by it to compare with h on the "
                          "same barrier-value axis (h_real = d_real - d_safe)")
+    ap.add_argument("--grasp-d-safe", type=float, default=0.002,
+                    help="grasped-target group safety margin (grasp_d_safe); used "
+                         "to annotate the h_groups figure. h_food already has it "
+                         "folded in (h_food=0 at clearance=grasp_d_safe).")
     ap.add_argument("--real-samples", type=int, default=1500,
                     help="surface samples per protected link for the offline "
                          "true-clearance overlay on h_evolution")
@@ -275,6 +279,32 @@ def main():
     ts.legend_top(ax)
     fig.tight_layout()
     ts.save(fig, outdir, "h_evolution")
+
+    # 1b. Per-group barriers (robot/fork vs grasped target) ----------------
+    # Two CBF groups, each with its own d_safe: the "h" field is the robot/fork
+    # group (d_safe); "h_food" is the grasped-target group (grasp_d_safe, already
+    # folded in). Each crosses 0 at its own margin, so they share the h axis.
+    # h_food is NaN before the grasp, so the target trace appears only once the
+    # separate constraint is active.
+    if "h_food" in s and np.isfinite(s["h_food"]).any():
+        fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))
+        ax.plot(t, s["h"], color=ts.BLUE, lw=1.0,
+                label=r"$h_{\mathrm{robot+fork}}$ ($d_{\mathrm{safe}}=%.0f$ mm)"
+                % (args.d_safe * 1e3))
+        ax.plot(t, s["h_food"], color=ts.ORANGE, lw=1.0,
+                label=r"$h_{\mathrm{cible}}$ ($d_{\mathrm{safe}}=%.0f$ mm)"
+                % (args.grasp_d_safe * 1e3))
+        ax.axhline(0.0, color="k", lw=0.8, ls="--")
+        shade_active(ax, t, cbf_active, ts.GREEN, "projection CBF")
+        ax.set_xlabel("t [s]")
+        ax.set_ylabel("h [m]")
+        ts.legend_top(ax)
+        fig.tight_layout()
+        ts.save(fig, outdir, "h_groups")
+    else:
+        print("[h_groups] no finite h_food in bag — skipping per-group barrier "
+              "figure (record a run with the grasp separate constraint active, "
+              "using the updated CBF node).")
 
     # 2. Velocity decomposition -------------------------------------------
     def disp_smooth(x):

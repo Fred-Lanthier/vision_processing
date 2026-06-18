@@ -102,6 +102,9 @@ DIAG_SCALAR_FIELDS = [
     "contact_stop",     # 1 = latched contact stop active (robot frozen)
     "h_hard",           # hard-min barrier on the same selected set
     "softmin_gap",      # h_hard - h; near 0 when alpha is effectively hard-min
+    "h_food",           # grasped-target group barrier (its own grasp_d_safe);
+                        # NaN unless two-group (grasp separate constraint) is on.
+                        # The base "h" field is then the robot/fork group barrier.
 ]
 
 
@@ -162,6 +165,38 @@ class CBFSafetyNode:
         self.barrier = BernsteinBarrier(self.bernstein_core, d_safe=self.d_safe, alpha=barrier_alpha)
         self._log_cuda_memory("CBF after Bernstein barrier")
 
+        # Grasped object: when the grasp node welds food to fork_tip it publishes
+        # the target's point cloud (in fork_tip frame); the core then treats it as
+        # an extra protected link (distance-to-nearest-grasped-point SDF) AND
+        # self-filters it. Configured BEFORE setup_cuda_graph so the grasp term is
+        # captured in the CUDA graph (fixed-size cloud buffer).
+        self.cbf_grasp_enabled = bool(rospy.get_param("~cbf_grasp_box_enabled", True))
+        # Apply the grasped object as its OWN QP half-space (food group) separate
+        # from the robot+fork group, each with its own d_safe, instead of folding
+        # it into the single min-over-links gradient (where the food's low d_safe
+        # lets it out-compete and starve the robot/fork correction).
+        self.cbf_grasp_separate_constraint = bool(rospy.get_param(
+            "~cbf_grasp_separate_constraint", True))
+        self.grasp_attach_link = str(rospy.get_param("~grasp_box_attach_link", "fork_tip"))
+        self.grasp_npts = int(rospy.get_param("~grasp_npts", 256))
+        self.grasp_point_radius = float(rospy.get_param("~grasp_point_radius", 0.012))
+        self.grasp_softmin_beta = float(rospy.get_param("~grasp_softmin_beta", 0.003))
+        # Split the selected-obstacle budget so the food (smaller d_safe, closest)
+        # cannot crowd out the robot/fork's nearby points: reserve this many of
+        # cbf_graph_points for food-nearest points, the rest for robot/fork-nearest.
+        self.cbf_grasp_obstacle_points = int(rospy.get_param(
+            "~cbf_grasp_obstacle_points", 25))
+        # Per-link d_safe for the grasped object (<0 => use the global d_safe).
+        # Lower than the global d_safe so the carried food can pass close
+        # obstacles (e.g. the container rim on exit) without braking.
+        grasp_d_safe = float(rospy.get_param("~grasp_d_safe", -1.0))
+        grasp_d_safe = None if grasp_d_safe < 0.0 else grasp_d_safe
+        if self.cbf_grasp_enabled:
+            self.bernstein_core.configure_grasp_cloud(
+                self.grasp_attach_link, self.grasp_npts, self.grasp_point_radius,
+                softmin_beta=self.grasp_softmin_beta,
+                d_safe_global=self.d_safe, grasp_d_safe=grasp_d_safe)
+
         # kappa: class-K coefficient in the CBF constraint ∇h·dq + κh ≥ 0.
         # High kappa forces hard corrections even when h is slightly positive (safe).
         # With a jumpy gradient, high kappa amplifies oscillation near obstacles.
@@ -195,6 +230,21 @@ class CBFSafetyNode:
             "~cbf_max_correction_speed", 0.35))
         self.cbf_recovery_max_correction_speed = max(
             0.0, float(rospy.get_param("~cbf_recovery_max_correction_speed", 0.0)))
+        # Per-group overrides for the grasped-TARGET half-space. The values above
+        # govern the fork+robot group; these govern the target group so its
+        # smaller d_safe can have its own braking band / recovery authority. Each
+        # defaults to the fork+robot value, so omitting them keeps both groups
+        # identical (current behavior).
+        self.cbf_grasp_h_activate = float(rospy.get_param(
+            "~cbf_grasp_h_activate", self.cbf_h_activate))
+        self.cbf_grasp_max_inward_speed = float(rospy.get_param(
+            "~cbf_grasp_max_inward_speed", self.cbf_max_inward_speed))
+        self.cbf_grasp_recovery_speed = float(rospy.get_param(
+            "~cbf_grasp_recovery_speed", self.cbf_recovery_speed))
+        self.cbf_grasp_recovery_depth = float(rospy.get_param(
+            "~cbf_grasp_recovery_depth", self.cbf_recovery_depth))
+        self.cbf_grasp_max_correction_speed = float(rospy.get_param(
+            "~cbf_grasp_max_correction_speed", self.cbf_max_correction_speed))
         # Repair gradient gate. When |grad_h| falls below this the obstacle
         # geometry is degenerate/conflicting (e.g. the fork wedged between both
         # walls of a slim container, where opposing per-point gradients cancel):
@@ -255,6 +305,19 @@ class CBFSafetyNode:
         self.last_cbf_position_delta = None
 
         self.cbf_graph_points = max(1, int(rospy.get_param("~cbf_graph_points", 100)))
+        # Point partition for the two-group barrier: the first n_obs_robot of the
+        # cbf_graph_points selected points feed the robot/fork constraint, the
+        # remaining cbf_grasp_obstacle_points feed the target constraint.
+        # _split_select_obstacles orders the selection as [robot... | food...] to
+        # match this boundary, baked into the CUDA graph below.
+        self.n_obs_robot_split = max(
+            1, self.cbf_graph_points - max(0, self.cbf_grasp_obstacle_points))
+        # Alternating-projection passes over the two group half-spaces (POCS).
+        # 1 = single food-then-robot pass (only the robot constraint is then
+        # guaranteed); >1 iterates so BOTH the target and fork+robot half-spaces
+        # are satisfied at convergence. Baked into the CUDA graph below.
+        self.cbf_two_group_iters = max(
+            1, int(rospy.get_param("~cbf_two_group_iters", 6)))
         preprocess_max_points = int(rospy.get_param("~preprocess_max_points", 512))
         self.preprocess_max_points = (
             max(self.cbf_graph_points, preprocess_max_points)
@@ -432,7 +495,7 @@ class CBFSafetyNode:
         # (39:46 dq_ff, 46:53 dq_fb, 53:60 solver output, 60 repair flag,
         #  61 final constraint, 62 pre-projection constraint, 63 |grad_h|,
         #  64:71 dq_escape).
-        self.transfer_buffer = torch.zeros(71, dtype=torch.float32, device=self.device)
+        self.transfer_buffer = torch.zeros(72, dtype=torch.float32, device=self.device)
         # Hot-path command buffer: dq_final, q_safe, h, constr. Keep diagnostics
         # out of this copy so command publication is not blocked by telemetry.
         self.command_buffer = torch.zeros(16, dtype=torch.float32, device=self.device)
@@ -447,7 +510,11 @@ class CBFSafetyNode:
         rospy.Subscriber(self.nominal_velocity_topic, Float64MultiArray, self._nominal_vel_cb)
         obs_topic = rospy.get_param("~obs_topic", "/perception/persistent_obstacles")
         rospy.Subscriber(obs_topic, PointCloud2, self.obs_callback)
-        
+        if self.cbf_grasp_enabled:
+            grasp_cloud_topic = rospy.get_param("~grasp_cloud_topic", "/fork_grasp/grasped_cloud")
+            rospy.Subscriber(grasp_cloud_topic, PointCloud2, self._grasp_cloud_cb,
+                             queue_size=1)
+
         self.cmd_pub = rospy.Publisher('/franka_control/safe_joint_velocities', Float32MultiArray, queue_size=1)
         self.pos_cmd_pub = None
         if self.publish_controller_command:
@@ -844,6 +911,28 @@ class CBFSafetyNode:
                 float(predicted.item()),
             )
 
+    def _grasp_cloud_cb(self, msg):
+        """Grasped target cloud from the grasp node, in the attach-link (fork_tip)
+        frame. Sampled/padded to the fixed buffer size and written into the core;
+        the CUDA graph picks it up on the next replay. Empty cloud => released."""
+        core = self.bernstein_core
+        if core.grasp_points is None:
+            return
+        try:
+            pts = np.frombuffer(msg.data, dtype=np.float32).reshape(
+                -1, int(msg.point_step / 4))[:, :3]
+        except Exception:
+            return
+        M = core.grasp_npts
+        n = len(pts)
+        if n == 0:
+            core.grasp_active.zero_()
+            return
+        idx = np.random.choice(n, M, replace=(n < M))
+        core.grasp_points.copy_(
+            torch.from_numpy(pts[idx].copy()).to(self.device, dtype=torch.float32))
+        core.grasp_active.fill_(1.0)
+
     def setup_cuda_graph(self, batch_size=1, n_points=100):
         """
         Single unified CUDA graph:
@@ -858,6 +947,11 @@ class CBFSafetyNode:
         self.static_dq_nom = torch.zeros((batch_size, 7), device=self.device)
         self.static_dq_safe = torch.zeros((batch_size, 7), device=self.device)
         self.static_h      = torch.zeros((batch_size,), device=self.device)
+        # Target (grasped-food) group barrier, retained for diagnostics only. The
+        # two-group solve computes it but otherwise overwrites static_h with the
+        # robot/fork value; keep a copy here so both can be plotted. NaN until the
+        # two-group path writes it (so the diagnostic reads NaN when no grasp).
+        self.static_h_food = torch.full((batch_size,), float('nan'), device=self.device)
         self.static_constr = torch.zeros((batch_size,), device=self.device)
         self.static_grad_h = torch.zeros((batch_size, 7), device=self.device)
         self.graph = None
@@ -867,13 +961,26 @@ class CBFSafetyNode:
 
         # Capture scalars as Python floats so the CUDA graph bakes in the params.
         constraint_margin = self.cbf_constraint_margin
-        h_activate = max(self.cbf_h_activate, 1e-6)
-        max_inward_speed = max(0.0, self.cbf_max_inward_speed)
-        recovery_speed = max(0.0, self.cbf_recovery_speed)
-        recovery_depth = max(self.cbf_recovery_depth, 1e-6)
-        max_correction_speed = max(0.0, self.cbf_max_correction_speed)
+        # Per-group band/recovery constants, baked at capture. The fork+robot set
+        # and the grasped-target set are passed explicitly to _qp_step so each
+        # half-space brakes/recovers with its own authority.
+        robot_band = (
+            max(self.cbf_h_activate, 1e-6),
+            max(0.0, self.cbf_max_inward_speed),
+            max(0.0, self.cbf_recovery_speed),
+            max(self.cbf_recovery_depth, 1e-6),
+            max(0.0, self.cbf_max_correction_speed),
+        )
+        food_band = (
+            max(self.cbf_grasp_h_activate, 1e-6),
+            max(0.0, self.cbf_grasp_max_inward_speed),
+            max(0.0, self.cbf_grasp_recovery_speed),
+            max(self.cbf_grasp_recovery_depth, 1e-6),
+            max(0.0, self.cbf_grasp_max_correction_speed),
+        )
 
-        def _qp_step(h, grad_h, dq_in):
+        def _qp_step(h, grad_h, dq_in, h_activate, max_inward_speed,
+                     recovery_speed, recovery_depth, max_correction_speed):
             self.static_h.copy_(h)
             # Tangent-preserving fast CBF:
             # - outside activation: no correction
@@ -909,6 +1016,36 @@ class CBFSafetyNode:
             )
             return dq_safe
 
+        # Two-group mode: robot/fork and the grasped object are separate QP
+        # half-spaces (each its own d_safe). A single food-then-robot pass only
+        # guarantees the LAST (robot) constraint; alternating the two projections
+        # (POCS) with the gradients fixed at the current q converges to a dq that
+        # satisfies BOTH half-spaces. Ending on the robot step leaves static_h /
+        # static_constr / static_grad_h set to the robot group for the repair.
+        two_group = (self.cbf_grasp_enabled and self.cbf_grasp_separate_constraint)
+        n_robot = self.bernstein_core.K
+        two_group_iters = self.cbf_two_group_iters
+
+        def _solve(dq_nom):
+            if two_group:
+                h_r, g_r, h_f, g_f = self.barrier.forward_two_group(
+                    self.static_q, self.static_obs, n_robot,
+                    n_obs_robot=self.n_obs_robot_split)
+                # Retain the target barrier for diagnostics before _qp_step
+                # overwrites static_h with each group's value in turn. Capped at
+                # 0.25 for the diagnostic only (the QP still uses the true h_f
+                # below); far-from-obstacle spikes otherwise squash the plot.
+                self.static_h_food.copy_(torch.clamp(h_f, max=0.25))
+                dq = dq_nom
+                for _ in range(two_group_iters):
+                    dq = _qp_step(h_f, g_f, dq, *food_band)    # target half-space
+                    dq = _qp_step(h_r, g_r, dq, *robot_band)   # fork+robot (last)
+                self.static_grad_h.copy_(g_r)
+                return dq
+            h, g, _ = self.barrier(self.static_q, self.static_obs)
+            self.static_grad_h.copy_(g)
+            return _qp_step(h, g, dq_nom, *robot_band)
+
         # ── Warmup ────────────────────────────────────────────────────────────
         def _warmup():
             s = torch.cuda.Stream()
@@ -916,9 +1053,7 @@ class CBFSafetyNode:
             with torch.cuda.stream(s):
                 for _ in range(3):
                     if self.static_q.grad is not None: self.static_q.grad.zero_()
-                    h_w, g_w, _ = self.barrier(self.static_q, self.static_obs)
-                    self.static_grad_h.copy_(g_w)
-                    self.static_dq_safe.copy_(_qp_step(h_w, g_w, self.static_dq_nom))
+                    self.static_dq_safe.copy_(_solve(self.static_dq_nom))
             torch.cuda.current_stream().wait_stream(s)
 
         _warmup()
@@ -928,9 +1063,7 @@ class CBFSafetyNode:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             if self.static_q.grad is not None: self.static_q.grad.zero_()
-            h, g, _ = self.barrier(self.static_q, self.static_obs)
-            self.static_grad_h.copy_(g)
-            self.static_dq_safe.copy_(_qp_step(h, g, self.static_dq_nom))
+            self.static_dq_safe.copy_(_solve(self.static_dq_nom))
 
         print(f"✅ Graphe CUDA capturé ({n_points} points) !")
         self._log_cuda_memory("CBF setup_cuda_graph captured")
@@ -1514,6 +1647,40 @@ class CBFSafetyNode:
                 markers.markers.append(m)
         self.pub_cbf_velocity_arrows.publish(markers)
 
+    def _split_select_obstacles(self, pts, q9, link_poses):
+        """Split the cbf_graph_points budget between the robot/fork group and the
+        grasped-food group, ranking each by ITS OWN per-link SDF. Prevents the
+        food (smaller d_safe, closest) from taking all the slots and starving the
+        robot/fork constraint. Returns the chosen obstacle points [M<=graph_points, 3]."""
+        n_pts = int(pts.shape[0])
+        n_food = max(0, min(self.cbf_grasp_obstacle_points, self.cbf_graph_points))
+        n_robot = self.cbf_graph_points - n_food
+        if q9 is None:
+            q9 = torch.cat([self.current_q.detach(), self.q_pad2], dim=1)
+        _, sdf_pl = self.bernstein_core.get_whole_body_sdf_batch(
+            pts, self.eye4, q9, return_per_link=True, link_poses=link_poses)
+        K = self.bernstein_core.K
+        sdf_robot = sdf_pl[0, :K, :].min(dim=0).values            # nearest robot/fork link
+        if sdf_pl.shape[1] <= K:                                  # no food link → no split
+            k = min(self.cbf_graph_points, n_pts)
+            _, idx = torch.topk(sdf_robot, k=k, largest=False)
+            return pts[idx]
+        sdf_food = sdf_pl[0, K, :]                                # grasped-food link
+        n_robot = min(n_robot, n_pts)
+        _, idx_robot = torch.topk(sdf_robot, k=max(n_robot, 1), largest=False)
+        # Food-nearest points that are not already chosen for the robot group.
+        keep = torch.ones(n_pts, dtype=torch.bool, device=self.device)
+        keep[idx_robot] = False
+        n_food = min(n_food, int(keep.sum()))
+        if n_food > 0:
+            food_scores = torch.where(keep, sdf_food,
+                                      torch.full_like(sdf_food, float('inf')))
+            _, idx_food = torch.topk(food_scores, k=n_food, largest=False)
+            chosen = torch.cat([idx_robot, idx_food])
+        else:
+            chosen = idx_robot
+        return pts[chosen]
+
     def _copy_fixed_obstacles(self, obs):
         n = min(int(obs.shape[0]), self.cbf_graph_points)
         if n == self.cbf_graph_points:
@@ -1950,7 +2117,21 @@ class CBFSafetyNode:
                 self.debug_tip_min = pts_inside[tip_min_idx].detach()
                 mark_stage("debug_seed")
 
-                if num_inside > self.cbf_graph_points:
+                split_select = (
+                    self.cbf_grasp_enabled
+                    and self.cbf_grasp_separate_constraint
+                    and self.cbf_grasp_obstacle_points > 0
+                    and self.cbf_selection_metric in ("sdf", "fork_sdf")
+                    and float(self.bernstein_core.grasp_active) > 0.5
+                    and num_inside > self.cbf_graph_points
+                )
+                if split_select:
+                    # Per-group budget: robot/fork-nearest + food-nearest, so the
+                    # food cannot crowd the robot/fork points out of the QP set.
+                    obs = self._split_select_obstacles(
+                        pts_inside, q9, link_poses_current)
+                    pts_yellow = torch.empty((0, 3), dtype=torch.float32, device=self.device)
+                elif num_inside > self.cbf_graph_points:
                     if self.cbf_cluster_mode == "topk":
                         # Diagnostic/global mode: protect the k lowest-score
                         # points even if they are split across the bowl/scene.
@@ -2560,6 +2741,8 @@ class CBFSafetyNode:
                             )
                             self.transfer_buffer[14].copy_(h_now.squeeze(0))
                             self.transfer_buffer[15].copy_(self.static_constr.squeeze(0))
+                            self.transfer_buffer[71].copy_(
+                                self.static_h_food.detach().view(-1)[0])
                             self.transfer_buffer[62].copy_((
                                 (grad_h_dbg * dq_nom_base).sum(dim=1)
                                 + kappa_dbg * h_now
@@ -2727,6 +2910,7 @@ class CBFSafetyNode:
                         1.0 if self._contact_stopped else 0.0,
                         h_hard_val,
                         softmin_gap_val,
+                        float(cpu_buffer[71]) if self.enable_cbf else nan,  # h_food
                     ]
                     self.diag_pub.publish(Float32MultiArray(data=(
                         cpu_buffer[39:46].tolist()                 # dq_ff

@@ -78,7 +78,7 @@
   <arg name="cbf_kappa" default="3.0" />
   <arg name="cbf_recovery_kappa" default="5.0" />
   <arg name="cbf_constraint_margin" default="0.001" />
-  <arg name="cbf_recovery_switch_margin" default="0.000" />
+  <arg name="cbf_recovery_switch_margin" default="0.015" />
   <arg name="cbf_enforce_final_constraint" default="true" />
   <arg name="cbf_integrate_from_current" default="true" />
   <arg name="cbf_command_dt" default="0.05" />
@@ -96,13 +96,13 @@
   <arg name="cbf_kp" default="5.0" />
   <arg name="max_feedback_velocity" default="0.5" />
   <arg name="cbf_filter_tau" default="0.05" />
-  <arg name="cbf_velocity_filter_tau" default="0.05" />
+  <arg name="cbf_velocity_filter_tau" default="0.2" />
   <arg name="cbf_use_nominal_velocity_topic" default="true" />
   <arg name="cbf_nominal_velocity_timeout" default="0.25" />
   <arg name="cbf_nominal_feedforward_gain" default="1.0" />
   <arg name="cbf_escape_enabled" default="false" />
-  <arg name="cbf_escape_h_trigger" default="0.006" />
-  <arg name="cbf_escape_h_release" default="0.012" />
+  <arg name="cbf_escape_h_trigger" default="0.015" />
+  <arg name="cbf_escape_h_release" default="0.015" />
   <arg name="cbf_escape_use_bias_corrected_h" default="false" />
   <arg name="cbf_escape_activation_cycles" default="2" />
   <arg name="cbf_escape_min_cbf_delta" default="0.02" />
@@ -137,7 +137,11 @@
   <arg name="persistent_dilate_cloud" default="false" />
   <arg name="persistent_publish_rate_hz" default="30.0" />
   <arg name="persistent_target_exclusion_radius" default="0.005" />
-  <arg name="persistent_generate_synthetic_floor" default="true" />
+  <!-- Keep the accumulated target tight: evict persistent target voxels farther
+       than this from the current target centroid (it otherwise smears/grows and
+       inflates the synthetic floor that blocks the descent). <=0 disables. -->
+  <arg name="persistent_target_max_radius" default="0.04" />
+  <arg name="persistent_generate_synthetic_floor" default="false" />
   <arg name="persistent_floor_sample_radius"      default="0.12" />
   <arg name="persistent_floor_grid_radius"        default="0.05" />
   <arg name="persistent_floor_grid_resolution"    default="0.005" />
@@ -181,12 +185,12 @@
   <arg name="cbf_active_constraints" default="4" />
   <arg name="cbf_multi_gradient_mode" default="finite_difference" />
   <arg name="cbf_multi_fd_eps" default="0.001" />
-  <arg name="cbf_h_activate" default="0.00" />
+  <arg name="cbf_h_activate" default="0.005" />
   <arg name="cbf_max_inward_speed" default="0.20" />
-  <arg name="cbf_recovery_speed" default="0.0" />
-  <arg name="cbf_recovery_depth" default="0.01" />
-  <arg name="cbf_max_correction_speed" default="0.35" />
-  <arg name="cbf_recovery_max_correction_speed" default="0.0" />
+  <arg name="cbf_recovery_speed" default="0.02" />
+  <arg name="cbf_recovery_depth" default="0.015" />
+  <arg name="cbf_max_correction_speed" default="0.20" />
+  <arg name="cbf_recovery_max_correction_speed" default="0.55" />
   <arg name="cbf_projection_iters" default="3" />
   <arg name="cbf_projection_relaxation" default="1.0" />
   <arg name="cbf_tracking_feedback_mode" default="tangent_near" />
@@ -232,6 +236,49 @@
   <arg name="depth_topic" default="/camera_wrist/aligned_depth_to_color/image_raw" />
   <arg name="info_topic" default="/camera_wrist/color/camera_info" />
   <arg name="launch_rviz" default="true" />
+  <!-- Declared here (before the CBF node) so the CBF block can gate the
+       grasped-object box on it; the grasp node itself is defined later. -->
+  <arg name="grasp_enabled" default="true" />
+  <!-- Whether the CBF treats the grasped food as a protected/self-filtered link.
+       Decoupled from grasp_enabled so you can keep welding+viz while turning the
+       protection OFF (it makes the carried food unable to pass close obstacles,
+       e.g. the container rim on exit). -->
+  <arg name="cbf_grasp_sdf_enabled" default="true" />
+  <!-- Apply the grasped object as its own QP half-space (its own d_safe) instead
+       of folding it into the single min-over-links gradient (so the food can't
+       starve the robot/fork correction). -->
+  <arg name="cbf_grasp_separate_constraint" default="true" />
+  <!-- Of cbf_graph_points selected obstacles, reserve this many for the food
+       group; the rest go to the robot/fork group. Stops the food (smaller d_safe,
+       closest) from taking all the slots and starving the robot/fork constraint. -->
+  <arg name="cbf_grasp_obstacle_points" default="25" />
+  <!-- Alternating-projection passes over the two group half-spaces (POCS).
+       1 = single food-then-robot pass (only the robot constraint is then
+       guaranteed); >1 iterates so BOTH the target and fork+robot half-spaces
+       are satisfied at convergence. -->
+  <arg name="cbf_two_group_iters" default="6" />
+  <!-- Per-group braking/recovery band for the grasped-TARGET half-space. The
+       cbf_* args above govern the fork+robot group; these govern the target
+       group so its smaller d_safe gets its own proactive braking band and
+       recovery authority. Each defaults to the fork+robot value, so leaving them
+       unset keeps both groups identical. Raise cbf_grasp_h_activate (e.g.
+       0.03-0.05) to give the target the same pre-contact braking that prevents
+       h_food crossing 0. Note the target band lives in h_food space (its own
+       grasp_d_safe + the soft-min bias). -->
+  <arg name="cbf_grasp_h_activate"           default="0.001" />
+  <arg name="cbf_grasp_max_inward_speed"     default="0.20" />
+  <arg name="cbf_grasp_recovery_speed"       default="0.02" />
+  <arg name="cbf_grasp_recovery_depth"       default="0.001" />
+  <arg name="cbf_grasp_max_correction_speed" default="0.55" />
+  <!-- Grasped-object SDF params (declared before the CBF node, which reads them).
+       grasp_point_radius: sphere radius (m) per grasped point.
+       grasp_softmin_beta: soft-min temperature (m) for a smooth SDF gradient.
+       grasp_d_safe: the grasped object's own clearance margin (m); <0 = use the
+       global d_safe. Lower it so the carried food can pass close obstacles (the
+       container rim on exit) without braking. -->
+  <arg name="grasp_point_radius" default="0.0002" />
+  <arg name="grasp_softmin_beta" default="0.003" />
+  <arg name="grasp_d_safe" default="0.002" />
 
   <!-- 3. Dual SAM3+SAM2 Detector -->
   <!-- Tracks the target and publishes a 2D mask -->
@@ -300,6 +347,7 @@
         <param name="dilate_published_cloud" value="$(arg persistent_dilate_cloud)" />
         <param name="publish_rate_hz"          value="$(arg persistent_publish_rate_hz)" />
         <param name="target_exclusion_radius"       value="$(arg persistent_target_exclusion_radius)" />
+        <param name="target_max_radius"             value="$(arg persistent_target_max_radius)" />
         <param name="generate_synthetic_floor"      value="$(arg persistent_generate_synthetic_floor)" />
         <param name="floor_sample_radius"           value="$(arg persistent_floor_sample_radius)" />
         <param name="floor_grid_radius"             value="$(arg persistent_floor_grid_radius)" />
@@ -497,6 +545,27 @@
         <param name="contact_stop_cycles" value="$(arg contact_stop_cycles)" />
         <param name="log_trajectory_timing" value="$(arg log_trajectory_timing)" />
         <param name="barrier_alpha" value="$(arg barrier_alpha)" />
+        <!-- Treat the grasped food's point cloud (published by fork_grasp) as an
+             extra protected + self-filtered link rigidly attached to fork_tip. -->
+        <param name="cbf_grasp_box_enabled" value="$(arg cbf_grasp_sdf_enabled)" />
+        <param name="cbf_grasp_separate_constraint" value="$(arg cbf_grasp_separate_constraint)" />
+        <param name="cbf_grasp_obstacle_points" value="$(arg cbf_grasp_obstacle_points)" />
+        <param name="cbf_two_group_iters" value="$(arg cbf_two_group_iters)" />
+        <!-- Per-group braking/recovery band for the grasped-target half-space. -->
+        <param name="cbf_grasp_h_activate" value="$(arg cbf_grasp_h_activate)" />
+        <param name="cbf_grasp_max_inward_speed" value="$(arg cbf_grasp_max_inward_speed)" />
+        <param name="cbf_grasp_recovery_speed" value="$(arg cbf_grasp_recovery_speed)" />
+        <param name="cbf_grasp_recovery_depth" value="$(arg cbf_grasp_recovery_depth)" />
+        <param name="cbf_grasp_max_correction_speed" value="$(arg cbf_grasp_max_correction_speed)" />
+        <param name="grasp_box_attach_link" value="fork_tip" />
+        <param name="grasp_cloud_topic" value="/fork_grasp/grasped_cloud" />
+        <param name="grasp_npts" value="256" />
+        <param name="grasp_point_radius" value="$(arg grasp_point_radius)" />
+        <!-- Soft-min temperature over grasped points: smooths the SDF gradient
+             (no jumps when the nearest grasped point switches). Lower = sharper
+             (closer to hard min, less bias); 0 = hard min. -->
+        <param name="grasp_softmin_beta" value="$(arg grasp_softmin_beta)" />
+        <param name="grasp_d_safe" value="$(arg grasp_d_safe)" />
         <param name="d_safe"       value="$(arg d_safe)" />
         <param name="publish_safety_envelope" value="$(arg cbf_publish_safety_envelope)" />
         <param name="safety_envelope_resolution" value="$(arg cbf_safety_envelope_resolution)" />
@@ -560,10 +629,14 @@
   <!-- Welds the food to the fork via gazebo_ros_link_attacher when any fork
        point (/vision/fork_cloud) touches any target point
        (/perception/persistent_target). Contact anywhere on the fork / anywhere
-       on the target triggers the weld. Disable with grasp_enabled:=false. -->
-  <arg name="grasp_enabled" default="true" />
-  <arg name="grasp_contact_distance" default="0.012" />
+       on the target triggers the weld. Disable with grasp_enabled:=false
+       (grasp_enabled is declared earlier, before the CBF node). -->
+  <arg name="grasp_contact_distance" default="0.002" />
   <arg name="grasp_contact_cycles" default="2" />
+  <!-- Crop radius (m) around the snapshot median; drops smeared/outlier points. -->
+  <arg name="grasp_crop_radius" default="0.02" />
+  <!-- grasp_point_radius / grasp_softmin_beta / grasp_d_safe declared earlier
+       (before the CBF node), since the CBF block reads them too. -->
   <node name="fork_grasp" pkg="vision_processing" type="fork_grasp_node.py"
         output="screen" if="$(arg grasp_enabled)">
         <param name="robot_model" value="panda" />
@@ -575,6 +648,19 @@
         <param name="contact_distance" value="$(arg grasp_contact_distance)" />
         <param name="contact_cycles" value="$(arg grasp_contact_cycles)" />
         <param name="auto_attach" value="true" />
+        <!-- Protected/self-filtered grasped cloud, published to the CBF and to
+             RViz (display the PointCloud2 /fork_grasp/grasped_cloud). -->
+        <param name="grasp_cloud_topic" value="/fork_grasp/grasped_cloud" />
+        <param name="box_frame" value="fork_tip" />
+        <param name="world_frame" value="world" />
+        <!-- Snapshot from the live (tight) target, not the accumulated one. -->
+        <param name="box_fit_topic" value="/perception/target" />
+        <param name="grasp_crop_radius" value="$(arg grasp_crop_radius)" />
+        <!-- SDF envelope marker (/viz/grasp_sdf_envelope): per-point sphere
+             radius = the CBF's grasp_point_radius, so it shows the SDF=0 surface.
+             Use grasp_point_radius + d_safe to show the CBF keep-out boundary. -->
+        <param name="envelope_radius" value="$(arg grasp_point_radius)" />
+        <param name="publish_viz" value="$(arg launch_rviz)" />
   </node>
 
   <!-- 10. RViz Visualization -->

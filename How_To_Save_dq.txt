@@ -22,7 +22,7 @@ rosbag record -O run12.bag /cbf_safety/diagnostics /cbf_safety/diagnostics_layou
 
 When it is done, run :
 
-python3 scripts/plot_cbf_diagnostics.py run12.bag --csv for the plots of one bag
+python3 scripts/plot_cbf_diagnostics.py run16.bag --csv for the plots of one bag
 
 For comparison : 
 
