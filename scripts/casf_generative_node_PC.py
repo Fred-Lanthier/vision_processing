@@ -106,6 +106,7 @@ sys.path.insert(0, pkg_path)
 if scripts_path not in sys.path:
     sys.path.insert(0, scripts_path)
 sys.path.append(os.path.join(pkg_path, 'src', 'vision_processing', 'diffusion_model_train'))
+from pipeline_timing import TimingPublisher
 
 # Two checkpoint families share the same U-Net architecture but use different
 # normalizers:
@@ -172,7 +173,9 @@ class CASFGenerativeNode:
     def __init__(self):
         rospy.init_node('casf_generative_node_PC')
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+        # Per-stage timing -> /pipeline/timing/* (recorded in the bag for section 5.6)
+        self.timing = TimingPublisher(enabled=rospy.get_param('~publish_timing', True))
+
         # Paths and Parameters
         urdf_path_raw = rospy.get_param("~urdf_path", pkg_path + '/urdf/panda_camera.xacro')
         
@@ -1148,8 +1151,14 @@ class CASFGenerativeNode:
         self._q_warm = q_warm
 
         t_total = time.perf_counter() - t_start
+        self.timing.publish('fm_encode', t_fm_encode * 1000.0)
+        self.timing.publish('fm_generation', t_fm_pred * 1000.0)
+        self.timing.publish('fm_correction', t_fm_corr * 1000.0)
+        self.timing.publish('ik_correction', t_ik_total * 1000.0)
+        self.timing.publish('casf_warp', t_casf_total * 1000.0)
+        self.timing.publish('planner_total', t_total * 1000.0)
         plan_label = "PC-CASF" if self.enable_casf_correction else "PC-FM"
-        rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] {plan_label} Plan generated in {t_total*1000:.2f}ms | FM Encode={t_fm_encode*1000:.2f}ms, Pred FM={t_fm_pred*1000:.2f}ms, Corr FM={t_fm_corr*1000:.2f}ms, IK={t_ik_total*1000:.2f}ms, CASF={t_casf_total*1000:.2f}ms")
+        rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] {plan_label} Plan generated in {t_total*1000:.2f}ms | FM Encode={t_fm_encode*1000:.2f}ms, Pred FM={t_fm_pred*1000:.2f}ms, Corr FM={t_fm_corr*1000:.2f}ms, IK_corr={t_ik_total*1000:.2f}ms, CASF={t_casf_total*1000:.2f}ms")
         return A
 
     def publish_joint_trajectory(self, A_norm, pos_fork, q_source, t_capture, use_ensembler=True):
@@ -1283,7 +1292,12 @@ class CASFGenerativeNode:
         t_ik_start = time.perf_counter()
         q_traj = self.ik_solver.solve_batch(se3_tcp_list, q_init)
         t_publish_ik = time.perf_counter() - t_ik_start
-        
+        # Canonical IK cost: the batch solve that turns the FM Cartesian fork-tip
+        # trajectory into the joint position trajectory q_traj. Runs every plan,
+        # so this is the IK number for the §5.6 timing table (the correction-loop
+        # IK is published separately as 'ik_correction' and is 0 when CASF is off).
+        self.timing.publish('ik', t_publish_ik * 1000.0)
+
         if len(q_traj) == 0: return
         
         # Unwrap joints to prevent 2*pi jumps and ensure continuity with current_q
@@ -1387,6 +1401,7 @@ class CASFGenerativeNode:
             msg.points.append(point)
             
         self.traj_pub.publish(msg)
+        self.timing.publish('trajectory_build', (time.perf_counter() - t_build_start) * 1000.0)
         if self.log_trajectory_timing:
             if len(q_traj) > 1:
                 q_arm = np.asarray(q_traj)[:, :7]

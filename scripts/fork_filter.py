@@ -7,13 +7,23 @@ configuration.  We exploit this to filter fork points with:
 
   Strategy C (primary)  — zero fork pixels in the raw depth image before any
                           3D projection, so fork points never become obstacles.
-  Strategy B (backup)   — capsule distance filter on 3D points still in camera
-                          frame, catching any pixels that leaked through the
-                          depth-discontinuity boundary of the 2D mask.
+  Strategy B (backup)   — 3D distance filter on points still in camera frame,
+                          catching pixels that leaked through the depth-edge
+                          boundary of the 2D mask. Two flavours:
+                            • capsule  — cheap analytic cylinder, loose
+                            • sdf      — distance to the TRUE fork surface
+                                         (fork_tip.stl), tight 5 mm shell.
+                          The SDF flavour hugs the real tine geometry, so it
+                          removes near-fork leaks without erasing real obstacles
+                          a centimetre away (the bowl rim during the grasp),
+                          which the 3 cm capsule cannot do.
 
-All geometry is computed ONCE at startup from the URDF joint chain.
-No FK is needed at runtime.
+All geometry is computed ONCE at startup from the URDF joint chain (the fork is
+rigid in the camera frame), so the filter is a constant KD-tree query at runtime
+— no per-frame FK.
 """
+
+import os
 
 import numpy as np
 import cv2
@@ -46,10 +56,17 @@ class ForkFilter:
                  capsule_length=0.15,
                  capsule_radius=0.03,
                  prong_axis_local=None,
-                 mask_dilation_px=5):
+                 mask_dilation_px=5,
+                 sdf_filter=False,
+                 sdf_margin=0.005,
+                 fork_mesh_path=None,
+                 sdf_surface_samples=4000):
 
         self.capsule_radius  = float(capsule_radius)
         self.mask_dilation_px = int(mask_dilation_px)
+        self.sdf_margin       = float(sdf_margin)
+        self.sdf_active       = False        # set True iff the KD-tree built ok
+        self._fork_kdt        = None
 
         # [0,0,-1] is the fork_tip local axis that keeps both capsule endpoints
         # inside the image frame and extends in the physically correct direction
@@ -89,6 +106,53 @@ class ForkFilter:
         self._seg_len_sq  = float(self._seg @ self._seg) + 1e-8
         self.pixel_mask   = None   # populated by compute_pixel_mask()
 
+        # Optional SDF backup: a KD-tree of the true fork surface in camera frame.
+        if sdf_filter:
+            self._build_fork_surface(fork_mesh_path, sdf_surface_samples,
+                                     T_fork_in_camera)
+
+    # ── SDF backup setup (constant, built once) ───────────────────────────────
+
+    def _build_fork_surface(self, mesh_path, n_samples, T_fork_in_camera):
+        """Sample fork_tip.stl and store its surface in the camera frame.
+
+        The fork is rigid in camera_wrist_optical_frame, so the surface points
+        are constant: the runtime filter is a single KD-tree query for the
+        distance from each candidate point to the true fork surface. On any
+        failure we log and leave sdf_active False so the caller falls back to
+        the capsule.
+        """
+        try:
+            import trimesh
+            from scipy.spatial import cKDTree
+        except Exception as e:                      # pragma: no cover
+            print(f"[fork_filter] SDF backup disabled (deps missing: {e!r}); "
+                  "using capsule.")
+            return
+        if not mesh_path or not os.path.isfile(mesh_path):
+            print(f"[fork_filter] SDF backup disabled (mesh not found: "
+                  f"{mesh_path}); using capsule.")
+            return
+        try:
+            mesh = trimesh.load(mesh_path, force='mesh')
+            pts, _ = trimesh.sample.sample_surface(mesh, int(n_samples))
+            pts = np.asarray(pts, np.float64) * 0.001   # fork_tip.stl scale (mm→m)
+            # Visual-origin offset: fork_tip.stl mesh frame → fork_tip LINK frame
+            # (panda_camera.xacro <visual><origin> of link "fork_tip").
+            T_link_visual = _make_T(
+                xyz=[-0.033, -0.02, 0.0171378],
+                rpy_xyz=[0.0, np.deg2rad(27.5), 0.0],
+            )
+            T = T_fork_in_camera @ T_link_visual        # mesh → camera frame
+            pts_cam = (T[:3, :3] @ pts.T).T + T[:3, 3]
+            self._fork_kdt = cKDTree(pts_cam)
+            self.sdf_active = True
+            print(f"[fork_filter] SDF backup active: {len(pts_cam)} fork-surface "
+                  f"samples, {self.sdf_margin * 1e3:.0f} mm shell.")
+        except Exception as e:                          # pragma: no cover
+            print(f"[fork_filter] SDF backup disabled (build failed: {e!r}); "
+                  "using capsule.")
+
     # ── Strategy C: 2D depth mask ─────────────────────────────────────────────
 
     def compute_pixel_mask(self, fx, fy, cx, cy, H, W):
@@ -124,13 +188,18 @@ class ForkFilter:
     # ── Strategy B: 3D camera-frame capsule filter ────────────────────────────
 
     def filter_camera_frame_points(self, pts):
-        """Remove any point whose distance to the P1-P2 segment ≤ capsule_radius.
+        """Remove points lying on/near the fork, in camera_wrist_optical_frame.
 
-        pts : (N, 3) float32/64 numpy array in camera_wrist_optical_frame
-        Returns filtered (M, 3) array, M ≤ N.  Pure vectorised NumPy, no loops.
+        Uses the true-surface SDF shell when available (sdf_active), otherwise
+        the analytic capsule. pts : (N, 3) array; returns (M, 3), M ≤ N.
         """
         if pts is None or len(pts) == 0:
             return pts
+        if self.sdf_active:
+            # Distance from each candidate point to the true fork surface.
+            dist, _ = self._fork_kdt.query(np.asarray(pts), k=1)
+            return pts[dist > self.sdf_margin]
+        # Capsule fallback: distance to the P1-P2 segment.
         w       = pts - self.P1                                    # (N, 3)
         t       = np.clip(w @ self._seg / self._seg_len_sq, 0.0, 1.0)  # (N,)
         closest = self.P1 + t[:, None] * self._seg                # (N, 3)

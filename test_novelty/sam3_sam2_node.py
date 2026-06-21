@@ -31,6 +31,9 @@ pkg_path = rospack.get_path('vision_processing')
 muggled_sam_path = os.path.join(pkg_path, "third_party", "muggled_sam")
 if muggled_sam_path not in sys.path:
     sys.path.insert(0, muggled_sam_path)
+if pkg_path not in sys.path:
+    sys.path.insert(0, pkg_path)
+from pipeline_timing import TimingPublisher
 
 # Imports Muggled SAM / Samurai
 try:
@@ -44,7 +47,10 @@ except ImportError as e:
 class Sam3Sam2Node:
     def __init__(self):
         rospy.init_node('sam3_sam2_node')
-        
+
+        # Per-stage timing -> /pipeline/timing/* (recorded in the bag for section 5.6)
+        self.timing = TimingPublisher(enabled=rospy.get_param("~publish_timing", True))
+
         # --- PARAMETRES ROS ---
         self.sam2_model_path = rospy.get_param("~sam2_model_path", "/home/flanthier/segment-anything-2/checkpoints/sam2.1_hiera_tiny.pt")
         self.target_prompt = rospy.get_param("~target_prompt", "green cube")
@@ -127,9 +133,10 @@ class Sam3Sam2Node:
 
         # 1. INIT TARGET
         if self.obj_mem_target is None:
-            req = Sam3SegmentRequest(rgb_image=self.bridge.cv2_to_imgmsg(rgb_cv, encoding="bgr8"), 
+            req = Sam3SegmentRequest(rgb_image=self.bridge.cv2_to_imgmsg(rgb_cv, encoding="bgr8"),
                                      text_prompt=self.target_prompt, confidence_threshold=0.1)
-            resp = sam3_segment(req)
+            with self.timing.measure('sam3_detect'):
+                resp = sam3_segment(req)
             if resp.success:
                 mask_t = torch.from_numpy(self.bridge.imgmsg_to_cv2(resp.mask, "mono8") > 0).to(self.device).float().unsqueeze(0).unsqueeze(0)
                 with torch.inference_mode():
@@ -241,6 +248,7 @@ class Sam3Sam2Node:
                         self.pub_debug.publish(msg_out)
                 
                 self.frame_idx += 1
+                self.timing.publish('sam2_track', (time.perf_counter() - t0) * 1000.0)
                 if self.log_timing:
                     rospy.loginfo_throttle(5.0, f"⏱️ [TIMING] SAM2 Tracking: {(time.perf_counter() - t0)*1000:.2f} ms")
             except Exception as e:

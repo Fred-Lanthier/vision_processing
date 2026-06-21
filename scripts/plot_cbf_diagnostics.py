@@ -99,6 +99,78 @@ def load_motion(path, t0):
     return np.asarray(t_q), np.asarray(q), np.asarray(obs_t), obs
 
 
+def _rate(ts):
+    ts = np.asarray(ts, dtype=float)
+    if len(ts) < 2:
+        return float("nan")
+    return (len(ts) - 1) / (ts[-1] - ts[0])
+
+
+def print_bag_summary(path):
+    """Print statistics for the non-diagnostics topics in the bag: the joint
+    trajectory, the persistent obstacle cloud and the per-stage pipeline timing
+    (/pipeline/timing/*). Best-effort: missing topics are simply skipped.
+    """
+    js_t, js_pos, js_vel = [], [], []
+    obs_t, obs_n = [], []
+    timing = {}
+    with rosbag.Bag(path) as bag:
+        for topic, msg, t in bag.read_messages():
+            if topic == JOINTS_TOPIC:
+                p = dict(zip(msg.name, msg.position))
+                v = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+                if all(j in p for j in PANDA_JOINTS):
+                    js_t.append(t.to_sec())
+                    js_pos.append([p[j] for j in PANDA_JOINTS])
+                    js_vel.append([v.get(j, np.nan) for j in PANDA_JOINTS])
+            elif topic == OBSTACLES_TOPIC:
+                obs_t.append(t.to_sec())
+                obs_n.append(int(msg.width) * int(msg.height))
+            elif topic.startswith("/pipeline/timing/"):
+                timing.setdefault(topic, []).append(float(msg.data))
+
+    print("\n" + "=" * 72)
+    print(f"OTHER RECORDED TOPICS — {os.path.basename(path)}")
+    print("=" * 72)
+
+    if js_t:
+        js_pos = np.asarray(js_pos)
+        js_vel = np.asarray(js_vel)
+        span = js_t[-1] - js_t[0]
+        print(f"\n/joint_states  (sensor_msgs/JointState)")
+        print(f"  {len(js_t)} samples | {_rate(js_t):.1f} Hz | span {span:.1f} s")
+        print(f"  {'joint':<7}{'pos min':>9}{'pos max':>9}{'range':>8}{'|vel|max':>10}")
+        for j, name in enumerate(PANDA_JOINTS):
+            p = js_pos[:, j]
+            v = np.abs(js_vel[:, j])
+            print(f"  {name[-1]:<7}{p.min():>9.3f}{p.max():>9.3f}"
+                  f"{p.max() - p.min():>8.3f}{np.nanmax(v):>10.3f}")
+    else:
+        print(f"\n/joint_states: not in bag")
+
+    if obs_t:
+        obs_n = np.asarray(obs_n)
+        print(f"\n/perception/persistent_obstacles  (sensor_msgs/PointCloud2)")
+        print(f"  {len(obs_t)} clouds | {_rate(obs_t):.1f} Hz")
+        print(f"  points/cloud: min {obs_n.min()}  median "
+              f"{int(np.median(obs_n))}  max {obs_n.max()}  mean {obs_n.mean():.0f}")
+    else:
+        print(f"\n/perception/persistent_obstacles: not in bag")
+
+    if timing:
+        print(f"\n/pipeline/timing/*  (std_msgs/Float64, milliseconds)")
+        print(f"  {'stage':<26}{'n':>6}{'mean':>8}{'med':>8}{'p95':>8}{'max':>8}")
+        for topic in sorted(timing):
+            v = np.asarray(timing[topic], dtype=float)
+            name = topic.replace("/pipeline/timing/", "")
+            zero = " (inactive)" if np.allclose(v, 0.0) else ""
+            print(f"  {name:<26}{len(v):>6}{v.mean():>8.2f}{v.std():>8.2f}{np.median(v):>8.2f}"
+                  f"{np.percentile(v, 95):>8.2f}{v.max():>8.2f}{zero}")
+    else:
+        print(f"\n/pipeline/timing/*: not in bag")
+    print()
+
+
 def real_clearance_series(path, t0, t, dummy, samples_per_link):
     """Offline true min distance robot->obstacles, aligned to diagnostics time t.
 
@@ -164,7 +236,7 @@ def main():
                     help="velocity clamp applied before replaying the output "
                          "filter, to match the node which filters the clamped "
                          "solver output (cbf node L1601)")
-    ap.add_argument("--smooth", type=float, default=0.25,
+    ap.add_argument("--smooth", type=float, default=0.0,
                     help="display smoothing window in seconds for the velocity "
                          "decomposition (raw shown faintly behind; 0 = off)")
     ap.add_argument("--d-safe", type=float, default=0.015,
@@ -180,6 +252,9 @@ def main():
                          "true-clearance overlay on h_evolution")
     ap.add_argument("--no-real-distance", action="store_true",
                     help="skip the offline true-clearance overlay on h_evolution")
+    ap.add_argument("--no-summary", action="store_true",
+                    help="skip the printed summary of the other recorded topics "
+                         "(joint_states, persistent_obstacles, pipeline timing)")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -188,7 +263,11 @@ def main():
     import matplotlib.pyplot as plt
 
     t, s, t0 = load_bag(args.bag)
+    if not args.no_summary:
+        print_bag_summary(args.bag)
+    general_dir = "run_diag"
     outdir = args.outdir or os.path.splitext(args.bag)[0] + "_diag"
+    outdir = os.path.join(general_dir, outdir)
     os.makedirs(outdir, exist_ok=True)
 
     # Before the first preprocessing cycle the node feeds the barrier dummy
@@ -239,7 +318,19 @@ def main():
     vmax = args.max_joint_velocity
     dq_post_filter = None
     dq_rep_norm = np.zeros_like(t)
-    if "dt" in s:
+    if "dq_post_filter" in s:
+        # Logged directly by the node (clamped solver output through F_tau_safe,
+        # before the final-constraint repair). Exact — no replay, so it is
+        # independent of --tau-safe and overlaps dq_pre_filter when tau == 0.
+        dq_post_filter = s["dq_post_filter"]
+        if "repair_applied" in s:
+            dq_rep_norm = np.linalg.norm(s["dq_final"] - dq_post_filter, axis=1)
+            dq_rep_norm[~repaired] = 0.0
+    elif "dt" in s:
+        # Backward compatibility for bags recorded before dq_post_filter was
+        # logged: reconstruct by replaying the output low-pass on dq_pre_filter.
+        # This replay uses --tau-safe and MUST match the node's
+        # cbf_velocity_filter_tau or the curve will not overlap dq_pre.
         dts = np.nan_to_num(s["dt"], nan=0.0).copy()
         good = dts > 0
         dts[~good] = np.median(dts[good]) if good.any() else 1e-2
@@ -328,12 +419,11 @@ def main():
             continue
         ax.plot(t, disp_smooth(v), color=color, label=label, lw=1.2)
     ff_level = float(np.nanmedian(norm(s["dq_ff"])))
-    ax.annotate("retiming : consigne constante",
-                xy=(0.62 * t[-1], ff_level), xytext=(0.62 * t[-1], ff_level * 1.18),
-                color=ts.SKY, fontsize=8, ha="center",
-                arrowprops=dict(arrowstyle="-", color=ts.SKY, lw=0.7))
+    # ax.annotate("retiming : consigne constante",
+    #             xy=(0.62 * t[-1], ff_level), xytext=(0.62 * t[-1], ff_level * 1.18),
+    #             color=ts.SKY, fontsize=8, ha="center",
+    #             arrowprops=dict(arrowstyle="-", color=ts.SKY, lw=0.7))
     ax.set_ylabel("[rad/s]")
-    ax.set_ylim(bottom=0.0, top=ff_level * 1.45)
     ts.legend_top(ax, ncol=3)
     ts.panel_label(ax, "(a)")
 
@@ -352,7 +442,6 @@ def main():
                 label=r"$|\Delta\dot{q}_{\mathrm{rep}}|$ (réparation)")
     ax.set_xlabel("t [s]")
     ax.set_ylabel("[rad/s]")
-    ax.set_ylim(bottom=0.0)
     ts.legend_top(ax, ncol=4)
     ts.panel_label(ax, "(b)")
 
@@ -395,11 +484,12 @@ def main():
     #     exact. It removes the velocity steps of the piecewise-linear waypoint
     #     interpolation so the solver tracks a smooth reference.
     # (b) Output filter F_tau_safe, on the safe command AFTER the QP: its input
-    #     (dq_pre_filter) is logged but its pure output is consumed in place, so
-    #     it is reconstructed (dq_post_filter). It smooths the discontinuous CBF
-    #     correction that jumps as the active obstacle set switches. dq_final
-    #     (filter + repair + saturation) is shown faintly so the filter's effect
-    #     is not conflated with the post-filter repair.
+    #     (dq_pre_filter) and its pure output (dq_post_filter) are both logged by
+    #     the node, so the panel is exact. (Older bags lack dq_post_filter and
+    #     reconstruct it by replaying the filter with --tau-safe.) It smooths the
+    #     discontinuous CBF correction that jumps as the active obstacle set
+    #     switches. dq_final (filter + repair + saturation) is shown faintly so
+    #     the filter's effect is not conflated with the post-filter repair.
     dq_nom_raw = s["dq_ff"] + s["dq_fb"]
     fig, axes = plt.subplots(2, 1, figsize=(ts.TEXTWIDTH, 4.4), sharex=True)
 
@@ -412,8 +502,7 @@ def main():
     ax.set_ylim(bottom=0.0)
     ts.legend_top(ax)
     ts.panel_label(
-        ax, rf"(a) filtre d'entrée $F_{{\tau_{{\mathrm{{nom}}}}}}$ "
-            rf"($\tau={args.tau_nom:g}$ s)")
+        ax, rf"(a)")
 
     ax = axes[1]
     ax.plot(t, norm(s["dq_pre_filter"]), color=ts.ORANGE, lw=0.9,
@@ -421,18 +510,56 @@ def main():
     if dq_post_filter is not None:
         ax.plot(t, norm(dq_post_filter), color=ts.BLUE, lw=1.1,
                 label=r"après : $|F_{\tau_{\mathrm{safe}}}[\dot{q}_{\mathrm{pre}}]|$")
-    ax.plot(t, norm(s["dq_final"]), color=ts.LIGHTGREY, lw=0.9, zorder=0,
+    ax.plot(t, norm(s["dq_final"]), color=ts.GREEN, lw=0.9, zorder=0,
             label=r"$|\dot{q}_{\mathrm{final}}|$ (+ réparation, saturation)")
     ax.set_xlabel("t [s]")
     ax.set_ylabel("[rad/s]")
     ax.set_ylim(bottom=0.0)
     ts.legend_top(ax)
     ts.panel_label(
-        ax, rf"(b) filtre de sortie $F_{{\tau_{{\mathrm{{safe}}}}}}$ "
-            rf"($\tau={args.tau_safe:g}$ s)")
+        ax, rf"(b)")
 
     fig.tight_layout()
     ts.save(fig, outdir, "filter_effect")
+
+    # 3b. Per-joint velocity ------------------------------------------------
+    # Every dq_* field is logged as a full 7-vector, so each joint can be shown
+    # on its own axis instead of collapsed to a norm. Signed values matter here:
+    # the CBF can brake, stop or REVERSE an individual joint, which the (always
+    # positive) norm hides. One panel per joint shows the chain
+    #   nominal  ->  after CBF projection  ->  commanded (filter + repair)
+    # together with the per-joint correction Delta_q_CBF that produced it.
+    # Wider than the text column (landscape figure): 4 panels across the text
+    # width are too narrow on the time axis, so use ~1.8x the width.
+    fig, axes = plt.subplots(2, 4, figsize=(ts.TEXTWIDTH * 1.8, 4.6), sharex=True)
+    axes_flat = axes.ravel()
+    for j in range(7):
+        ax = axes_flat[j]
+        ax.axhline(0.0, color="k", lw=0.5, ls="-", alpha=0.25)
+        # Nominal: faint thin reference, sits in the background.
+        ax.plot(t, s["dq_base"][:, j], color=ts.ORANGE, lw=0.8, alpha=0.55,
+                label=r"$\dot{q}_{\mathrm{base}}$ (nominale)")
+        # Correction: a soft filled band to zero rather than a fourth hard line.
+        ax.fill_between(t, 0.0, s["dq_cbf_delta"][:, j], color=ts.GREEN,
+                        alpha=0.20, lw=0,
+                        label=r"$\Delta\dot{q}_{\mathrm{CBF}}$ (correction)")
+        # Commanded: the single clean hero line.
+        ax.plot(t, s["dq_final"][:, j], color=ts.BLUE, lw=1.3, alpha=0.95,
+                solid_capstyle="round", solid_joinstyle="round",
+                label=r"$\dot{q}_{\mathrm{final}}$ (commandée)")
+        ax.set_title(f"Articulation {j + 1}", fontsize=9)
+        if j % 4 == 0:
+            ax.set_ylabel("[rad/s]")
+    axes_flat[7].axis("off")
+    # sharex hides x ticks on non-bottom rows; the bottom of the rightmost
+    # column is the disabled spare cell, so re-enable ticks/label on the panel
+    # above it (joint 4) as well as the rest of the bottom row.
+    for ax in (axes_flat[4], axes_flat[5], axes_flat[6], axes_flat[3]):
+        ax.set_xlabel("t [s]")
+        ax.tick_params(labelbottom=True)
+    ts.fig_legend_top(fig, axes_flat[0], ncol=4)
+    fig.tight_layout()
+    ts.save(fig, outdir, "per_joint_velocity")
 
     # 4. Constraint residuals ----------------------------------------------
     fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))

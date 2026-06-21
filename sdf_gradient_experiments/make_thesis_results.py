@@ -214,21 +214,18 @@ def fig_speed(R, core, pose, q9, dev):
     bern, mesh = np.array(bern), np.array(mesh)
     speed = mesh / bern
     fig, ax = plt.subplots(figsize=(5.0, 3.4))
-    ax.plot(sizes, mesh, "-o", color=RED, lw=1.8, ms=4.5, label="vérité terrain maillage (trimesh, CPU)")
-    ax.plot(sizes, bern, "-o", color=BLUE, lw=1.8, ms=4.5, label="SDF Bernstein (analytique, GPU)")
-    ax.axhline(1000 / 80, color=GREY, ls="--", lw=1.2)
-    ax.text(sizes[0] * 0.92, 1000 / 80 * 1.25, "budget 80 Hz (12,5 ms)",
-            color=GREY, ha="left", va="bottom", fontsize=8)
-    ax.axvline(100, color=GREEN, ls=":", lw=1.4)
-    ax.text(100 * 1.1, 0.58, "$K = 100$", color=GREEN, fontsize=8,
-            ha="left", va="bottom", transform=ax.get_xaxis_transform())
+    ax.plot(sizes, mesh, "-o", color=RED, lw=1.8, ms=4.5, label="vérité terrain maillage (trimesh)")
+    ax.plot(sizes, bern, "-o", color=BLUE, lw=1.8, ms=4.5, label="SDF Bernstein (analytique)")
+    # ax.axvline(100, color=GREEN, ls=":", lw=1.4)
+    # ax.text(100 * 1.1, 0.58, "$K = 100$", color=GREEN, fontsize=8,
+    #         ha="left", va="bottom", transform=ax.get_xaxis_transform())
     for n, mv, s in zip(sizes, mesh, speed):
         ax.annotate(f"{s:.0f}$\\times$", (n, mv), textcoords="offset points",
                     xytext=(0, 6), ha="center", va="bottom", color=RED, fontsize=8)
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xticks(sizes); ax.set_xticklabels([str(s) for s in sizes], rotation=30)
     ax.minorticks_off()
-    ax.set_xlabel("Nombre de points de requête (échelle log)")
+    ax.set_xlabel("Nombre de points de requête")
     ax.set_ylabel("Temps distance + gradient [ms]")
     ts.legend_top(ax, ncol=1)
     fig.tight_layout(); ts.save(fig, OUT, "fig3_speed")

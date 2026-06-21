@@ -5,7 +5,13 @@ Inputs: one bag recorded with the CBF active and one recorded in
 monitor-only + contact-stop mode (baseline), same scene and seed:
     rosbag record /cbf_safety/diagnostics /cbf_safety/diagnostics_layout \
         /cbf_safety/contact_event /joint_states /perception/persistent_obstacles \
-        /planner/nominal_trajectory
+        /perception/persistent_target /planner/nominal_trajectory
+
+The views are centered on the target (the food) with a fixed, configurable
+box (--view-up/--view-down/--view-left/--view-right, in cm) so the deviation
+of the safe path away from the baseline reads at a glance. The target is the
+centroid of /perception/persistent_target if recorded, else --target x y z,
+else the CBF fork-tip endpoint.
 
 Outputs:
   comparison_avec_sans.png  fork-tip paths (XY + XZ) through the obstacle
@@ -31,6 +37,24 @@ import sensor_msgs.point_cloud2 as pc2
 
 PANDA_JOINTS = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
                 'panda_joint5', 'panda_joint6', 'panda_joint7']
+TARGET_TOPIC = "/perception/persistent_target"
+
+
+def read_target_centroid(path):
+    """Median centroid (base frame) of the last target cloud in the bag, or None.
+
+    The median is robust to the few smeared/outlier points the persistent target
+    can carry, so the view recenters on the actual food, not on a stray voxel."""
+    last = None
+    with rosbag.Bag(path) as bag:
+        for _, msg, _ in bag.read_messages(topics=[TARGET_TOPIC]):
+            pts = np.array(list(pc2.read_points(
+                msg, field_names=("x", "y", "z"), skip_nans=True)))
+            if len(pts):
+                last = pts.reshape(-1, 3)
+    if last is None or not len(last):
+        return None
+    return np.median(last, axis=0)
 
 
 def load_run(path):
@@ -159,6 +183,18 @@ def main():
     ap.add_argument("--d-safe", type=float, default=0.015)
     ap.add_argument("--stride", type=int, default=4,
                     help="joint-state subsampling for FK")
+    ap.add_argument("--target", type=float, nargs=3, default=None,
+                    metavar=("X", "Y", "Z"),
+                    help="manual target (food) position [m] to center the views "
+                         "on; overrides the recorded target cloud")
+    ap.add_argument("--view-up", type=float, default=30.0,
+                    help="view half-extent above the target [cm]")
+    ap.add_argument("--view-down", type=float, default=30.0,
+                    help="view half-extent below the target [cm]")
+    ap.add_argument("--view-left", type=float, default=30.0,
+                    help="view half-extent left of the target [cm]")
+    ap.add_argument("--view-right", type=float, default=30.0,
+                    help="view half-extent right of the target [cm]")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -183,6 +219,27 @@ def main():
     if obs is not None and len(obs) > 4000:
         obs = obs[np.random.default_rng(0).choice(len(obs), 4000, replace=False)]
 
+    # Target (food) the views recenter on: manual override, else the recorded
+    # target cloud, else the CBF fork-tip endpoint (the fork reaches the food).
+    if args.target is not None:
+        target = np.asarray(args.target, dtype=float)
+    else:
+        target = read_target_centroid(args.cbf_bag)
+        if target is None:
+            target = tips["cbf"][0][-1]
+    print(f"target (view center): ({target[0]:.3f}, {target[1]:.3f}, "
+          f"{target[2]:.3f}) m")
+    # Per-direction half-extents [m]: vertical = up/down, horizontal = left/right.
+    m_up, m_down = args.view_up / 100.0, args.view_down / 100.0
+    m_left, m_right = args.view_left / 100.0, args.view_right / 100.0
+
+    def center_view(ax, ix, iy):
+        ax.set_xlim(target[ix] - m_left, target[ix] + m_right)
+        ax.set_ylim(target[iy] - m_down, target[iy] + m_up)
+        # 'box' keeps the requested limits AND an equal data scale (it resizes
+        # the axes box), so the deviation is not distorted by the asymmetric box.
+        ax.set_aspect("equal", adjustable="box")
+
     C_BASE, C_CBF, C_OBS = ts.ORANGE, ts.BLUE, ts.LIGHTGREY
 
     # ------- Figure A: avec / sans comparison --------------------------------
@@ -201,13 +258,15 @@ def main():
         ax.plot(tb[:, ix], tb[:, iy], color=C_BASE, lw=1.5, label="sans CBF")
         ax.plot(tc[:, ix], tc[:, iy], color=C_CBF, lw=1.5, label="avec CBF")
         ax.plot(tc[0, ix], tc[0, iy], "o", color="k", ms=5, label="départ")
+        ax.plot(target[ix], target[iy], "*", color=ts.GREEN, ms=13, mec="k",
+                mew=0.6, label="cible", zorder=6)
         if runs["base"]["contact_time"] is not None:
             ax.plot(tb[-1, ix], tb[-1, iy], "x", color=C_BASE, ms=11, mew=2.5,
                     label="contact estimé")
         ax.set_xlabel(f"{nx} [m]")
         ax.set_ylabel(f"{ny} [m]")
         ax.set_title(title)
-        ax.set_aspect("equal", adjustable="datalim")
+        center_view(ax, ix, iy)
         if col == 0:
             ax_views = ax
 
@@ -252,8 +311,9 @@ def main():
             label="exécution sans filtre (référence)")
     if obs is not None:
         ax.scatter(obs[:, 0], obs[:, 2], s=1.0, c=C_OBS, alpha=0.3)
-    ax.autoscale()
-    ax.set_aspect("equal", adjustable="datalim")
+    ax.plot(target[0], target[2], "*", color=ts.GREEN, ms=13, mec="k",
+            mew=0.6, label="cible", zorder=6)
+    center_view(ax, 0, 2)
     ax.set_xlabel("x [m]")
     ax.set_ylabel("z [m]")
     cb = fig.colorbar(lc, ax=ax, pad=0.01)

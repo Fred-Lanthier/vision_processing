@@ -8,13 +8,13 @@
   <!-- 1. General Parameters -->
   <arg name="target_prompt" default="green cube" />
   <arg name="venv_python" default="/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3" />
-  <arg name="casf_model_name" default="last_fm_model_high_dim_CFM_relative_dropout.ckpt" />
+  <arg name="casf_model_name" default="last_fm_model_9D_dynamics_1024.ckpt" />
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
   <arg name="planner_rate_hz" default="10" />
   <arg name="trajectory_waypoint_rate_hz" default="10.0" />
   <arg name="control_rate_hz" default="100.0" />
-  <arg name="cbf_preprocess_rate_hz" default="40.0" />
+  <arg name="cbf_preprocess_rate_hz" default="30.0" />
   <arg name="viz_rate_hz" default="5.0" />
   <arg name="bridge_rate_hz" default="60.0" />
   <arg name="bridge_horizon_points" default="1" />
@@ -34,13 +34,13 @@
   <arg name="cbf_cluster_mode" default="topk" />
   <arg name="cbf_fork_mesh_selection_points" default="512" />
   <arg name="cbf_publish_yellow_points" default="false" />
-  <arg name="cbf_selected_obstacle_hold_time" default="0.1" />
-  <arg name="cbf_selection_sticky_points" default="25" />
-  <arg name="cbf_selection_sticky_radius" default="0.03" />
+  <arg name="cbf_selected_obstacle_hold_time" default="0.25" />
+  <arg name="cbf_selection_sticky_points" default="0" />
+  <arg name="cbf_selection_sticky_radius" default="0.05" />
   <arg name="cbf_selection_sticky_score_margin" default="0.002" />
   <arg name="cbf_selection_duplicate_radius" default="0.003" />
   <arg name="cbf_selection_new_point_penalty" default="0.0" />
-  <arg name="cbf_selection_sticky_force_keep" default="true" />
+  <arg name="cbf_selection_sticky_force_keep" default="false" />
   <arg name="obstacle_pre_sample_max" default="2000" />
   <arg name="planner_cbf_max_obstacles" default="256" />
   <arg name="casf_spatial_max_obstacles" default="100" />
@@ -83,7 +83,7 @@
   <arg name="cbf_integrate_from_current" default="true" />
   <arg name="cbf_command_dt" default="0.05" />
   <arg name="cbf_stateful_position_command" default="true" />
-  <arg name="cbf_direct_position_mode" default="nominal_correction" />
+  <arg name="cbf_direct_position_mode" default="integrated" />
   <arg name="cbf_position_correction_dt" default="0.08" />
   <arg name="cbf_max_command_lead" default="0.05" />
   <arg name="cbf_gradient_check_period" default="0.0" />
@@ -96,7 +96,7 @@
   <arg name="cbf_kp" default="5.0" />
   <arg name="max_feedback_velocity" default="0.5" />
   <arg name="cbf_filter_tau" default="0.05" />
-  <arg name="cbf_velocity_filter_tau" default="0.2" />
+  <arg name="cbf_velocity_filter_tau" default="0.1" />
   <arg name="cbf_use_nominal_velocity_topic" default="true" />
   <arg name="cbf_nominal_velocity_timeout" default="0.25" />
   <arg name="cbf_nominal_feedforward_gain" default="1.0" />
@@ -122,6 +122,12 @@
   <arg name="fork_sam3_prompt" default="4 fork tips" />
   <arg name="fork_mask_dilation_px" default="7" />
   <arg name="run_3d_fork_filter_backup" default="false" />
+  <!-- 3D fork backup using the true fork surface (fork_tip.stl) SDF instead of
+       the loose capsule. Removes near-fork leaks the 2D mask cannot, without
+       erasing real obstacles beyond the shell. Runs every frame when enabled. -->
+  <arg name="fork_sdf_filter" default="true" />
+  <arg name="fork_sdf_margin" default="0.005" />
+  <arg name="fork_sdf_samples" default="2000" />
   <arg name="persistent_voxel_size" default="0.01" />
   <!-- Freespace eviction band (m). Default ~2x voxel_size. Set very large
        (e.g. 100.0) for a baseline collision run so the static bowl is never
@@ -180,14 +186,14 @@
   <!-- CBF node selection: cbf_safety_node_Bernstein.py (single soft-min
        constraint, CUDA graph) or cbf_safety_node_Bernstein_multicbf.py.
        The multicbf-specific args below are ignored by the Bernstein node. -->
-  <arg name="cbf_node_type" default="cbf_safety_node_Bernstein.py" />
+  <arg name="cbf_node_type" default="cbf_safety_node_Bernstein_multicbf.py" />
   <arg name="cbf_solver_mode" default="fast_tangent" />
   <arg name="cbf_active_constraints" default="4" />
   <arg name="cbf_multi_gradient_mode" default="finite_difference" />
   <arg name="cbf_multi_fd_eps" default="0.001" />
-  <arg name="cbf_h_activate" default="0.005" />
+  <arg name="cbf_h_activate" default="0.04" />
   <arg name="cbf_max_inward_speed" default="0.20" />
-  <arg name="cbf_recovery_speed" default="0.02" />
+  <arg name="cbf_recovery_speed" default="0.05" />
   <arg name="cbf_recovery_depth" default="0.015" />
   <arg name="cbf_max_correction_speed" default="0.20" />
   <arg name="cbf_recovery_max_correction_speed" default="0.55" />
@@ -313,6 +319,9 @@
         <param name="log_timing" value="$(arg log_projector_timing)" />
         <param name="log_events" value="$(arg log_projector_events)" />
         <param name="run_3d_fork_filter_backup" value="$(arg run_3d_fork_filter_backup)" />
+        <param name="fork_sdf_filter" value="$(arg fork_sdf_filter)" />
+        <param name="fork_sdf_margin" value="$(arg fork_sdf_margin)" />
+        <param name="fork_sdf_samples" value="$(arg fork_sdf_samples)" />
         <param name="enable_fork_sam3_mask" value="true" />
         <param name="fork_sam3_prompt" value="$(arg fork_sam3_prompt)" />
         <param name="fork_mask_dilation_px" value="$(arg fork_mask_dilation_px)" />

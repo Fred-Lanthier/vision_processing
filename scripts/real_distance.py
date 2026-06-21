@@ -80,6 +80,13 @@ class RealClearance:
 
         self.found_links = sorted({self.layer.meshes_info[i]['link_name']
                                    for i in self.mesh_idx})
+        # Per-surface-point link name (length P, same concatenation order as
+        # surface_points), so a min-distance point can be attributed to a link.
+        self._pt_link = (np.concatenate([
+            np.full(len(self.local_pts[j]),
+                    self.layer.meshes_info[mi]['link_name'], dtype=object)
+            for j, mi in enumerate(self.mesh_idx)])
+            if self.mesh_idx else np.empty(0, dtype=object))
         missing = [l for l in PROTECTED_LINKS if l not in self.found_links]
         if missing:
             print(f"[real_distance] WARNING: no resolvable mesh for {missing}; "
@@ -103,25 +110,49 @@ class RealClearance:
             parts.append(torch.einsum('bij,sj->bsi', R, lp) + t[:, None, :])
         return torch.cat(parts, dim=1).detach().cpu().numpy()    # [B,P,3]
 
-    def clearance(self, q_rows, obs_clouds, obs_index, batch=256):
+    def clearance(self, q_rows, obs_clouds, obs_index, batch=256,
+                  return_details=False):
         """Minimum surface-to-cloud distance per trajectory step.
 
         q_rows:     [T,7] joint angles, one per output sample
         obs_clouds: list of [Ni,3] point clouds (base frame)
         obs_index:  [T] index into obs_clouds for each step
         returns:    [T] distances in metres (NaN where no usable cloud)
+
+        If ``return_details`` is True, also returns a dict attributing each
+        step's minimum to its source:
+            'link'     [T] object  — protected link name owning the closest
+                                     robot surface point (None where no cloud)
+            'robot_pt' [T,3] float — that closest robot surface point (base frame)
+            'obs_pt'   [T,3] float — the nearest obstacle point it matched to
+        This tells a real wall approach (obs_pt on the obstacle, robot_pt on an
+        arm link) apart from a self/swept-point artifact (link == 'fork_tip' and
+        obs_pt sitting on the fork body).
         """
         trees = [cKDTree(c) if (c is not None and len(c) >= 1) else None
                  for c in obs_clouds]
         T = len(q_rows)
         d = np.full(T, np.nan)
+        if return_details:
+            links = np.full(T, None, dtype=object)
+            robot_pt = np.full((T, 3), np.nan)
+            obs_pt = np.full((T, 3), np.nan)
         for start in range(0, T, batch):
             sl = slice(start, min(start + batch, T))
             pts = self.surface_points(q_rows[sl])           # [b,P,3]
             for k in range(pts.shape[0]):
-                tree = trees[obs_index[start + k]]
+                gi = start + k
+                ci = obs_index[gi]
+                tree = trees[ci]
                 if tree is None:
                     continue
-                dist, _ = tree.query(pts[k], k=1)
-                d[start + k] = float(dist.min())
+                dist, oidx = tree.query(pts[k], k=1)        # [P], [P]
+                pmin = int(np.argmin(dist))
+                d[gi] = float(dist[pmin])
+                if return_details:
+                    links[gi] = self._pt_link[pmin]
+                    robot_pt[gi] = pts[k][pmin]
+                    obs_pt[gi] = obs_clouds[ci][oidx[pmin]]
+        if return_details:
+            return d, {"link": links, "robot_pt": robot_pt, "obs_pt": obs_pt}
         return d

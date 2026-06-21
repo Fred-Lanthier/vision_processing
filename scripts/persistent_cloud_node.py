@@ -29,6 +29,12 @@ from cv_bridge import CvBridge
 sys.path.insert(0, os.path.dirname(__file__))
 from PersistentCloud import WorldCloud, _to_hashes
 
+import rospkg
+_pkg = rospkg.RosPack().get_path('vision_processing')
+if _pkg not in sys.path:
+    sys.path.insert(0, _pkg)
+from pipeline_timing import TimingPublisher
+
 
 # ── Shared helper ─────────────────────────────────────────────────────────────
 
@@ -103,6 +109,9 @@ def _gpu_freespace_check(pts_world, depth_img, R_cw, t_cw,
 class PersistentCloudNode:
     def __init__(self):
         rospy.init_node('persistent_cloud_node')
+
+        # Per-stage timing -> /pipeline/timing/* (recorded in the bag for section 5.6)
+        self.timing = TimingPublisher(enabled=rospy.get_param("~publish_timing", True))
 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         if device == 'cpu':
@@ -295,23 +304,24 @@ class PersistentCloudNode:
             return
 
         # Freespace eviction: immediately remove voxels where camera sees background
-        pts, hashes = self.obs_world.get_points_and_hashes(min_confidence=1)
-        if pts is not None:
-            is_free = _gpu_freespace_check(
-                pts, img, R_cw, t_cw,
-                self.fx, self.fy, self.cx, self.cy,
-                self.obs_free_margin, self.device)
-            if is_free.any():
-                evicted_pts = pts[is_free]
-                self.obs_world.evict_hashes(np.sort(hashes[is_free]))
-                if self.publish_evicted_debug:
-                    header = Header(stamp=msg.header.stamp, frame_id=self.world_frame)
-                    self.evicted_pub.publish(_make_cloud_msg(header, evicted_pts))
-                if self.log_freespace_evictions:
-                    rospy.loginfo_throttle(
-                        1.0,
-                        "Persistent freespace eviction: evicted=%d / checked=%d",
-                        int(is_free.sum()), int(len(is_free)))
+        with self.timing.measure('persistent_evict'):
+            pts, hashes = self.obs_world.get_points_and_hashes(min_confidence=1)
+            if pts is not None:
+                is_free = _gpu_freespace_check(
+                    pts, img, R_cw, t_cw,
+                    self.fx, self.fy, self.cx, self.cy,
+                    self.obs_free_margin, self.device)
+                if is_free.any():
+                    evicted_pts = pts[is_free]
+                    self.obs_world.evict_hashes(np.sort(hashes[is_free]))
+                    if self.publish_evicted_debug:
+                        header = Header(stamp=msg.header.stamp, frame_id=self.world_frame)
+                        self.evicted_pub.publish(_make_cloud_msg(header, evicted_pts))
+                    if self.log_freespace_evictions:
+                        rospy.loginfo_throttle(
+                            1.0,
+                            "Persistent freespace eviction: evicted=%d / checked=%d",
+                            int(is_free.sum()), int(len(is_free)))
 
     # ── Cloud callbacks ───────────────────────────────────────────────────────
 
@@ -337,7 +347,8 @@ class PersistentCloudNode:
 
         self._live_obs = pts
         if len(pts) > 0:
-            self.obs_world.integrate(pts)
+            with self.timing.measure('persistent_integrate'):
+                self.obs_world.integrate(pts)
         self._last_pub_stamp = msg.header.stamp
 
     def _target_cb(self, msg):

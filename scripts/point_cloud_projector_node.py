@@ -16,6 +16,12 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from fork_filter import ForkFilter
 
+import rospkg
+_pkg = rospkg.RosPack().get_path('vision_processing')
+if _pkg not in sys.path:
+    sys.path.insert(0, _pkg)
+from pipeline_timing import TimingPublisher
+
 from vision_processing.srv import Sam3Segment, Sam3SegmentRequest
 
 
@@ -32,6 +38,8 @@ class PointCloudProjectorNode:
         self.run_3d_fork_filter_backup = bool(rospy.get_param("~run_3d_fork_filter_backup", False))
         self.log_timing = bool(rospy.get_param("~log_timing", True))
         self.log_events = bool(rospy.get_param("~log_events", True))
+        # Per-stage timing -> /pipeline/timing/* (recorded in the bag for section 5.6)
+        self.timing = TimingPublisher(enabled=rospy.get_param("~publish_timing", True))
         self.rng = np.random.default_rng()
 
         # SAM3 fork mask params
@@ -40,12 +48,25 @@ class PointCloudProjectorNode:
         self._mask_dilation   = int(rospy.get_param("~fork_mask_dilation_px",   0))
         self._enable_fork_sam3_mask = bool(rospy.get_param("~enable_fork_sam3_mask", False))
 
+        # 3D fork backup: an SDF shell around the TRUE fork surface (fork_tip.stl)
+        # is the geometrically-correct backstop for the 2D mask's near-fork leaks.
+        # Falls back to the analytic capsule if disabled or the mesh fails to load.
+        self._fork_sdf_filter = bool(rospy.get_param("~fork_sdf_filter", False))
+        self._fork_sdf_margin = float(rospy.get_param("~fork_sdf_margin", 0.005))
+        _fork_mesh_default = os.path.join(
+            _pkg, "src/vision_processing/diffusion_model_train/fork_tip.stl")
+        self._fork_mesh_path = rospy.get_param("~fork_mesh_path", _fork_mesh_default)
+
         # Geometric fallback params (used only if SAM3 permanently unavailable)
         self.fork_filter = ForkFilter(
             capsule_length   = float(rospy.get_param("~fork_capsule_length", 0.15)),
             capsule_radius   = float(rospy.get_param("~fork_capsule_radius", 0.03)),
             prong_axis_local = rospy.get_param("~fork_prong_axis",           [0.0, 0.0, -1.0]),
             mask_dilation_px = self._mask_dilation,
+            sdf_filter       = self._fork_sdf_filter,
+            sdf_margin       = self._fork_sdf_margin,
+            fork_mesh_path   = self._fork_mesh_path,
+            sdf_surface_samples = int(rospy.get_param("~fork_sdf_samples", 4000)),
         )
 
         # pixel_mask starts None → no 2D masking until SAM3 delivers
@@ -310,6 +331,7 @@ class PointCloudProjectorNode:
         return (newer - older) * 1000.0
 
     def _log_timing(self, total_start, stages, obs_in, obs_pub, target_pub):
+        self.timing.publish('projection', (time.perf_counter() - total_start) * 1000.0)
         if not self.log_timing:
             return
         rospy.loginfo_throttle(
@@ -406,11 +428,15 @@ class PointCloudProjectorNode:
         obs_in = 0 if obs_pts_cam is None else len(obs_pts_cam)
         stages["obs_deproj"] = self._elapsed_ms(time.perf_counter(), t_stage)
 
-        # ── STRATEGY B: 3D capsule backup ─────────────────────────────────────
-        # Once the fork pixel mask is active, the fork is already removed before
-        # projection. Keep the 3D capsule as startup/fallback protection only.
+        # ── STRATEGY B: 3D fork backup (SDF shell or capsule) ─────────────────
+        # The 2D mask cannot represent "within N mm of the fork in 3D", so near-
+        # fork points still leak when the fork is close to a surface (inside the
+        # container). Run the 3D backup always when the SDF shell is active; the
+        # capsule stays a startup-only fallback (before the pixel mask exists).
         t_stage = time.perf_counter()
-        use_3d_fork_backup = self.run_3d_fork_filter_backup or self.fork_filter.pixel_mask is None
+        use_3d_fork_backup = (self.run_3d_fork_filter_backup
+                              or self.fork_filter.sdf_active
+                              or self.fork_filter.pixel_mask is None)
         if obs_pts_cam is not None and use_3d_fork_backup:
             obs_pts_cam = self.fork_filter.filter_camera_frame_points(obs_pts_cam)
         stages["fork_filter"] = self._elapsed_ms(time.perf_counter(), t_stage)

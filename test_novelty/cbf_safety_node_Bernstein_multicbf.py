@@ -32,6 +32,7 @@ except ImportError:
 rospack = rospkg.RosPack()
 pkg_path = rospack.get_path('vision_processing')
 sys.path.insert(0, pkg_path)
+from pipeline_timing import TimingPublisher
 
 from third_party.SafeFlowMatcher.diffuser.models.rdf_cbf import RDF_CBF # Le solveur CBF est conservé
 from third_party.RDF.urdf_layer import URDFLayer # Le module de cinématique est conservé pour l'Autograd
@@ -64,6 +65,7 @@ DIAG_VEC_FIELDS = [
     "dq_escape",      # local tangent/normal escape velocity before CBF solve
     "dq_cbf_delta",   # solver output minus dq_base (before repair)
     "dq_pre_filter",  # solver output before clamp/repair
+    "dq_post_filter", # clamped solver output after the output low-pass, pre-repair
     "dq_final",       # velocity actually published
 ]
 DIAG_SCALAR_FIELDS = [
@@ -112,6 +114,8 @@ class CBFSafetyNode:
     def __init__(self):
         rospy.init_node('cbf_safety_node')
         self.device = torch.device('cuda')
+        # Per-stage timing -> /pipeline/timing/* (recorded in the bag for section 5.6)
+        self.timing = TimingPublisher(enabled=rospy.get_param("~publish_timing", True))
         self._logged_first_nominal = False
         self._logged_first_safe_publish = False
 
@@ -495,7 +499,7 @@ class CBFSafetyNode:
         # (39:46 dq_ff, 46:53 dq_fb, 53:60 solver output, 60 repair flag,
         #  61 final constraint, 62 pre-projection constraint, 63 |grad_h|,
         #  64:71 dq_escape).
-        self.transfer_buffer = torch.zeros(72, dtype=torch.float32, device=self.device)
+        self.transfer_buffer = torch.zeros(79, dtype=torch.float32, device=self.device)
         # Hot-path command buffer: dq_final, q_safe, h, constr. Keep diagnostics
         # out of this copy so command publication is not blocked by telemetry.
         self.command_buffer = torch.zeros(16, dtype=torch.float32, device=self.device)
@@ -1742,13 +1746,18 @@ class CBFSafetyNode:
         centers = torch.stack(centers, dim=0)
         link_dist = torch.cdist(pts.unsqueeze(0), centers.unsqueeze(0)).squeeze(0).min(dim=1).values
 
-        n_after_radius = n_input
+        # Sync-free prefilter: push out-of-radius points to +inf, then keep the
+        # nearest max_points via topk (a fixed-size index gather — no boolean
+        # mask and no torch.any, both of which force a GPU->CPU sync that, under
+        # FM contention, blocks for tens of ms). Out-of-radius points only slip
+        # through when fewer than max_points are in range, and the whole-body SDF
+        # self-filter downstream drops them anyway.
         if self.cbf_sdf_prefilter_radius > 0.0:
-            keep_mask = link_dist <= self.cbf_sdf_prefilter_radius
-            if torch.any(keep_mask):
-                pts = pts[keep_mask]
-                link_dist = link_dist[keep_mask]
-            n_after_radius = int(pts.shape[0])
+            link_dist = torch.where(
+                link_dist <= self.cbf_sdf_prefilter_radius,
+                link_dist,
+                torch.full_like(link_dist, float('inf')),
+            )
 
         if self.cbf_sdf_prefilter_max_points > 0 and pts.shape[0] > self.cbf_sdf_prefilter_max_points:
             _, keep_idx = torch.topk(
@@ -1759,7 +1768,7 @@ class CBFSafetyNode:
             pts = pts[keep_idx]
 
         self.debug_sdf_prefilter_counts = (
-            n_input, n_after_radius, int(pts.shape[0]))
+            n_input, n_input, int(pts.shape[0]))
         return pts
 
     def _whole_body_sdf_candidates(self, pts, q9, link_poses=None):
@@ -1794,11 +1803,14 @@ class CBFSafetyNode:
                 (sdf_all <= self.cbf_sdf_candidate_max_dist)
                 & (sdf_self_filter > self.cbf_sdf_self_filter_margin)
             )
-            if torch.any(keep_mask):
-                kept_pts.append(pts_chunk[keep_mask])
-                kept_dist.append(sdf_all[keep_mask])
-                kept_sdf_all.append(sdf_all[keep_mask])
-                kept_sdf_fork.append(sdf_fork[keep_mask])
+            # No `if torch.any(keep_mask)` guard: that reduction is its own
+            # GPU->CPU sync. Appending an empty masked tensor is harmless (the
+            # cat below and the `if not kept_pts` fallback handle it), so drop
+            # the guard and keep only the unavoidable mask-index.
+            kept_pts.append(pts_chunk[keep_mask])
+            kept_dist.append(sdf_all[keep_mask])
+            kept_sdf_all.append(sdf_all[keep_mask])
+            kept_sdf_fork.append(sdf_fork[keep_mask])
 
         if not kept_pts:
             empty = torch.empty((0,), dtype=torch.float32, device=self.device)
@@ -1864,20 +1876,39 @@ class CBFSafetyNode:
         if prev_pts.shape[0] == 0:
             return pts_inside, scores, dist_inside
 
+        # Map each previously-selected point to its nearest current candidate.
+        nearest_idx = None
         if self.cbf_selection_sticky_radius > 0.0:
-            d_prev_to_current = torch.cdist(
+            dmin = torch.cdist(
                 prev_pts.unsqueeze(0),
                 pts_inside.unsqueeze(0),
-            ).squeeze(0).min(dim=1).values
-            still_present = d_prev_to_current <= self.cbf_selection_sticky_radius
+            ).squeeze(0).min(dim=1)
+            still_present = dmin.values <= self.cbf_selection_sticky_radius
             if not torch.any(still_present):
                 return pts_inside, scores, dist_inside
             prev_pts = prev_pts[still_present]
+            nearest_idx = dmin.indices[still_present]
 
-        prev_pts, prev_scores, prev_dist = self._score_previous_selection(
-            prev_pts, x_now_pos, q9, link_poses_current)
-        if prev_pts.shape[0] == 0:
-            return pts_inside, scores, dist_inside
+        if self.cbf_selection_metric in ("sdf", "fork_sdf"):
+            # Reuse the nearest current candidate's already-computed SDF score
+            # instead of recomputing a whole-body SDF on prev_pts (saves one
+            # ~5 ms fixed-overhead call per cycle). The points are within
+            # sticky_radius, so the score and self-filter decision match: a
+            # point now inside the robot body has no nearby candidate (those
+            # were self-filtered) and is already dropped by still_present above —
+            # the same effect as _score_previous_selection's self-filter.
+            if nearest_idx is None:
+                nearest_idx = torch.cdist(
+                    prev_pts.unsqueeze(0),
+                    pts_inside.unsqueeze(0),
+                ).squeeze(0).min(dim=1).indices
+            prev_scores = scores[nearest_idx]
+            prev_dist = torch.norm(prev_pts - x_now_pos, dim=1)
+        else:
+            prev_pts, prev_scores, prev_dist = self._score_previous_selection(
+                prev_pts, x_now_pos, q9, link_poses_current)
+            if prev_pts.shape[0] == 0:
+                return pts_inside, scores, dist_inside
 
         if prev_pts.shape[0] > sticky_max:
             _, prev_idx = torch.topk(prev_scores, k=sticky_max, largest=largest)
@@ -2173,6 +2204,8 @@ class CBFSafetyNode:
                 if self.profile_sync:
                     torch.cuda.synchronize()
                 self.preprocess_times.append(time.perf_counter() - t_start)
+                self.timing.publish('critical_point_selection',
+                                    (time.perf_counter() - t_start) * 1000.0)
                 if self.log_cbf_preprocess_breakdown:
                     now_ros = rospy.get_time()
                     if now_ros - self._last_preprocess_breakdown_log >= self.cbf_preprocess_breakdown_period:
@@ -2411,6 +2444,13 @@ class CBFSafetyNode:
                                 self.dq_safe_work, alpha=gamma_v)
                         self.dq_safe_work.copy_(self._dq_safe_filtered)
                         velocity_filter_active = True
+
+                    # Pure output-filter command (clamped solver output through
+                    # F_tau_safe), captured before the final-constraint repair so
+                    # the diagnostic logs the filter's effect in isolation. With
+                    # cbf_velocity_filter_tau == 0 this equals the clamped solver
+                    # output and overlaps dq_pre_filter, as expected.
+                    self.transfer_buffer[72:79].copy_(self.dq_safe_work.squeeze(0))
 
                     if self.enable_cbf and self.cbf_enforce_final_constraint and not self.cbf_monitor_only:
                         # Component-wise velocity limits can invalidate the QP
@@ -2712,6 +2752,9 @@ class CBFSafetyNode:
                 pos_msg = Float64MultiArray(data=q_safe_work_cpu)
                 self.safe_cmd_pub.publish(pos_msg)
                 t_pub_done = time.perf_counter()
+                self.timing.publish('cbf_correction', (t_cbf_done - t_start) * 1000.0)
+                self.timing.publish('cbf_command', (t_q_cmd_done - t_cbf_done) * 1000.0)
+                self.timing.publish('cbf_total', (t_pub_done - t_start) * 1000.0)
 
                 diag_due = (
                     self.publish_diagnostics
@@ -2919,6 +2962,7 @@ class CBFSafetyNode:
                         + cpu_buffer[64:71].tolist()               # dq_escape
                         + (solver_out_v - dq_base_v).tolist()      # dq_cbf_delta
                         + solver_out_v.tolist()                    # dq_pre_filter
+                        + cpu_buffer[72:79].tolist()               # dq_post_filter
                         + cpu_buffer[0:7].tolist()                 # dq_final
                         + scalars)))
 
