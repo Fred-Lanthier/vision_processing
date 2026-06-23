@@ -105,6 +105,15 @@
   <arg name="persistent_voxel_size" default="0.005" />
   <arg name="persistent_commit_threshold" default="2" />
   <arg name="persistent_max_voxels" default="50000" />
+  <arg name="moving_sphere_enabled" default="true" />
+  <arg name="moving_sphere_initial_x" default="0.50" />
+  <arg name="moving_sphere_initial_y" default="-0.50" />
+  <arg name="moving_sphere_initial_z" default="1.05" />
+  <arg name="moving_sphere_velocity_x" default="0.0" />
+  <arg name="moving_sphere_velocity_y" default="0.05" />
+  <arg name="moving_sphere_velocity_z" default="0.0" />
+  <arg name="moving_sphere_radius" default="0.08" />
+  <arg name="moving_sphere_num_points" default="1000" />
   <arg name="condition_num_points" default="256" />
   <arg name="condition_target_timeout" default="5.0" />
   <arg name="condition_hold_last_target_on_loss" default="true" />
@@ -212,6 +221,15 @@
         <param name="voxel_size"        value="$(arg persistent_voxel_size)" />
         <param name="commit_threshold"  value="$(arg persistent_commit_threshold)" />
         <param name="max_voxels"        value="$(arg persistent_max_voxels)" />
+        <param name="moving_sphere_enabled"    value="$(arg moving_sphere_enabled)" />
+        <param name="moving_sphere_initial_x"  value="$(arg moving_sphere_initial_x)" />
+        <param name="moving_sphere_initial_y"  value="$(arg moving_sphere_initial_y)" />
+        <param name="moving_sphere_initial_z"  value="$(arg moving_sphere_initial_z)" />
+        <param name="moving_sphere_velocity_x" value="$(arg moving_sphere_velocity_x)" />
+        <param name="moving_sphere_velocity_y" value="$(arg moving_sphere_velocity_y)" />
+        <param name="moving_sphere_velocity_z" value="$(arg moving_sphere_velocity_z)" />
+        <param name="moving_sphere_radius"      value="$(arg moving_sphere_radius)" />
+        <param name="moving_sphere_num_points"  value="$(arg moving_sphere_num_points)" />
         <param name="log_counts"        value="$(arg log_persistent_counts)" />
   </node>
 

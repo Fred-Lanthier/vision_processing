@@ -38,24 +38,65 @@ from pipeline_timing import TimingPublisher
 
 # ── Shared helper ─────────────────────────────────────────────────────────────
 
-def _make_cloud_msg(header, pts_np):
-    """Zero-copy PointCloud2 from numpy [N, 3] float32."""
+def _make_cloud_msg(header, pts_np, rgb_uint32=None):
+    """Create an XYZ or packed-RGB PointCloud2 from numpy arrays."""
     pts = np.ascontiguousarray(pts_np, dtype=np.float32)
     msg = PointCloud2()
     msg.header       = header
     msg.height       = 1
     msg.width        = len(pts)
     msg.is_bigendian = False
-    msg.point_step   = 12
-    msg.row_step     = 12 * len(pts)
     msg.fields = [
         PointField('x', 0, PointField.FLOAT32, 1),
         PointField('y', 4, PointField.FLOAT32, 1),
         PointField('z', 8, PointField.FLOAT32, 1),
     ]
-    msg.data     = pts.tobytes()
+    if rgb_uint32 is None:
+        msg.point_step = 12
+        data = pts
+    else:
+        rgb = np.asarray(rgb_uint32, dtype=np.uint32).reshape(-1)
+        if len(rgb) != len(pts):
+            raise ValueError("One packed RGB value is required per point.")
+        data = np.empty((len(pts), 4), dtype=np.float32)
+        data[:, :3] = pts
+        data[:, 3].view(np.uint32)[:] = rgb
+        msg.fields.append(PointField('rgb', 12, PointField.FLOAT32, 1))
+        msg.point_step = 16
+    msg.row_step = msg.point_step * len(pts)
+    msg.data     = data.tobytes()
     msg.is_dense = True
     return msg
+
+
+def _fibonacci_sphere_offsets(radius, num_points):
+    """Return uniformly distributed surface offsets for a sphere."""
+    radius = float(radius)
+    num_points = int(num_points)
+    if radius <= 0.0:
+        raise ValueError("Sphere radius must be positive.")
+    if num_points < 4:
+        raise ValueError("A sphere point cloud requires at least four points.")
+
+    indices = np.arange(num_points, dtype=np.float64) + 0.5
+    z = 1.0 - 2.0 * indices / num_points
+    radial = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    theta = np.pi * (1.0 + np.sqrt(5.0)) * indices
+    unit_sphere = np.column_stack([
+        radial * np.cos(theta),
+        radial * np.sin(theta),
+        z,
+    ])
+    return np.ascontiguousarray(radius * unit_sphere, dtype=np.float32)
+
+
+def _linear_motion_position(initial_position, velocity, elapsed):
+    """Position of a constant-velocity obstacle after ``elapsed`` seconds."""
+    initial = np.asarray(initial_position, dtype=np.float32)
+    velocity = np.asarray(velocity, dtype=np.float32)
+    if initial.shape != (3,) or velocity.shape != (3,):
+        raise ValueError("Initial position and velocity must each contain x, y, z.")
+    return initial + velocity * np.float32(max(0.0, float(elapsed)))
 
 
 # ── GPU per-voxel freespace check ─────────────────────────────────────────────
@@ -150,6 +191,39 @@ class PersistentCloudNode:
             "~publish_evicted_debug", False))
         self.log_freespace_evictions = bool(rospy.get_param(
             "~log_freespace_evictions", False))
+
+        # ── Camera-independent moving obstacle ───────────────────────────────
+        # This sphere is overlaid only on the published obstacle cloud. It is
+        # therefore never removed by camera freespace checks and, unlike points
+        # integrated into obs_world, leaves no stale trail as it moves.
+        self.moving_sphere_enabled = bool(rospy.get_param(
+            "~moving_sphere_enabled", False))
+        self.moving_sphere_initial_position = np.array([
+            float(rospy.get_param("~moving_sphere_initial_x", 0.50)),
+            float(rospy.get_param("~moving_sphere_initial_y", -0.50)),
+            float(rospy.get_param("~moving_sphere_initial_z", 1.05)),
+        ], dtype=np.float32)
+        self.moving_sphere_velocity = np.array([
+            float(rospy.get_param("~moving_sphere_velocity_x", 0.0)),
+            float(rospy.get_param("~moving_sphere_velocity_y", 0.05)),
+            float(rospy.get_param("~moving_sphere_velocity_z", 0.0)),
+        ], dtype=np.float32)
+        self.moving_sphere_radius = float(rospy.get_param(
+            "~moving_sphere_radius", 0.08))
+        self.moving_sphere_num_points = int(rospy.get_param(
+            "~moving_sphere_num_points", 1000))
+        self._moving_sphere_start_time = None
+        self._moving_sphere_offsets = None
+        if self.moving_sphere_enabled:
+            values = np.concatenate([
+                self.moving_sphere_initial_position,
+                self.moving_sphere_velocity,
+                np.array([self.moving_sphere_radius], dtype=np.float32),
+            ])
+            if not np.isfinite(values).all():
+                raise ValueError("Moving-sphere position, velocity, and radius must be finite.")
+            self._moving_sphere_offsets = _fibonacci_sphere_offsets(
+                self.moving_sphere_radius, self.moving_sphere_num_points)
 
         # ── Robot self-filter ─────────────────────────────────────────────────
         # Removes depth-projected points on robot body links before integration.
@@ -259,6 +333,15 @@ class PersistentCloudNode:
             "freespace_evict=%s | self-filter radius=%.0fcm | device=%s",
             obs_voxel_size * 1000, obs_commit_thresh, obs_free_margin * 1000,
             self.freespace_evict_enabled, self.robot_body_radius * 100, device)
+        if self.moving_sphere_enabled:
+            rospy.loginfo(
+                "Synthetic moving sphere | center0=%s m | velocity=%s m/s | "
+                "radius=%.0f mm | points=%d | frame=%s",
+                np.array2string(self.moving_sphere_initial_position, precision=3),
+                np.array2string(self.moving_sphere_velocity, precision=3),
+                self.moving_sphere_radius * 1000.0,
+                self.moving_sphere_num_points,
+                self.world_frame)
 
     # ── Robot link position helper ────────────────────────────────────────────
 
@@ -621,6 +704,26 @@ class PersistentCloudNode:
 
         return self._generate_circular_floor_patch(floor_z)
 
+    # ── Camera-independent moving sphere ─────────────────────────────────────
+
+    def _generate_moving_sphere(self, now_sec=None):
+        """Return the sphere surface at its current world-frame position."""
+        if not self.moving_sphere_enabled:
+            return None
+
+        now_sec = rospy.get_time() if now_sec is None else float(now_sec)
+        if self._moving_sphere_start_time is None or \
+                now_sec < self._moving_sphere_start_time:
+            # Lazy initialization handles /use_sim_time startup and clock resets.
+            self._moving_sphere_start_time = now_sec
+
+        elapsed = now_sec - self._moving_sphere_start_time
+        center = _linear_motion_position(
+            self.moving_sphere_initial_position,
+            self.moving_sphere_velocity,
+            elapsed)
+        return self._moving_sphere_offsets + center[None, :]
+
     # ── Publishing ────────────────────────────────────────────────────────────
 
     def _publish(self, stamp):
@@ -666,16 +769,42 @@ class PersistentCloudNode:
             _, unique_idx = np.unique(h_all, return_index=True)
             obs_pts = all_pts[unique_idx].astype(np.float32)
 
-        if obs_pts is not None and len(obs_pts) > self.obs_max_pts:
-            obs_pts = obs_pts[:self.obs_max_pts]
+        # Reserve capacity for the camera-independent obstacle so it cannot be
+        # truncated when the persistent camera map reaches max_voxels.
+        sphere_pts = self._generate_moving_sphere()
+        sphere_count = 0 if sphere_pts is None else len(sphere_pts)
+        if sphere_count > self.obs_max_pts:
+            sphere_pts = sphere_pts[:self.obs_max_pts]
+            sphere_count = len(sphere_pts)
+        camera_point_budget = max(0, self.obs_max_pts - sphere_count)
+        if obs_pts is not None and len(obs_pts) > camera_point_budget:
+            obs_pts = obs_pts[:camera_point_budget]
+        map_point_count = 0 if obs_pts is None else len(obs_pts)
+        if sphere_count > 0:
+            obs_pts = np.vstack([obs_pts, sphere_pts]) \
+                if obs_pts is not None and len(obs_pts) > 0 else sphere_pts
 
         if obs_pts is not None and len(obs_pts) > 0:
-            self.pub.publish(_make_cloud_msg(header, obs_pts))
+            # One message and one collision map: measured/persistent points are
+            # gray and the synthetic points are magenta. Downstream CBF nodes
+            # still read fields x/y/z as the first three float32 values.
+            colors = np.full(len(obs_pts), 0xB4B4B4, dtype=np.uint32)
+            if sphere_count > 0:
+                colors[map_point_count:] = 0xFF00FF
+            self.pub.publish(_make_cloud_msg(header, obs_pts, colors))
+            if sphere_count > 0:
+                rospy.loginfo_once(
+                    "First persistent_obstacles output contains %d mapped points "
+                    "+ %d moving-sphere points (total=%d).",
+                    map_point_count, sphere_count, len(obs_pts))
 
         if self.log_counts:
+            total_count = 0 if obs_pts is None else len(obs_pts)
             rospy.loginfo_throttle(5.0,
-                "Obs committed: %d | Target committed: %d",
-                self.obs_world.count(), self._tgt_world.count())
+                "persistent_obstacles output: total=%d | mapped=%d | "
+                "synthetic sphere=%d | target=%d",
+                total_count, self.obs_world.count(), sphere_count,
+                self._tgt_world.count())
 
     def _publish_target(self, stamp):
         header  = Header(stamp=stamp, frame_id=self.world_frame)

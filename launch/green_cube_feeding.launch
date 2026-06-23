@@ -15,6 +15,18 @@
   <arg name="bridge_point_dt" default="0.05" />
   <arg name="bridge_lead_time" default="0.06" />
 
+  <!-- Camera-independent dynamic obstacle in the world frame.
+       For the Panda base frame, -Y is the robot's right side. The default
+       sphere starts there and moves only along +Y through the workspace. -->
+  <arg name="moving_sphere_enabled" default="true" />
+  <arg name="moving_sphere_initial_x" default="0.50" />
+  <arg name="moving_sphere_initial_y" default="-0.50" />
+  <arg name="moving_sphere_initial_z" default="1.05" />
+  <arg name="moving_sphere_velocity_x" default="0.0" />
+  <arg name="moving_sphere_velocity_y" default="0.05" />
+  <arg name="moving_sphere_velocity_z" default="0.0" />
+  <arg name="moving_sphere_radius" default="0.08" />
+
   <!-- 2. Dual SAM3+SAM2 Detector -->
   <node name="sam3_sam2" pkg="vision_processing" type="sam3_sam2_node.py" output="screen" cwd="node">
     <param name="target_prompt" value="$(arg target_prompt)" />
@@ -48,6 +60,15 @@
     <param name="voxel_size" value="0.005" />
     <param name="commit_threshold" value="2" />
     <param name="max_voxels" value="50000" />
+    <param name="moving_sphere_enabled" value="$(arg moving_sphere_enabled)" />
+    <param name="moving_sphere_initial_x" value="$(arg moving_sphere_initial_x)" />
+    <param name="moving_sphere_initial_y" value="$(arg moving_sphere_initial_y)" />
+    <param name="moving_sphere_initial_z" value="$(arg moving_sphere_initial_z)" />
+    <param name="moving_sphere_velocity_x" value="$(arg moving_sphere_velocity_x)" />
+    <param name="moving_sphere_velocity_y" value="$(arg moving_sphere_velocity_y)" />
+    <param name="moving_sphere_velocity_z" value="$(arg moving_sphere_velocity_z)" />
+    <param name="moving_sphere_radius" value="$(arg moving_sphere_radius)" />
+    <param name="moving_sphere_num_points" value="1000" />
   </node>
 
   <!-- 5. Condition Merger -->

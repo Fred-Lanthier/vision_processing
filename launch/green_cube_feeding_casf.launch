@@ -160,6 +160,17 @@
   <arg name="persistent_floor_footprint_margin"   default="0.0" />
   <arg name="persistent_floor_height_filter_tau"  default="0.0" />
   <arg name="persistent_floor_height_max_step"    default="0.0" />
+  <!-- Camera-independent obstacle. In the Panda/world convention, -Y is the
+       robot's right side; the default sphere moves only along +Y. -->
+  <arg name="moving_sphere_enabled" default="true" />
+  <arg name="moving_sphere_initial_x" default="0.30" />
+  <arg name="moving_sphere_initial_y" default="-9.6" />
+  <arg name="moving_sphere_initial_z" default="0.5" />
+  <arg name="moving_sphere_velocity_x" default="0.0" />
+  <arg name="moving_sphere_velocity_y" default="0.30" />
+  <arg name="moving_sphere_velocity_z" default="0.0" />
+  <arg name="moving_sphere_radius" default="0.08" />
+  <arg name="moving_sphere_num_points" default="1000" />
   <arg name="condition_num_points" default="256" />
   <arg name="condition_target_timeout" default="5.0" />
   <arg name="condition_hold_last_target_on_loss" default="true" />
@@ -373,6 +384,15 @@
         <param name="floor_footprint_margin"        value="$(arg persistent_floor_footprint_margin)" />
         <param name="floor_height_filter_tau"       value="$(arg persistent_floor_height_filter_tau)" />
         <param name="floor_height_max_step"         value="$(arg persistent_floor_height_max_step)" />
+        <param name="moving_sphere_enabled"    value="$(arg moving_sphere_enabled)" />
+        <param name="moving_sphere_initial_x"  value="$(arg moving_sphere_initial_x)" />
+        <param name="moving_sphere_initial_y"  value="$(arg moving_sphere_initial_y)" />
+        <param name="moving_sphere_initial_z"  value="$(arg moving_sphere_initial_z)" />
+        <param name="moving_sphere_velocity_x" value="$(arg moving_sphere_velocity_x)" />
+        <param name="moving_sphere_velocity_y" value="$(arg moving_sphere_velocity_y)" />
+        <param name="moving_sphere_velocity_z" value="$(arg moving_sphere_velocity_z)" />
+        <param name="moving_sphere_radius"      value="$(arg moving_sphere_radius)" />
+        <param name="moving_sphere_num_points"  value="$(arg moving_sphere_num_points)" />
         <param name="log_counts"          value="$(arg log_persistent_counts)" />
         <param name="log_freespace_evictions" value="$(arg log_persistent_evictions)" />
   </node>

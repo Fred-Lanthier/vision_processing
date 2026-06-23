@@ -19,13 +19,13 @@ rosbag record -O run1.bag /cbf_safety/diagnostics /cbf_safety/diagnostics_layout
 pour les trajectoires, ajouté :
 
 rosbag record --lz4 -O run21.bag /cbf_safety/diagnostics /cbf_safety/diagnostics_layout /joint_states /perception/persistent_obstacles
-rosbag record --lz4 -O run22.bag -e \
+rosbag record --lz4 -O run26.bag -e \
     '/cbf_safety/diagnostics(_layout)?$|/joint_states$|/perception/persistent_obstacles$|/pipeline/timing/.*'
 
     
 When it is done, run :
 
-python3 scripts/plot_cbf_diagnostics.py run22.bag --csv for the plots of one bag
+python3 scripts/plot_cbf_diagnostics.py run26.bag --csv for the plots of one bag
 
 For comparison : 
 

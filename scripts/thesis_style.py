@@ -39,7 +39,17 @@ GREY = "#555555"
 LIGHTGREY = "#909090"
 
 # printed widths [inches]
-TEXTWIDTH = 6.3
+# \textwidth du gabarit Polytechnique = 472.03 pt / 72.27 = 6.53 in.
+# Pour que la police imprimee soit EXACTEMENT font.size (12 pt) quelle que
+# soit la figure, on cree chaque figure a sa largeur physique finale (en
+# pouces) et on l'inclut SANS option width :  \includesvg[inkscapelatex=false]{...}
+# Ainsi l'echelle vaut toujours 1 et 12 pt matplotlib = 12 pt sur la page.
+# La fraction de page occupee se regle ici, via figsize, pas dans LaTeX.
+TEXTWIDTH = 6.53        # pleine largeur de texte
+def width(frac=1.0):
+    """Largeur physique [pouces] pour une figure occupant `frac` de \\textwidth.
+    A inclure ensuite sans `width` dans LaTeX pour garder l'echelle = 1."""
+    return frac * TEXTWIDTH
 
 
 def apply():
@@ -51,12 +61,15 @@ def apply():
         "font.family": "serif",
         "font.serif": ["Latin Modern Roman", "CMU Serif", "DejaVu Serif"],
         "mathtext.fontset": "cm",
-        "font.size": 10,
-        "axes.titlesize": 10,
-        "axes.labelsize": 10,
-        "legend.fontsize": 8.5,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
+        # Police de base = 12 pt, identique au corps de texte du mémoire.
+        # Valable seulement si la figure est créée à TEXTWIDTH et incluse
+        # à width=\textwidth (échelle 1). Sinon, multiplier par l'échelle.
+        "font.size": 12,
+        "axes.titlesize": 12,
+        "axes.labelsize": 12,
+        "legend.fontsize": 11,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
         "axes.spines.top": False,
         "axes.spines.right": False,
         "axes.grid": True,

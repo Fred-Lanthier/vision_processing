@@ -52,7 +52,7 @@ CKPT_NAME = 'best_fm_model_9D_dynamics_1024.ckpt'
 
 # --- scene selection (self-contained: robot joints + scene + trajectory all
 #     come from the SAME recorded timestep) ------------------------------------
-TRAJ_ID = 6           # recorded trajectory folder (datas/Trajectories_preprocess)
+TRAJ_ID = 60           # recorded trajectory folder (datas/Trajectories_preprocess)
 STATE_IDX = 25        # timestep: fork descending toward the cube (approach phase)
 OBS_HORIZON = 2
 PRED_HORIZON = 16
