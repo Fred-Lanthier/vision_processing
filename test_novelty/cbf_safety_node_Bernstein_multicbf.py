@@ -41,6 +41,10 @@ from third_party.RDF.urdf_layer import URDFLayer # Le module de cinématique est
 from third_party.SDF_Bernstein_Basis.src.rdf_weights import RDF_Weights
 from third_party.SDF_Bernstein_Basis.bernstein_core import BernsteinCore
 from third_party.SDF_Bernstein_Basis.bernstein_barrier import BernsteinBarrier
+from vision_processing.analytical_bernstein import (
+    AnalyticalBernsteinSoftmin,
+    project_halfspaces_sequential,
+)
 
 from vision_processing import fast_perception_module
 
@@ -165,8 +169,9 @@ class CBFSafetyNode:
         # stable correction direction at the cost of a larger bias.
         # Effective trigger clearance = d_safe + alpha*log(N).
         # Tune with cbf_graph_points because the soft-min bias depends on N.
-        barrier_alpha = float(rospy.get_param("~barrier_alpha", 0.005))
-        self.barrier = BernsteinBarrier(self.bernstein_core, d_safe=self.d_safe, alpha=barrier_alpha)
+        self.barrier_alpha = float(rospy.get_param("~barrier_alpha", 0.005))
+        self.barrier = BernsteinBarrier(
+            self.bernstein_core, d_safe=self.d_safe, alpha=self.barrier_alpha)
         self._log_cuda_memory("CBF after Bernstein barrier")
 
         # Grasped object: when the grasp node welds food to fork_tip it publishes
@@ -201,6 +206,15 @@ class CBFSafetyNode:
                 softmin_beta=self.grasp_softmin_beta,
                 d_safe_global=self.d_safe, grasp_d_safe=grasp_d_safe)
 
+        # Exact explicit RDF/Jacobian chain.  This evaluator never enables
+        # gradients and never calls torch.autograd; it returns one smooth row per
+        # protected link (plus the optional rigid grasp cloud).
+        self.analytical_barrier = AnalyticalBernsteinSoftmin(
+            self.bernstein_core,
+            temperature=self.barrier_alpha,
+            d_safe=self.d_safe,
+        )
+
         # kappa: class-K coefficient in the CBF constraint ∇h·dq + κh ≥ 0.
         # High kappa forces hard corrections even when h is slightly positive (safe).
         # With a jumpy gradient, high kappa amplifies oscillation near obstacles.
@@ -217,10 +231,12 @@ class CBFSafetyNode:
         self.cbf_active_constraints = max(1, int(rospy.get_param(
             "~cbf_active_constraints", 4)))
         self.cbf_multi_gradient_mode = str(rospy.get_param(
-            "~cbf_multi_gradient_mode", "finite_difference")).lower()
-        if self.cbf_multi_gradient_mode not in ("finite_difference", "autograd"):
+            "~cbf_multi_gradient_mode", "analytical")).lower()
+        if self.cbf_multi_gradient_mode not in (
+                "analytical", "finite_difference", "autograd"):
             raise ValueError(
-                "~cbf_multi_gradient_mode must be 'finite_difference' or 'autograd'")
+                "~cbf_multi_gradient_mode must be 'analytical', "
+                "'finite_difference', or 'autograd'")
         self.cbf_multi_fd_eps = max(
             1e-5, float(rospy.get_param("~cbf_multi_fd_eps", 1e-3)))
         self.cbf_h_activate = float(rospy.get_param("~cbf_h_activate", 0.006))
@@ -403,6 +419,13 @@ class CBFSafetyNode:
         self._contact_stopped = False
         self._contact_q = None
         self.publish_controller_command = _bool_param("~publish_controller_command", False)
+        self.publish_velocity_controller_command = _bool_param(
+            "~publish_velocity_controller_command", False)
+        if (self.publish_controller_command
+                and self.publish_velocity_controller_command):
+            raise ValueError(
+                "Position and velocity controller command publication are "
+                "mutually exclusive")
         self.preprocess_rate_hz = float(rospy.get_param("~preprocess_rate_hz", 30.0))
         self.viz_rate_hz = float(rospy.get_param("~viz_rate_hz", 5.0))
         self.publish_debug_topics = _bool_param("~publish_debug_topics", False)
@@ -424,9 +447,20 @@ class CBFSafetyNode:
         self.fork_filter_radius = float(rospy.get_param("~fork_filter_radius", 0.15))
         self.nominal_hold_deadband = float(rospy.get_param("~nominal_hold_deadband", 1e-4))
         self.cbf_candidate_filter = str(rospy.get_param("~cbf_candidate_filter", "sphere")).lower()
-        if self.cbf_candidate_filter not in ("sphere", "sdf", "link_spheres"):
+        if self.cbf_candidate_filter not in ("sphere", "sdf", "link_spheres", "prism"):
             raise ValueError(
-                "~cbf_candidate_filter must be 'sphere', 'link_spheres', or 'sdf'")
+                "~cbf_candidate_filter must be 'sphere', 'link_spheres', 'prism', or 'sdf'")
+        # 'prism' prefilter margin (world metres). The per-link box is the tight
+        # per-axis AABB of {sdf <= margin} -- i.e. every point within `margin` of
+        # the link surface -- so it is a compact rectangular prism, not a cube.
+        # d_safe is 1.5 cm, so the default 3 cm keeps every point that could ever
+        # be active in the QP while discarding the rest with a few matmuls.
+        self.cbf_prism_margin = float(rospy.get_param("~cbf_prism_margin", 0.03))
+        # Tight per-link boxes (local-frame AABB corners), filled lazily below.
+        self.prism_lo = None
+        self.prism_hi = None
+        if self.cbf_candidate_filter == "prism":
+            self._precompute_prism_boxes()
         # Debug radius for the RViz link spheres. The live 'link_spheres'
         # prefilter keeps a fixed number of nearest points, rather than a hard
         # radius, so the CBF is never starved when the cloud is sparse or the
@@ -481,6 +515,9 @@ class CBFSafetyNode:
         self.debug_tip_min = None
         self.debug_filter_center = None
         self.debug_link_centers = None
+        # ('prism' filter) per-link oriented boxes for RViz: (centers[K,3],
+        # rotations[K,3,3], full_side[K]) in the world frame.
+        self.debug_prism_boxes = None
         self.debug_candidate_points = None   # the candidate pool (~512) the SDF ranks
         self.debug_sdf_prefilter_counts = None
 
@@ -523,6 +560,13 @@ class CBFSafetyNode:
         self.pos_cmd_pub = None
         if self.publish_controller_command:
             self.pos_cmd_pub = rospy.Publisher('/joint_group_position_controller/command', Float64MultiArray, queue_size=1)
+        self.velocity_cmd_pub = None
+        if self.publish_velocity_controller_command:
+            self.velocity_cmd_pub = rospy.Publisher(
+                '/joint_group_velocity_controller/command',
+                Float64MultiArray,
+                queue_size=1)
+            rospy.on_shutdown(self._stop_velocity_controller)
         self.safe_cmd_pub = rospy.Publisher('/planner/safe_joint_command', Float64MultiArray, queue_size=1)
         self.ready_pub = rospy.Publisher('/cbf_safety/ready', Bool, queue_size=1, latch=True)
         self.h_pub = rospy.Publisher('/cbf_safety/h_value', Float32MultiArray, queue_size=1)
@@ -749,6 +793,64 @@ class CBFSafetyNode:
         sdf = torch.matmul(phi, group["weights"][group_index])
         return (sdf + torch.norm(residual, dim=-1)) * scale
 
+    def _precompute_prism_boxes(self):
+        """Tight per-link oriented box for the 'prism' candidate filter.
+
+        For each protected link, sample its Bernstein SDF on a grid in the link's
+        local frame and take the per-axis bounds of ``{sdf <= cbf_prism_margin}``
+        -- the set of points that could ever fall within the prefilter margin of
+        the link surface. Stored as local-frame AABB corners
+        (``prism_lo``/``prism_hi``, world metres). The box is constant in the
+        link frame, so this runs once, and it is a compact rectangular prism that
+        is tight on each axis independently (unlike the isotropic SDF cube).
+        """
+        resolution = self.safety_envelope_resolution
+        level = self.cbf_prism_margin
+        K = self.bernstein_core.K
+        lo = torch.zeros((K, 3), device=self.device)
+        hi = torch.zeros((K, 3), device=self.device)
+        started = time.perf_counter()
+        with torch.no_grad():
+            for link_index in range(K):
+                offset = self.bernstein_core.offsets[link_index]
+                scale = float(self.bernstein_core.scales[link_index].item())
+                # The surface lives within `scale` of the centroid; {sdf<=level}
+                # extends ~level beyond it. Pad a little so the grid encloses it.
+                half_extent = scale + level + 0.01
+                spacing = 2.0 * half_extent / (resolution - 1)
+                axes = [
+                    torch.linspace(
+                        float(offset[a].item()) - half_extent,
+                        float(offset[a].item()) + half_extent,
+                        resolution, device=self.device, dtype=torch.float32)
+                    for a in range(3)
+                ]
+                grid = torch.stack(
+                    torch.meshgrid(*axes, indexing='ij'), dim=-1).reshape(-1, 3)
+                sdf_chunks = [
+                    self._evaluate_link_sdf_local(link_index, chunk)
+                    for chunk in torch.split(grid, 4096, dim=0)
+                ]
+                sdf = torch.cat(sdf_chunks)                       # [G]
+                inside = sdf <= level
+                if not bool(inside.any()):
+                    # Degenerate: fall back to the isotropic cube.
+                    lo[link_index] = offset - (scale + level)
+                    hi[link_index] = offset + (scale + level)
+                    rospy.logwarn(
+                        "prism box: link %s has empty {sdf<=%.3f}; using cube.",
+                        self.protected_link_names[link_index], level)
+                    continue
+                pts_in = grid[inside]
+                # Pad by one grid cell so discretisation never clips a real point.
+                lo[link_index] = pts_in.min(dim=0).values - spacing
+                hi[link_index] = pts_in.max(dim=0).values + spacing
+        self.prism_lo = lo
+        self.prism_hi = hi
+        rospy.loginfo(
+            "Precomputed %d tight prism boxes (margin=%.3f m, grid=%d^3, %.0f ms).",
+            K, level, resolution, (time.perf_counter() - started) * 1000.0)
+
     def _find_visual_info(self, link_name):
         for info in self.robot_layer.meshes_info:
             if info['link_name'] == link_name:
@@ -943,10 +1045,16 @@ class CBFSafetyNode:
           Calculates whole-body safety over n_points selected obstacle points.
           dq_safe = dq_nom + lam * grad_h.
         """
-        print(f"⚡ Initialisation Multi-CBF ({n_points} selected points)...")
+        print(
+            f"⚡ Initialisation CBF ({n_points} selected points, "
+            f"solver={self.cbf_solver_mode}, gradient={self.cbf_multi_gradient_mode})...")
         torch.cuda.empty_cache()
 
-        self.static_q      = torch.zeros((batch_size, 7), device=self.device, requires_grad=True)
+        self.static_q = torch.zeros(
+            (batch_size, 7), device=self.device,
+            requires_grad=(
+                self.cbf_solver_mode == "fast_tangent"
+                and self.cbf_multi_gradient_mode != "analytical"))
         self.static_obs    = torch.zeros((n_points, 3),   device=self.device)
         self.static_dq_nom = torch.zeros((batch_size, 7), device=self.device)
         self.static_dq_safe = torch.zeros((batch_size, 7), device=self.device)
@@ -1030,11 +1138,49 @@ class CBFSafetyNode:
         n_robot = self.bernstein_core.K
         two_group_iters = self.cbf_two_group_iters
 
+        analytical_point_mask = None
+        if self.cbf_multi_gradient_mode == "analytical" and two_group:
+            # Selected obstacles are ordered [robot points | food points].  Keep
+            # the original two-group partition while evaluating all analytical
+            # rows in one pass and one CUDA graph.
+            analytical_point_mask = torch.zeros(
+                (n_robot + 1, n_points), dtype=torch.bool, device=self.device)
+            analytical_point_mask[:n_robot, :self.n_obs_robot_split] = True
+            analytical_point_mask[n_robot, self.n_obs_robot_split:] = True
+
+        def _analytical_constraints():
+            result = self.analytical_barrier.evaluate(
+                self.static_q,
+                self.static_obs,
+                point_mask=analytical_point_mask,
+            )
+            h_links = result.h
+            g_links = result.grad_q
+            if two_group:
+                h_robot_links = h_links[:, :n_robot]
+                robot_index = h_robot_links.argmin(dim=1)
+                h_robot = h_robot_links.gather(
+                    1, robot_index[:, None]).squeeze(1)
+                g_robot = g_links[:, :n_robot, :].gather(
+                    1,
+                    robot_index[:, None, None].expand(-1, 1, 7),
+                ).squeeze(1)
+                return h_robot, g_robot, h_links[:, n_robot], g_links[:, n_robot, :]
+
+            link_index = h_links.argmin(dim=1)
+            h = h_links.gather(1, link_index[:, None]).squeeze(1)
+            gradient = g_links.gather(
+                1, link_index[:, None, None].expand(-1, 1, 7)).squeeze(1)
+            return h, gradient
+
         def _solve(dq_nom):
             if two_group:
-                h_r, g_r, h_f, g_f = self.barrier.forward_two_group(
-                    self.static_q, self.static_obs, n_robot,
-                    n_obs_robot=self.n_obs_robot_split)
+                if self.cbf_multi_gradient_mode == "analytical":
+                    h_r, g_r, h_f, g_f = _analytical_constraints()
+                else:
+                    h_r, g_r, h_f, g_f = self.barrier.forward_two_group(
+                        self.static_q, self.static_obs, n_robot,
+                        n_obs_robot=self.n_obs_robot_split)
                 # Retain the target barrier for diagnostics before _qp_step
                 # overwrites static_h with each group's value in turn. Capped at
                 # 0.25 for the diagnostic only (the QP still uses the true h_f
@@ -1046,7 +1192,10 @@ class CBFSafetyNode:
                     dq = _qp_step(h_r, g_r, dq, *robot_band)   # fork+robot (last)
                 self.static_grad_h.copy_(g_r)
                 return dq
-            h, g, _ = self.barrier(self.static_q, self.static_obs)
+            if self.cbf_multi_gradient_mode == "analytical":
+                h, g = _analytical_constraints()
+            else:
+                h, g, _ = self.barrier(self.static_q, self.static_obs)
             self.static_grad_h.copy_(g)
             return _qp_step(h, g, dq_nom, *robot_band)
 
@@ -1069,15 +1218,19 @@ class CBFSafetyNode:
             if self.static_q.grad is not None: self.static_q.grad.zero_()
             self.static_dq_safe.copy_(_solve(self.static_dq_nom))
 
-        print(f"✅ Graphe CUDA capturé ({n_points} points) !")
+        print(
+            f"✅ Graphe CUDA capturé ({n_points} points, "
+            f"gradient={self.cbf_multi_gradient_mode}) !")
         self._log_cuda_memory("CBF setup_cuda_graph captured")
 
     def solve_multicbf_projection(self, current_q, obs_points, dq_nom):
         """
         Tangent-preserving multi-constraint CBF.
 
-        Each active obstacle point contributes one half-space:
-            grad_h_i · dq >= bound_i(h_i)
+        In analytical mode, each active robot link contributes one smooth
+        Softmin half-space (the optional grasp cloud is one additional row):
+            grad_h_k · dq >= bound_k(h_k)
+        Legacy finite-difference/autograd modes retain one row per obstacle point.
         The sequential projection keeps dq as close as possible to dq_nom while
         removing only the unsafe inward normal component.
         """
@@ -1094,88 +1247,125 @@ class CBFSafetyNode:
             return dq_nom
 
         obs_eval = obs_points[:valid_count]
-        with torch.no_grad():
-            q_probe = current_q.detach()
-            pose_probe = self.eye4.expand(q_probe.shape[0], 4, 4)
-            sdf_probe = self.bernstein_core.get_whole_body_sdf_batch(
-                obs_eval, pose_probe, q_probe, return_per_link=False)
-            h_probe = sdf_probe[0] - self.d_safe
+        q_probe = current_q.detach()
 
-        active_window = min(valid_count, max(self.cbf_active_constraints * 3, self.cbf_active_constraints))
-        _, near_idx = torch.topk(h_probe, k=active_window, largest=False, sorted=True)
-        h_near = h_probe[near_idx]
-        active_mask = h_near <= self.cbf_h_activate
-        if not torch.any(active_mask):
-            self._last_active_constraints = 0
-            h_min = h_probe.min().view(1)
-            self.static_h.copy_(h_min)
-            self.static_constr.copy_(torch.zeros_like(h_min))
-            self.static_grad_h.zero_()
-            return dq_nom
+        if self.cbf_multi_gradient_mode == "analytical":
+            # One vectorized evaluation produces every per-link h_k and the full
+            # Kx7 constraint Jacobian.  evaluate() is inference-mode internally:
+            # no requires_grad tensors, dynamic graph, or autograd calls.
+            analytical = self.analytical_barrier.evaluate(q_probe, obs_eval)
+            h_probe = analytical.h[0]
+            G_probe = analytical.grad_q[0]
+            if int(h_probe.numel()) > self.bernstein_core.K:
+                self.static_h_food.copy_(torch.clamp(h_probe[-1], max=0.25).view(1))
 
-        active_idx = near_idx[active_mask][:self.cbf_active_constraints]
-        obs_active = obs_eval[active_idx]
-
-        if self.cbf_multi_gradient_mode == "finite_difference":
-            with torch.no_grad():
-                eps = self.cbf_multi_fd_eps
-                q_base = current_q.detach().view(1, 7)
-                q_eval = q_base.expand(8, 7).clone()
-                q_eval[1:, :].add_(eps * torch.eye(
-                    7, device=self.device, dtype=q_eval.dtype))
-                pose = self.eye4.expand(q_eval.shape[0], 4, 4)
-                sdf_fd = self.bernstein_core.get_whole_body_sdf_batch(
-                    obs_active, pose, q_eval, return_per_link=False)
-                h_fd = sdf_fd - self.d_safe
-                h_det = h_fd[0].detach()
-                G = ((h_fd[1:] - h_fd[0:1]) / eps).transpose(0, 1).contiguous()
-        else:
-            prev_grad_enabled = torch.is_grad_enabled()
-            torch.set_grad_enabled(True)
-            q_eval = current_q.detach().clone().requires_grad_(True)
-            pose = self.eye4.expand(q_eval.shape[0], 4, 4)
-            sdf_active = self.bernstein_core.get_whole_body_sdf_batch(
-                obs_active, pose, q_eval, return_per_link=False)
-            h_active = sdf_active[0] - self.d_safe
-
-            if int(h_active.numel()) <= 0:
+            active_window = min(
+                int(h_probe.numel()),
+                max(self.cbf_active_constraints * 3, self.cbf_active_constraints),
+            )
+            _, near_idx = torch.topk(
+                h_probe, k=active_window, largest=False, sorted=True)
+            h_near = h_probe[near_idx]
+            active_mask = h_near <= self.cbf_h_activate
+            if not torch.any(active_mask):
                 self._last_active_constraints = 0
-                self.static_h.copy_(h_probe.min().view(1))
-                self.static_constr.zero_()
+                h_min = h_probe.min().view(1)
+                self.static_h.copy_(h_min)
+                self.static_constr.copy_(torch.zeros_like(h_min))
                 self.static_grad_h.zero_()
-                torch.set_grad_enabled(prev_grad_enabled)
                 return dq_nom
 
-            # One batched vector-Jacobian product is much cheaper than K separate
-            # backward passes. Fall back only for older PyTorch versions.
-            try:
-                grad_outputs = torch.eye(
-                    int(h_active.numel()), device=self.device, dtype=h_active.dtype)
-                grad_batch = torch.autograd.grad(
-                    outputs=h_active,
-                    inputs=q_eval,
-                    grad_outputs=grad_outputs,
-                    is_grads_batched=True,
-                    retain_graph=False,
-                    create_graph=False,
-                    only_inputs=True,
-                )[0]
-                G = grad_batch[:, 0, :]
-            except TypeError:
-                grads = []
-                for j, h_j in enumerate(h_active):
-                    grad_j = torch.autograd.grad(
-                        outputs=h_j,
+            active_idx = near_idx[active_mask][:self.cbf_active_constraints]
+            h_det = h_probe[active_idx]
+            G = G_probe[active_idx].contiguous()
+        else:
+            # Legacy formulation: hard-min over links at each obstacle point.
+            with torch.no_grad():
+                pose_probe = self.eye4.expand(q_probe.shape[0], 4, 4)
+                sdf_probe = self.bernstein_core.get_whole_body_sdf_batch(
+                    obs_eval, pose_probe, q_probe, return_per_link=False)
+                h_probe = sdf_probe[0] - self.d_safe
+
+            active_window = min(
+                valid_count,
+                max(self.cbf_active_constraints * 3, self.cbf_active_constraints),
+            )
+            _, near_idx = torch.topk(
+                h_probe, k=active_window, largest=False, sorted=True)
+            h_near = h_probe[near_idx]
+            active_mask = h_near <= self.cbf_h_activate
+            if not torch.any(active_mask):
+                self._last_active_constraints = 0
+                h_min = h_probe.min().view(1)
+                self.static_h.copy_(h_min)
+                self.static_constr.copy_(torch.zeros_like(h_min))
+                self.static_grad_h.zero_()
+                return dq_nom
+
+            active_idx = near_idx[active_mask][:self.cbf_active_constraints]
+            obs_active = obs_eval[active_idx]
+
+            if self.cbf_multi_gradient_mode == "finite_difference":
+                with torch.no_grad():
+                    eps = self.cbf_multi_fd_eps
+                    q_base = current_q.detach().view(1, 7)
+                    q_eval = q_base.expand(8, 7).clone()
+                    q_eval[1:, :].add_(eps * torch.eye(
+                        7, device=self.device, dtype=q_eval.dtype))
+                    pose = self.eye4.expand(q_eval.shape[0], 4, 4)
+                    sdf_fd = self.bernstein_core.get_whole_body_sdf_batch(
+                        obs_active, pose, q_eval, return_per_link=False)
+                    h_fd = sdf_fd - self.d_safe
+                    h_det = h_fd[0].detach()
+                    G = ((h_fd[1:] - h_fd[0:1]) / eps).transpose(
+                        0, 1).contiguous()
+            else:
+                prev_grad_enabled = torch.is_grad_enabled()
+                torch.set_grad_enabled(True)
+                q_eval = current_q.detach().clone().requires_grad_(True)
+                pose = self.eye4.expand(q_eval.shape[0], 4, 4)
+                sdf_active = self.bernstein_core.get_whole_body_sdf_batch(
+                    obs_active, pose, q_eval, return_per_link=False)
+                h_active = sdf_active[0] - self.d_safe
+
+                if int(h_active.numel()) <= 0:
+                    self._last_active_constraints = 0
+                    self.static_h.copy_(h_probe.min().view(1))
+                    self.static_constr.zero_()
+                    self.static_grad_h.zero_()
+                    torch.set_grad_enabled(prev_grad_enabled)
+                    return dq_nom
+
+                # One batched vector-Jacobian product is much cheaper than K separate
+                # backward passes. Fall back only for older PyTorch versions.
+                try:
+                    grad_outputs = torch.eye(
+                        int(h_active.numel()), device=self.device, dtype=h_active.dtype)
+                    grad_batch = torch.autograd.grad(
+                        outputs=h_active,
                         inputs=q_eval,
-                        grad_outputs=torch.ones_like(h_j),
-                        retain_graph=(j < int(h_active.numel()) - 1),
+                        grad_outputs=grad_outputs,
+                        is_grads_batched=True,
+                        retain_graph=False,
                         create_graph=False,
                         only_inputs=True,
                     )[0]
-                    grads.append(grad_j.squeeze(0))
-                G = torch.stack(grads, dim=0)
-            h_det = h_active.detach()
-            torch.set_grad_enabled(prev_grad_enabled)
+                    G = grad_batch[:, 0, :]
+                except TypeError:
+                    grads = []
+                    for j, h_j in enumerate(h_active):
+                        grad_j = torch.autograd.grad(
+                            outputs=h_j,
+                            inputs=q_eval,
+                            grad_outputs=torch.ones_like(h_j),
+                            retain_graph=(j < int(h_active.numel()) - 1),
+                            create_graph=False,
+                            only_inputs=True,
+                        )[0]
+                        grads.append(grad_j.squeeze(0))
+                    G = torch.stack(grads, dim=0)
+                h_det = h_active.detach()
+                torch.set_grad_enabled(prev_grad_enabled)
 
         if int(h_det.numel()) <= 0:
             self._last_active_constraints = 0
@@ -1193,41 +1383,27 @@ class CBFSafetyNode:
         bounds = torch.where(h_det > 0.0, outside_bound, inside_bound)
         bounds = bounds + self.cbf_constraint_margin
 
-        # The projection itself is a 7-variable QP with K half-spaces: a CPU
-        # problem. Solving it on GPU forced one host sync per constraint per
-        # sweep (`bool(violation > 0)`); instead, pack G/bounds/h/dq into one
-        # transfer and run Gauss-Seidel in numpy (microseconds at this size).
+        # Fixed-iteration on-device POCS for the 7-variable, K-row QP.  Tensor
+        # conditions replace Python scalar reads, so there is no intermediate
+        # GPU->CPU synchronization.  The only D2H copy left in the control path
+        # is the final command_buffer transfer required by rospy publication.
         K = int(G.shape[0])
-        packed = torch.cat([
-            G.reshape(-1), bounds, h_det, dq_nom.detach().view(-1),
-        ]).cpu().numpy().astype(np.float64)
-        G_np = packed[:7 * K].reshape(K, 7)
-        b_np = packed[7 * K:8 * K]
-        h_np = packed[8 * K:9 * K]
-        dq_np = packed[9 * K:9 * K + 7].copy()
+        dq_projected = project_halfspaces_sequential(
+            dq_nom.detach().view(-1),
+            G,
+            bounds,
+            iterations=self.cbf_projection_iters,
+            relaxation=self.cbf_projection_relaxation,
+            max_velocity=self.max_joint_velocity,
+        )
 
-        row_sq = np.einsum('ij,ij->i', G_np, G_np) + 1e-6
-        vmax = self.max_joint_velocity
-        relax = self.cbf_projection_relaxation
-        for _ in range(self.cbf_projection_iters):
-            updated = False
-            for i in range(K):
-                violation = b_np[i] - G_np[i].dot(dq_np)
-                if violation > 0.0:
-                    dq_np += relax * violation * G_np[i] / row_sq[i]
-                    np.clip(dq_np, -vmax, vmax, out=dq_np)
-                    updated = True
-            if not updated:
-                break
-
-        constr = G_np.dot(dq_np) - b_np
-        min_idx = int(np.argmin(h_np))
+        constr = torch.mv(G, dq_projected) - bounds
+        min_idx = torch.argmin(h_det)
         self._last_active_constraints = K
         self.static_h.copy_(h_det[min_idx].view(1))
-        self.static_constr.fill_(float(constr.min()))
+        self.static_constr.copy_(constr.min().view(1))
         self.static_grad_h.copy_(G[min_idx].view(1, 7))
-        return torch.as_tensor(
-            dq_np, dtype=torch.float32, device=self.device).view(1, 7)
+        return dq_projected.view(1, 7)
 
     def joint_callback(self, msg):
         try:
@@ -1480,6 +1656,65 @@ class CBFSafetyNode:
         marker.pose.position.z = float(p[2])
         return marker
 
+    @staticmethod
+    def _matrix_to_quat(R):
+        """3x3 rotation matrix (numpy) -> (x, y, z, w) quaternion."""
+        m00, m11, m22 = R[0, 0], R[1, 1], R[2, 2]
+        tr = m00 + m11 + m22
+        if tr > 0.0:
+            s = np.sqrt(tr + 1.0) * 2.0
+            w = 0.25 * s
+            x = (R[2, 1] - R[1, 2]) / s
+            y = (R[0, 2] - R[2, 0]) / s
+            z = (R[1, 0] - R[0, 1]) / s
+        elif m00 > m11 and m00 > m22:
+            s = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif m11 > m22:
+            s = np.sqrt(1.0 + m11 - m00 - m22) * 2.0
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + m22 - m00 - m11) * 2.0
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+        return x, y, z, w
+
+    def _box_marker(self, marker_id, ns, center, rot, sides, color, alpha=1.0):
+        """Oriented CUBE marker. center [3], rot [3,3], sides [3] (full edges)."""
+        marker = Marker()
+        marker.header.frame_id = "world"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = ns
+        marker.id = marker_id
+        marker.type = Marker.CUBE
+        marker.action = Marker.ADD
+        s = sides.detach().flatten().cpu().numpy()
+        marker.scale.x = float(s[0])
+        marker.scale.y = float(s[1])
+        marker.scale.z = float(s[2])
+        marker.color.a = alpha
+        marker.color.r = color[0]
+        marker.color.g = color[1]
+        marker.color.b = color[2]
+        c = center.detach().flatten().cpu().numpy()
+        marker.pose.position.x = float(c[0])
+        marker.pose.position.y = float(c[1])
+        marker.pose.position.z = float(c[2])
+        qx, qy, qz, qw = self._matrix_to_quat(rot.detach().cpu().numpy())
+        marker.pose.orientation.x = qx
+        marker.pose.orientation.y = qy
+        marker.pose.orientation.z = qz
+        marker.pose.orientation.w = qw
+        return marker
+
     def publish_selection_debug_markers(self):
         markers = MarkerArray()
         if self.debug_score_seed is not None:
@@ -1503,6 +1738,14 @@ class CBFSafetyNode:
                 markers.markers.append(self._sphere_marker(
                     100 + i, "cbf_link_spheres", centers[i],
                     (0.2, 0.85, 0.3), diam, alpha=0.15))
+        if self.debug_prism_boxes is not None:
+            # Translucent orange: the tight per-link oriented boxes of the
+            # 'prism' filter (per-axis AABB of {sdf <= cbf_prism_margin}).
+            centers_w, rots, sides = self.debug_prism_boxes
+            for i in range(int(centers_w.shape[0])):
+                markers.markers.append(self._box_marker(
+                    200 + i, "cbf_prism_boxes", centers_w[i], rots[i],
+                    sides[i], (1.0, 0.55, 0.1), alpha=0.12))
         if markers.markers:
             stamp = rospy.Time.now()
             for marker in markers.markers:
@@ -1722,12 +1965,19 @@ class CBFSafetyNode:
         self.debug_tip_min = None
         self.debug_filter_center = None
         self.debug_link_centers = None
+        self.debug_prism_boxes = None
         self.debug_candidate_points = None   # the candidate pool (~512) the SDF ranks
 
     def _prefilter_for_sdf(self, pts, q9, link_poses=None):
         """Cheap all-link prefilter before expensive whole-body SDF."""
         n_input = int(pts.shape[0])
         self.debug_sdf_prefilter_counts = (n_input, n_input, n_input)
+        if self.cbf_candidate_filter == "prism":
+            # Tight per-link oriented boxes instead of the radius ball: narrows
+            # the cloud more aggressively before the whole-body SDF ranks it.
+            kept = self._prism_prefilter(pts, q9, link_poses=link_poses)
+            self.debug_sdf_prefilter_counts = (n_input, n_input, int(kept.shape[0]))
+            return kept
         if self.cbf_sdf_prefilter_radius <= 0.0 and self.cbf_sdf_prefilter_max_points <= 0:
             return pts
 
@@ -1770,6 +2020,60 @@ class CBFSafetyNode:
         self.debug_sdf_prefilter_counts = (
             n_input, n_input, int(pts.shape[0]))
         return pts
+
+    def _prism_prefilter(self, pts, q9, link_poses=None):
+        """Cheap per-link oriented-box (prism) prefilter for the SDF candidate path.
+
+        Each protected link carries a tight rectangular box (the per-axis AABB of
+        ``{sdf <= cbf_prism_margin}``, precomputed in ``_precompute_prism_boxes``)
+        in its local frame -- an oriented prism in the world, compact on every
+        axis independently. This keeps only points inside SOME link's prism with a
+        handful of matmuls plus a comparison, far cheaper than a Bernstein SDF
+        evaluation and far tighter than a union-of-spheres.
+
+        It REPLACES the radius-based ``_prefilter_for_sdf`` step: the survivors are
+        then handed to the whole-body SDF in ``_whole_body_sdf_candidates``, which
+        does the real surface-distance ranking AND the robot self-filter. The
+        prism only narrows the set cheaply; it never decides clearance itself
+        (ranking by box membership / link-centre distance is a poor proxy for an
+        elongated link, which is why the standalone prism path was removed).
+
+        Returns the reduced point set. The boolean mask is the same kind the
+        ``sdf`` path already uses in this preprocessing stage (outside the live
+        CUDA graph).
+        """
+        if int(pts.shape[0]) == 0:
+            return pts
+
+        core = self.bernstein_core
+        # [1, K, 4, 4] visual-frame transforms -- the exact frames the boxes were
+        # precomputed in, so prism_lo/prism_hi align with the links by index.
+        trans = core._stack_used_link_transforms(self.eye4, q9, link_poses=link_poses)
+        fk = trans.reshape(-1, 4, 4)                     # [K, 4, 4]
+        R = fk[:, :3, :3].contiguous()                  # [K, 3, 3]
+        t_vec = fk[:, :3, 3].contiguous()               # [K, 3]
+
+        diff = pts.unsqueeze(0) - t_vec.unsqueeze(1)    # [K, N, 3]
+        # torch.bmm(diff, R) == R^T @ diff (world->local), as in the SDF batch.
+        x_local = torch.bmm(diff, R)                     # [K, N, 3]
+
+        # Tight per-axis box test in the link frame (margin already baked in).
+        lo = self.prism_lo.unsqueeze(1)                  # [K, 1, 3]
+        hi = self.prism_hi.unsqueeze(1)                  # [K, 1, 3]
+        inside_per_link = ((x_local >= lo) & (x_local <= hi)).all(dim=-1)  # [K, N]
+        inside_any = inside_per_link.any(dim=0)                            # [N]
+
+        # RViz boxes: oriented CUBE per link, centre = R @ centre_local + t,
+        # orientation = R, per-axis side = hi - lo. Built only when subscribed.
+        if self.pub_selection_debug.get_num_connections() > 0:
+            centre_local = 0.5 * (self.prism_lo + self.prism_hi)          # [K, 3]
+            centers_w = torch.bmm(centre_local.unsqueeze(1), R.transpose(1, 2)
+                                  ).squeeze(1) + t_vec                     # [K, 3]
+            sides = (self.prism_hi - self.prism_lo)                       # [K, 3]
+            self.debug_prism_boxes = (
+                centers_w.detach(), R.detach(), sides.detach())
+
+        return pts[inside_any]
 
     def _whole_body_sdf_candidates(self, pts, q9, link_poses=None):
         """Return points near protected links, scored by whole-body SDF.
@@ -1994,7 +2298,10 @@ class CBFSafetyNode:
                 sdf_fork_candidates = None
                 q9 = q9_current
 
-                if self.cbf_candidate_filter == "sdf":
+                if self.cbf_candidate_filter in ("sdf", "prism"):
+                    # 'prism' uses the oriented-box prefilter inside
+                    # _prefilter_for_sdf; both then rank survivors by the
+                    # whole-body SDF (true surface clearance) + self-filter.
                     pts_inside, _, sdf_all_candidates, sdf_fork_candidates = self._whole_body_sdf_candidates(
                         pts, q9, link_poses=link_poses_current)
                     dist_inside = torch.norm(pts_inside - x_now_pos, dim=1)
@@ -2047,7 +2354,7 @@ class CBFSafetyNode:
                     self._clear_or_hold_obstacles()
                     return
 
-                if self.cbf_selection_metric in ("sdf", "fork_sdf", "fork_mesh") or self.cbf_candidate_filter == "sdf":
+                if self.cbf_selection_metric in ("sdf", "fork_sdf", "fork_mesh") or self.cbf_candidate_filter in ("sdf", "prism"):
                     if self.preprocess_max_points > 0 and num_inside > self.preprocess_max_points:
                         preselect_scores = (
                             sdf_all_candidates
@@ -2070,7 +2377,7 @@ class CBFSafetyNode:
                 needs_score = (
                     num_inside > self.cbf_graph_points
                     or sdf_all_candidates is not None
-                    or self.cbf_candidate_filter == "sdf"
+                    or self.cbf_candidate_filter in ("sdf", "prism")
                 )
 
                 if not needs_score:
@@ -2286,6 +2593,15 @@ class CBFSafetyNode:
             self.publish_cbf_velocity_arrows()
         except Exception as e:
             rospy.logerr_throttle(5.0, f"Error publishing CBF visualization: {e}")
+
+    def _stop_velocity_controller(self):
+        """Best-effort stop; the controller watchdog is the hard backstop."""
+        if self.velocity_cmd_pub is not None:
+            try:
+                self.velocity_cmd_pub.publish(
+                    Float64MultiArray(data=[0.0] * 7))
+            except rospy.ROSException:
+                pass
 
     def run(self):
         # print(f"🛡️  CBF NODE : Bouclier actif à {self.rate_hz}Hz. Sécurités activées.")
@@ -2748,6 +3064,11 @@ class CBFSafetyNode:
                         rospy.loginfo_throttle(0.5, f"🛡️ CBF REACTIVE: Correcting trajectory (h = {h_val:.4f})")
 
                 self.cmd_pub.publish(Float32MultiArray(data=dq_pub_cpu))
+                if self.velocity_cmd_pub is not None:
+                    # dq_safe is the actuator command in velocity mode.  Publish
+                    # it before diagnostics so telemetry cannot delay control.
+                    self.velocity_cmd_pub.publish(
+                        Float64MultiArray(data=dq_pub_cpu))
 
                 pos_msg = Float64MultiArray(data=q_safe_work_cpu)
                 self.safe_cmd_pub.publish(pos_msg)
@@ -2911,7 +3232,9 @@ class CBFSafetyNode:
                         h_corr_val = h_val + float(self.barrier.alpha) * float(
                             np.log(max(1, int(self.selected_count))))
                     else:
-                        # multi_projected uses a hard min: no soft-min bias.
+                        # Keep the conservative per-link Softmin value in the
+                        # analytical multi_projected path; legacy multi modes are
+                        # hard-min constraints and need no correction either.
                         h_corr_val = h_val
                     solver_out_v = cpu_buffer[53:60]
                     dq_base_v = cpu_buffer[26:33]

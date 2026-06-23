@@ -5,6 +5,7 @@
   <arg name="paused" default="true"/>
   <arg name="gui" default="true"/>
   <arg name="use_direct_group_position_controller" default="false"/>
+  <arg name="use_direct_group_velocity_controller" default="false"/>
 
   <include file="$(find gazebo_ros)/launch/empty_world.launch">
     <arg name="world_name" value="$(find vision_processing)/worlds/feeding.world"/>
@@ -79,18 +80,22 @@
 
   <rosparam file="$(find franka_gazebo)/config/franka_hw_sim.yaml" command="load" subst_value="true"/>
   <rosparam file="$(find franka_gazebo)/config/sim_controllers.yaml" command="load" subst_value="true"/>
-  <rosparam if="$(arg use_direct_group_position_controller)"
+  <rosparam if="$(eval arg('use_direct_group_position_controller') or arg('use_direct_group_velocity_controller'))"
             file="$(find vision_processing)/config/simple_controllers.yaml"
             command="load"/>
 
   <node name="controller_spawner" pkg="controller_manager" type="spawner"
-        unless="$(arg use_direct_group_position_controller)"
+        unless="$(eval arg('use_direct_group_position_controller') or arg('use_direct_group_velocity_controller'))"
         respawn="false" output="screen"
         args="franka_state_controller position_joint_trajectory_controller"/>
-  <node name="controller_spawner_direct" pkg="controller_manager" type="spawner"
+  <node name="controller_spawner_direct_position" pkg="controller_manager" type="spawner"
         if="$(arg use_direct_group_position_controller)"
         respawn="false" output="screen"
         args="franka_state_controller joint_group_position_controller"/>
+  <node name="controller_spawner_direct_velocity" pkg="controller_manager" type="spawner"
+        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))"
+        respawn="false" output="screen"
+        args="franka_state_controller joint_group_velocity_controller"/>
 
   <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"
         respawn="true" output="screen"/>
@@ -107,7 +112,7 @@
   <node name="unpause_after_trajectory_controller_hold"
         pkg="vision_processing" type="unpause_after_controller_hold.py"
         output="screen"
-        unless="$(arg use_direct_group_position_controller)">
+        unless="$(eval arg('use_direct_group_position_controller') or arg('use_direct_group_velocity_controller'))">
     <param name="controller_name" value="position_joint_trajectory_controller"/>
     <param name="command_topic" value="/position_joint_trajectory_controller/command"/>
     <param name="command_type" value="trajectory"/>
@@ -115,6 +120,17 @@
     <rosparam param="homing_position">[-0.000059, -0.125928, 0.000117, -2.193312, -0.000251, 2.064780, 0.785511]</rosparam>
     <param name="lead_time" value="0.10"/>
     <param name="hold_duration" value="2.0"/>
+    <param name="publish_repeats" value="20"/>
+    <param name="publish_period" value="0.05"/>
+  </node>
+  <node name="unpause_after_velocity_controller_hold"
+        pkg="vision_processing" type="unpause_after_controller_hold.py"
+        output="screen"
+        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))">
+    <param name="controller_name" value="joint_group_velocity_controller"/>
+    <param name="command_topic" value="/joint_group_velocity_controller/command"/>
+    <param name="command_type" value="group_velocity"/>
+    <rosparam param="expected_models">[person, table, container, food_cube, panda]</rosparam>
     <param name="publish_repeats" value="20"/>
     <param name="publish_period" value="0.05"/>
   </node>

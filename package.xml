@@ -11,8 +11,12 @@
 
   <build_depend>rospy</build_depend>
   <build_depend>roscpp</build_depend>
+  <build_depend>controller_interface</build_depend>
   <build_depend>controller_manager_msgs</build_depend>
   <build_depend>gazebo_msgs</build_depend>
+  <build_depend>hardware_interface</build_depend>
+  <build_depend>pluginlib</build_depend>
+  <build_depend>realtime_tools</build_depend>
   <build_depend>std_msgs</build_depend>
   <build_depend>std_srvs</build_depend>
   <build_depend>trajectory_msgs</build_depend>
@@ -34,8 +38,12 @@
 
   <build_export_depend>rospy</build_export_depend>
   <build_export_depend>roscpp</build_export_depend>
+  <build_export_depend>controller_interface</build_export_depend>
   <build_export_depend>controller_manager_msgs</build_export_depend>
   <build_export_depend>gazebo_msgs</build_export_depend>
+  <build_export_depend>hardware_interface</build_export_depend>
+  <build_export_depend>pluginlib</build_export_depend>
+  <build_export_depend>realtime_tools</build_export_depend>
   <build_export_depend>std_msgs</build_export_depend>
   <build_export_depend>std_srvs</build_export_depend>
   <build_export_depend>trajectory_msgs</build_export_depend>
@@ -60,8 +68,12 @@
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>rospy</exec_depend>
   <exec_depend>roscpp</exec_depend>
+  <exec_depend>controller_interface</exec_depend>
   <exec_depend>controller_manager_msgs</exec_depend>
   <exec_depend>gazebo_msgs</exec_depend>
+  <exec_depend>hardware_interface</exec_depend>
+  <exec_depend>pluginlib</exec_depend>
+  <exec_depend>realtime_tools</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>trajectory_msgs</exec_depend>
@@ -82,5 +94,6 @@
   <exec_depend>pcl_conversions</exec_depend>
 
   <export>
+    <controller_interface plugin="${prefix}/vision_processing_controllers.xml"/>
   </export>
 </package>

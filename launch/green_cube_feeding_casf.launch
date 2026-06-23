@@ -1,8 +1,11 @@
 <launch>
   <!-- 0. Start Gazebo Simulation Environment -->
-  <arg name="use_direct_group_position_controller" default="true" />
+  <!-- Position takes precedence if both direct-controller flags are true. -->
+  <arg name="use_direct_group_position_controller" default="false" />
+  <arg name="use_direct_group_velocity_controller" default="true" />
   <include file="$(find vision_processing)/launch/feeding_simulation_position_controller.launch">
     <arg name="use_direct_group_position_controller" value="$(arg use_direct_group_position_controller)" />
+    <arg name="use_direct_group_velocity_controller" value="$(arg use_direct_group_velocity_controller)" />
   </include>
 
   <!-- 1. General Parameters -->
@@ -13,7 +16,7 @@
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
   <arg name="planner_rate_hz" default="10" />
   <arg name="trajectory_waypoint_rate_hz" default="10.0" />
-  <arg name="control_rate_hz" default="100.0" />
+  <arg name="control_rate_hz" default="75.0" />
   <arg name="cbf_preprocess_rate_hz" default="30.0" />
   <arg name="viz_rate_hz" default="5.0" />
   <arg name="bridge_rate_hz" default="60.0" />
@@ -23,6 +26,7 @@
   <arg name="cbf_graph_points" default="100" />
   <arg name="cbf_preprocess_max_points" default="2048" />
   <arg name="cbf_candidate_filter" default="sdf" />
+  <arg name="cbf_prism_margin" default="0.02" />
   <arg name="cbf_link_filter_radius" default="0.35" />
   <arg name="cbf_link_prefilter_points" default="2048" />
   <arg name="cbf_sdf_candidate_max_dist" default="0.35" />
@@ -187,9 +191,12 @@
        constraint, CUDA graph) or cbf_safety_node_Bernstein_multicbf.py.
        The multicbf-specific args below are ignored by the Bernstein node. -->
   <arg name="cbf_node_type" default="cbf_safety_node_Bernstein_multicbf.py" />
+  <!-- Fast tangent-preserving CUDA graph with an exact analytical gradient.
+       The most critical local-Softmin robot link is the robot half-space; the
+       grasp cloud remains a separate half-space when active. -->
   <arg name="cbf_solver_mode" default="fast_tangent" />
-  <arg name="cbf_active_constraints" default="4" />
-  <arg name="cbf_multi_gradient_mode" default="finite_difference" />
+  <arg name="cbf_active_constraints" default="9" />
+  <arg name="cbf_multi_gradient_mode" default="analytical" />
   <arg name="cbf_multi_fd_eps" default="0.001" />
   <arg name="cbf_h_activate" default="0.04" />
   <arg name="cbf_max_inward_speed" default="0.20" />
@@ -485,7 +492,7 @@
 
   <!-- 8. Bernstein-Basis CBF Safety Shield.
        The CBF intercepts the nominal command and publishes /planner/safe_joint_command.
-       In direct mode it also commands /joint_group_position_controller/command.
+       In direct mode it commands the selected joint-group controller.
        Tuning guide:
          cbf_kappa    — class-K gain: lower = softer correction (try 1.0–3.0, was 10.0)
          barrier_alpha — softmin temperature: higher = smoother gradient direction (try 0.003–0.007)
@@ -494,10 +501,13 @@
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
         <param name="enable_cbf"               value="true" />
         <param name="publish_controller_command" value="$(arg use_direct_group_position_controller)" />
+        <param name="publish_velocity_controller_command"
+               value="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))" />
         <param name="rate_hz"      value="$(arg control_rate_hz)" />
         <param name="cbf_graph_points" value="$(arg cbf_graph_points)" />
         <param name="preprocess_max_points" value="$(arg cbf_preprocess_max_points)" />
         <param name="cbf_candidate_filter" value="$(arg cbf_candidate_filter)" />
+        <param name="cbf_prism_margin" value="$(arg cbf_prism_margin)" />
         <param name="cbf_link_filter_radius" value="$(arg cbf_link_filter_radius)" />
         <param name="cbf_link_prefilter_points" value="$(arg cbf_link_prefilter_points)" />
         <param name="cbf_sdf_candidate_max_dist" value="$(arg cbf_sdf_candidate_max_dist)" />
@@ -615,12 +625,12 @@
   </node>
 
   <!-- 9. Trajectory Controller Bridge.
-       Used only when use_direct_group_position_controller is false.
+       Used only when both direct controller modes are false.
        Converts the CBF safe Float64MultiArray commands into rolling
        JointTrajectory horizon chunks for position_joint_trajectory_controller.
        Tune horizon_points * point_dt to control lookahead. Short horizons reduce lag. -->
   <node name="trajectory_controller_bridge" pkg="vision_processing" type="trajectory_controller_bridge.py" output="screen"
-        unless="$(arg use_direct_group_position_controller)">
+        unless="$(eval arg('use_direct_group_position_controller') or arg('use_direct_group_velocity_controller'))">
         <param name="rate_hz"        value="$(arg bridge_rate_hz)" />
         <param name="in_topic"       value="/planner/safe_joint_command" />
         <param name="out_topic"      value="/position_joint_trajectory_controller/command" />

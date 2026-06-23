@@ -7,8 +7,12 @@ cmake_policy(SET CMP0057 NEW)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
+  controller_interface
   controller_manager_msgs
   gazebo_msgs
+  hardware_interface
+  pluginlib
+  realtime_tools
   std_msgs
   std_srvs
   trajectory_msgs
@@ -61,14 +65,19 @@ generate_messages(
 )
 
 catkin_package(
+  LIBRARIES vision_processing_controllers
   CATKIN_DEPENDS 
     rospy 
+    controller_interface
     std_msgs 
     std_srvs
     trajectory_msgs
     sensor_msgs
     controller_manager_msgs
     gazebo_msgs
+    hardware_interface
+    pluginlib
+    realtime_tools
     cv_bridge
     geometry_msgs
     moveit_core
@@ -93,6 +102,13 @@ include_directories(
 
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
+
+## Direct joint-velocity controller used by the CBF shield.
+add_library(vision_processing_controllers
+  src/vision_processing/joint_group_velocity_controller.cpp
+)
+target_link_libraries(vision_processing_controllers ${catkin_LIBRARIES})
+add_dependencies(vision_processing_controllers ${catkin_EXPORTED_TARGETS})
 
 ## 4. Module Pybind11 (Fast IK)
 pybind11_add_module(fast_ik_module src/vision_processing/fast_ik.cpp)
@@ -159,6 +175,16 @@ catkin_install_python(PROGRAMS
 
 install(DIRECTORY launch/
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+)
+
+install(TARGETS vision_processing_controllers
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(FILES vision_processing_controllers.xml
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
 install(TARGETS fast_ik_module

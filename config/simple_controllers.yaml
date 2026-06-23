@@ -34,6 +34,21 @@ joint_group_position_controller:
     panda_joint6: {trajectory: 0.1, goal: 0.05}
     panda_joint7: {trajectory: 0.1, goal: 0.05}
 
+joint_group_velocity_controller:
+  type: vision_processing/JointGroupVelocityController
+  joints:
+    - panda_joint1
+    - panda_joint2
+    - panda_joint3
+    - panda_joint4
+    - panda_joint5
+    - panda_joint6
+    - panda_joint7
+  # Stop integrating and hold the last reference if the CBF stops publishing.
+  command_timeout: 0.10
+  max_abs_velocity: 0.70
+  max_position_lead: 0.05
+
 gazebo_ros_control:
   pid_gains:
     panda_joint1: {p: 600.0, i: 0.0, d: 30.0, i_clamp: 10000.0}

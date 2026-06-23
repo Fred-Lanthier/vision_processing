@@ -46,7 +46,7 @@ class UnpauseAfterControllerHold:
 
         if self.command_type == "trajectory":
             msg_type = JointTrajectory
-        elif self.command_type == "group_position":
+        elif self.command_type in ("group_position", "group_velocity"):
             msg_type = Float64MultiArray
         else:
             raise ValueError(
@@ -92,6 +92,8 @@ class UnpauseAfterControllerHold:
     def hold_message(self):
         if self.command_type == "group_position":
             return Float64MultiArray(data=list(self.homing_position))
+        if self.command_type == "group_velocity":
+            return Float64MultiArray(data=[0.0] * len(self.joint_names))
 
         msg = JointTrajectory()
         msg.header.stamp = rospy.Time.now() + rospy.Duration(self.lead_time)

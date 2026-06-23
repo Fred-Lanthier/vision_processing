@@ -316,8 +316,7 @@ Visualization Manager:
       Marker Topic: /viz/nominal_trajectory_3d
       Name: MarkerArray
       Namespaces:
-        nominal_trajectory: true
-        nominal_waypoints: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -341,8 +340,7 @@ Visualization Manager:
       Marker Topic: /viz/nominal_trajectory_3d
       Name: MarkerArray
       Namespaces:
-        nominal_trajectory: true
-        nominal_waypoints: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -434,7 +432,7 @@ Visualization Manager:
       Marker Topic: /viz/robot_safety_envelope
       Name: MarkerArray
       Namespaces:
-        robot_safety_envelope: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -478,9 +476,17 @@ Visualization Manager:
       Marker Topic: /viz/grasp_sdf_envelope
       Name: Marker
       Namespaces:
-        grasp_sdf_envelope: true
+        {}
       Queue Size: 100
       Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /viz/cbf_selection_debug
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -497,7 +503,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 0.8228347301483154
+      Distance: 1.4461928606033325
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -505,17 +511,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 0.3667374551296234
-        Y: 0.18620605766773224
-        Z: -0.03398498520255089
+        X: 0.23256760835647583
+        Y: 0.16783109307289124
+        Z: 0.010595014318823814
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.370399534702301
+      Pitch: 0.5303996205329895
       Target Frame: <Fixed Frame>
-      Yaw: 4.348602294921875
+      Yaw: 5.333606719970703
     Saved: ~
 Window Geometry:
   Displays:
@@ -528,4 +534,4 @@ Window Geometry:
   QMainWindow State: 000000ff00000000fd000000010000000000000185000002c6fc0200000002fb000000100044006900730070006c006100790073010000003d000002c6000000c900fffffffb0000000a0049006d006100670065000000020d000000f60000001600ffffff00000325000002c600000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Width: 1200
   X: 481
-  Y: 115
+  Y: 41

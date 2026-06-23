@@ -541,7 +541,7 @@ def main():
                 label=r"$\dot{q}_{\mathrm{base}}$ (nominale)")
         # Correction: a soft filled band to zero rather than a fourth hard line.
         ax.fill_between(t, 0.0, s["dq_cbf_delta"][:, j], color=ts.GREEN,
-                        alpha=0.20, lw=0,
+                        alpha=0.40, lw=0,
                         label=r"$\Delta\dot{q}_{\mathrm{CBF}}$ (correction)")
         # Commanded: the single clean hero line.
         ax.plot(t, s["dq_final"][:, j], color=ts.BLUE, lw=1.3, alpha=0.95,

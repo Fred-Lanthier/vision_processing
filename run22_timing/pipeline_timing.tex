@@ -1,0 +1,25 @@
+\begin{tabular}{llrrrr}
+\toprule
+Groupe & \'Etape & $N$ & m\'ediane [ms] & moyenne [ms] & p95 [ms] \\
+\midrule
+perception & sam3\_detect & 2 & 140.91 & 140.91 & 264.53 \\
+ & sam2\_track & 144 & 58.96 & 57.59 & 79.37 \\
+ & projection & 253 & 25.10 & 26.78 & 42.33 \\
+ & persistent\_evict & 967 & 2.90 & 3.31 & 6.06 \\
+ & persistent\_integrate & 2384 & 0.84 & 0.99 & 1.83 \\
+planning & fm\_encode & 470 & 1.06 & 1.18 & 1.81 \\
+ & fm\_generation & 470 & 62.74 & 64.28 & 79.18 \\
+ & fm\_correction & 470 & 0.00 & 0.00 & 0.00 \\
+ & ik & 460 & 0.28 & 0.47 & 0.99 \\
+ & ik\_correction & 470 & 0.00 & 0.00 & 0.00 \\
+ & casf\_warp & 470 & 0.00 & 0.00 & 0.00 \\
+ & trajectory\_build & 469 & 25.06 & 25.83 & 34.60 \\
+ & planner\_total & 470 & 64.71 & 66.08 & 81.23 \\
+safety & critical\_point\_selection & 1091 & 51.85 & 53.24 & 81.46 \\
+ & cbf\_correction & 1502 & 15.29 & 17.03 & 27.35 \\
+ & cbf\_command & 1502 & 3.13 & 4.03 & 9.97 \\
+ & cbf\_total & 1502 & 19.46 & 21.39 & 34.17 \\
+\midrule
+\multicolumn{3}{l}{budget bout-à-bout (somme des médianes)} & \multicolumn{3}{r}{169.07 ms} \\
+\bottomrule
+\end{tabular}

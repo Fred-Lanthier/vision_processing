@@ -1,0 +1,9 @@
+<library path="lib/libvision_processing_controllers">
+  <class name="vision_processing/JointGroupVelocityController"
+         type="vision_processing::JointGroupVelocityController"
+         base_class_type="controller_interface::ControllerBase">
+    <description>
+      Velocity-commanded position servo with gravity-holding stale-command behavior.
+    </description>
+  </class>
+</library>
