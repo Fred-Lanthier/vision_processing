@@ -5,9 +5,7 @@ For L=1,...,8 protected geometries this script compares:
 
 1. analytical_all_rows: explicit derivatives for all L independent link
    Softmin constraints, returning an [L,7] QP Jacobian;
-2. autograd_all_rows: the identical [L,7] Jacobian using a batched VJP;
-3. autograd_global_min: the legacy barrier behavior, returning only the one
-   gradient row selected by min_k h_k (not equivalent work when L > 1).
+2. autograd_all_rows: the identical [L,7] Jacobian using a batched VJP.
 
 Run this benchmark without the ROS launch running if isolated kernel/algorithm
 timings are desired.  Other CUDA processes create legitimate system-contention
@@ -72,39 +70,31 @@ def percentile(values, q):
     return float(np.percentile(np.asarray(values, dtype=np.float64), q))
 
 
-def summarize(wall_times, gpu_times):
+def summarize(wall_times):
     return {
         "wall_mean_ms": statistics.fmean(wall_times),
+        "wall_std_ms": statistics.stdev(wall_times) if len(wall_times) > 1 else 0.0,
         "wall_median_ms": statistics.median(wall_times),
         "wall_p95_ms": percentile(wall_times, 95),
-        "gpu_mean_ms": statistics.fmean(gpu_times),
-        "gpu_median_ms": statistics.median(gpu_times),
-        "gpu_p95_ms": percentile(gpu_times, 95),
     }
 
 
 def measure(callable_, warmup, repeats):
-    """Measure synchronized call latency and device execution with CUDA events."""
+    """Measure synchronized end-to-end call latency."""
     for _ in range(warmup):
         callable_()
     torch.cuda.synchronize()
 
     wall_times = []
-    gpu_times = []
     for _ in range(repeats):
         # Drain earlier work so each sample measures this call, not an unrelated
         # queue backlog.  The synchronization before the timer is not included.
         torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
         wall_start = time.perf_counter()
         callable_()
-        end_event.record()
         torch.cuda.synchronize()
         wall_times.append((time.perf_counter() - wall_start) * 1000.0)
-        gpu_times.append(start_event.elapsed_time(end_event))
-    return summarize(wall_times, gpu_times)
+    return summarize(wall_times)
 
 
 def per_link_softmin(sdf_per_link, temperature, d_safe):
@@ -140,8 +130,8 @@ def make_query_points(full_core, q, pose, point_count, seed):
 
 def format_metric(metric):
     return (
-        f"{metric['wall_median_ms']:8.3f} / "
-        f"{metric['gpu_median_ms']:8.3f}"
+        f"{metric['wall_mean_ms']:8.3f} +/- "
+        f"{metric['wall_std_ms']:6.3f}"
     )
 
 
@@ -218,10 +208,9 @@ def main():
 
     rows = []
     print()
-    print("Times are median wall / median CUDA milliseconds")
+    print("Times are mean +/- std wall milliseconds")
     print(
-        "links | analytical all rows | autograd all rows | autograd legacy min "
-        "| grad max error"
+        "links | analytical all rows | autograd all rows | grad max error"
     )
     print("-" * 98)
 
@@ -254,19 +243,6 @@ def main():
             )[0]
             return h_per_link.detach(), gradient_batch[:, 0, :].detach()
 
-        def autograd_global_min():
-            h_per_link = autograd_quantities()
-            h_global = h_per_link.min().view(1)
-            gradient = torch.autograd.grad(
-                outputs=h_global,
-                inputs=q_autograd,
-                grad_outputs=torch.ones_like(h_global),
-                create_graph=False,
-                retain_graph=False,
-                only_inputs=True,
-            )[0]
-            return h_global.detach(), gradient.detach()
-
         # Correctness is checked before timing.  The analytical path and batched
         # autograd must return the same independent constraints and Jacobian rows.
         analytical_result = analytical_all_rows()
@@ -281,8 +257,6 @@ def main():
             analytical_all_rows, args.warmup, args.repeats)
         autograd_rows_timing = measure(
             autograd_all_rows, args.warmup, args.repeats)
-        autograd_min_timing = measure(
-            autograd_global_min, args.warmup, args.repeats)
 
         row = {
             "links": link_count,
@@ -294,7 +268,6 @@ def main():
         for prefix, timing in (
             ("analytical", analytical_timing),
             ("autograd_all_rows", autograd_rows_timing),
-            ("autograd_global_min", autograd_min_timing),
         ):
             for key, value in timing.items():
                 row[f"{prefix}_{key}"] = value
@@ -307,7 +280,6 @@ def main():
         print(
             f"{link_count:5d} | {format_metric(analytical_timing)} | "
             f"{format_metric(autograd_rows_timing)} | "
-            f"{format_metric(autograd_min_timing)} | "
             f"{gradient_error:.3e}"
         )
 
@@ -321,8 +293,7 @@ def main():
         writer.writerows(rows)
     print(f"\nCSV written to {args.csv}")
     print(
-        "Important: autograd_global_min returns one gradient row. Compare "
-        "analytical against autograd_all_rows for equivalent Lx7 outputs."
+        "analytical and autograd_all_rows return the equivalent Lx7 Jacobian."
     )
 
 

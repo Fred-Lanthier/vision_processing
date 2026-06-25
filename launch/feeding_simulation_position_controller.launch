@@ -6,6 +6,9 @@
   <arg name="gui" default="true"/>
   <arg name="use_direct_group_position_controller" default="false"/>
   <arg name="use_direct_group_velocity_controller" default="false"/>
+  <!-- Skip the SAM3 server when it is kept warm across ablation runs
+       (rosrun sam3_server.py once, then launch with launch_sam3_server:=false). -->
+  <arg name="launch_sam3_server" default="true"/>
 
   <include file="$(find gazebo_ros)/launch/empty_world.launch">
     <arg name="world_name" value="$(find vision_processing)/worlds/feeding.world"/>
@@ -148,5 +151,5 @@
   </node>
 
   <node name="sam3_server" pkg="vision_processing" type="sam3_server.py"
-        respawn="true" output="screen"/>
+        respawn="true" output="screen" if="$(arg launch_sam3_server)"/>
 </launch>

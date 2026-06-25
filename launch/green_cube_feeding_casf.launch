@@ -3,9 +3,15 @@
   <!-- Position takes precedence if both direct-controller flags are true. -->
   <arg name="use_direct_group_position_controller" default="false" />
   <arg name="use_direct_group_velocity_controller" default="true" />
+  <!-- Set false to reuse a warm SAM3 server kept alive across ablation runs. -->
+  <arg name="launch_sam3_server" default="true" />
+  <!-- Set gui:=false to run Gazebo headless (no gzclient / no X needed). -->
+  <arg name="gui" default="true" />
   <include file="$(find vision_processing)/launch/feeding_simulation_position_controller.launch">
     <arg name="use_direct_group_position_controller" value="$(arg use_direct_group_position_controller)" />
     <arg name="use_direct_group_velocity_controller" value="$(arg use_direct_group_velocity_controller)" />
+    <arg name="launch_sam3_server" value="$(arg launch_sam3_server)" />
+    <arg name="gui" value="$(arg gui)" />
   </include>
 
   <!-- 1. General Parameters -->
@@ -16,7 +22,7 @@
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
   <arg name="planner_rate_hz" default="10" />
   <arg name="trajectory_waypoint_rate_hz" default="10.0" />
-  <arg name="control_rate_hz" default="75.0" />
+  <arg name="control_rate_hz" default="100.0" />
   <arg name="cbf_preprocess_rate_hz" default="30.0" />
   <arg name="viz_rate_hz" default="5.0" />
   <arg name="bridge_rate_hz" default="60.0" />
@@ -26,6 +32,9 @@
   <arg name="cbf_graph_points" default="100" />
   <arg name="cbf_preprocess_max_points" default="2048" />
   <arg name="cbf_candidate_filter" default="sdf" />
+  <!-- Obstacle source for the CBF. Default = persistent memory map. Override to
+       /perception/cleaned_obstacles for the memoryless (live-FOV only) ablation. -->
+  <arg name="cbf_obs_topic" default="/perception/persistent_obstacles" />
   <arg name="cbf_prism_margin" default="0.02" />
   <arg name="cbf_link_filter_radius" default="0.35" />
   <arg name="cbf_link_prefilter_points" default="2048" />
@@ -164,10 +173,10 @@
        robot's right side; the default sphere moves only along +Y. -->
   <arg name="moving_sphere_enabled" default="true" />
   <arg name="moving_sphere_initial_x" default="0.30" />
-  <arg name="moving_sphere_initial_y" default="-9.6" />
+  <arg name="moving_sphere_initial_y" default="-3" />
   <arg name="moving_sphere_initial_z" default="0.5" />
   <arg name="moving_sphere_velocity_x" default="0.0" />
-  <arg name="moving_sphere_velocity_y" default="0.30" />
+  <arg name="moving_sphere_velocity_y" default="0.10" />
   <arg name="moving_sphere_velocity_z" default="0.0" />
   <arg name="moving_sphere_radius" default="0.08" />
   <arg name="moving_sphere_num_points" default="1000" />
@@ -206,7 +215,8 @@
        The most critical local-Softmin robot link is the robot half-space; the
        grasp cloud remains a separate half-space when active. -->
   <arg name="cbf_solver_mode" default="fast_tangent" />
-  <arg name="cbf_active_constraints" default="9" />
+  <arg name="cbf_profile_multicbf" default="false" />
+  <arg name="cbf_active_constraints" default="2" />
   <arg name="cbf_multi_gradient_mode" default="analytical" />
   <arg name="cbf_multi_fd_eps" default="0.001" />
   <arg name="cbf_h_activate" default="0.04" />
@@ -565,6 +575,7 @@
         <param name="cbf_diagnostics_decimation" value="$(arg cbf_diagnostics_decimation)" />
         <!-- multicbf-only parameters (unread by the Bernstein node) -->
         <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)" />
+        <param name="cbf_profile_multicbf" value="$(arg cbf_profile_multicbf)" />
         <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)" />
         <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)" />
         <param name="cbf_multi_fd_eps" value="$(arg cbf_multi_fd_eps)" />
@@ -631,8 +642,10 @@
         <param name="tcp_filter_radius" value="$(arg tcp_filter_radius)" />
         <param name="fork_filter_radius" value="$(arg fork_filter_radius)" />
         <!-- persistent_obstacles is built from cleaned_obstacles (food already excluded by SAM2)
-             so the food cube never blocks approach, while outside-FOV obstacles persist. -->
-        <param name="obs_topic"    value="/perception/persistent_obstacles" />
+             so the food cube never blocks approach, while outside-FOV obstacles persist.
+             Override cbf_obs_topic:=/perception/cleaned_obstacles for the memoryless
+             (live-FOV only) ablation cell. -->
+        <param name="obs_topic"    value="$(arg cbf_obs_topic)" />
         <param name="preprocess_rate_hz" value="$(arg cbf_preprocess_rate_hz)" />
         <param name="viz_rate_hz" value="$(arg viz_rate_hz)" />
         <param name="publish_debug_topics" value="false" />

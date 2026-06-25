@@ -226,10 +226,15 @@ class CBFSafetyNode:
             "~cbf_recovery_switch_margin", 0.004))
         self.cbf_solver_mode = str(rospy.get_param(
             "~cbf_solver_mode", "fast_tangent")).lower()
-        if self.cbf_solver_mode not in ("fast_tangent", "multi_projected"):
-            raise ValueError("~cbf_solver_mode must be 'fast_tangent' or 'multi_projected'")
+        if self.cbf_solver_mode not in ("fast_tangent", "multi_projected", "multi_graphed"):
+            raise ValueError("~cbf_solver_mode must be 'fast_tangent', "
+                             "'multi_projected', or 'multi_graphed'")
         self.cbf_active_constraints = max(1, int(rospy.get_param(
             "~cbf_active_constraints", 4)))
+        # Phase profiling for the multi_projected solver (eager path). When on,
+        # inserts cuda.synchronize() around evaluate / selection / POCS to see
+        # where the latency goes. Adds syncs, so leave OFF in production.
+        self.cbf_profile_multicbf = _bool_param("~cbf_profile_multicbf", False)
         self.cbf_multi_gradient_mode = str(rospy.get_param(
             "~cbf_multi_gradient_mode", "analytical")).lower()
         if self.cbf_multi_gradient_mode not in (
@@ -1067,7 +1072,7 @@ class CBFSafetyNode:
         self.static_constr = torch.zeros((batch_size,), device=self.device)
         self.static_grad_h = torch.zeros((batch_size, 7), device=self.device)
         self.graph = None
-        if self.cbf_solver_mode != "fast_tangent":
+        if self.cbf_solver_mode not in ("fast_tangent", "multi_graphed"):
             self._log_cuda_memory("Multi-CBF runtime buffers ready")
             return
 
@@ -1173,7 +1178,49 @@ class CBFSafetyNode:
                 1, link_index[:, None, None].expand(-1, 1, 7)).squeeze(1)
             return h, gradient
 
+        # multi_graphed: fixed-shape topk(K_max) selection + a fixed POCS loop,
+        # so the entire multi-constraint solve is CUDA-graph-capturable like
+        # fast_tangent (no dynamic boolean masking, no GPU->CPU syncs). The proven
+        # graph-safe _qp_step is reused; inactive (far) links no-op inside it
+        # (active = h <= h_activate), so padding the set to a fixed K_max is safe.
+        K_max = max(1, min(self.cbf_active_constraints, n_robot))
+        if self.cbf_solver_mode == "multi_graphed":
+            self._last_active_constraints = K_max
+
+        def _multi_constraints():
+            result = self.analytical_barrier.evaluate(
+                self.static_q, self.static_obs, point_mask=analytical_point_mask)
+            h_links = result.h            # [B, n_robot(+1 food)]
+            g_links = result.grad_q       # [B, n_robot(+1), 7]
+            h_robot = h_links[:, :n_robot]
+            g_robot = g_links[:, :n_robot, :]
+            h_vals, idx = torch.topk(h_robot, k=K_max, dim=1, largest=False)
+            g_vals = g_robot.gather(1, idx[:, :, None].expand(-1, -1, 7))
+            if two_group:
+                return h_vals, g_vals, h_links[:, n_robot], g_links[:, n_robot, :]
+            return h_vals, g_vals, None, None
+
+        def _solve_multi(dq_nom):
+            h_vals, g_vals, h_f, g_f = _multi_constraints()
+            if two_group:
+                self.static_h_food.copy_(torch.clamp(h_f, max=0.25))
+            dq = dq_nom
+            for _ in range(two_group_iters):
+                if two_group:
+                    dq = _qp_step(h_f, g_f, dq, *food_band)       # target half-space
+                for k in range(K_max):                            # robot links (last)
+                    dq = _qp_step(h_vals[:, k], g_vals[:, k, :], dq, *robot_band)
+            # Leave static_h / static_grad_h on the most-critical robot link for
+            # the diagnostics / repair (the loop ends on the least-critical row).
+            min_k = h_vals.argmin(dim=1)
+            self.static_h.copy_(h_vals.gather(1, min_k[:, None]).squeeze(1))
+            self.static_grad_h.copy_(
+                g_vals.gather(1, min_k[:, None, None].expand(-1, 1, 7)).squeeze(1))
+            return dq
+
         def _solve(dq_nom):
+            if self.cbf_solver_mode == "multi_graphed":
+                return _solve_multi(dq_nom)
             if two_group:
                 if self.cbf_multi_gradient_mode == "analytical":
                     h_r, g_r, h_f, g_f = _analytical_constraints()
@@ -1249,6 +1296,17 @@ class CBFSafetyNode:
         obs_eval = obs_points[:valid_count]
         q_probe = current_q.detach()
 
+        prof = self.cbf_profile_multicbf
+        _t = []
+        if prof:
+            torch.cuda.synchronize(self.device)
+            _t.append(time.perf_counter())
+
+        def _lap():
+            if prof:
+                torch.cuda.synchronize(self.device)
+                _t.append(time.perf_counter())
+
         if self.cbf_multi_gradient_mode == "analytical":
             # One vectorized evaluation produces every per-link h_k and the full
             # Kx7 constraint Jacobian.  evaluate() is inference-mode internally:
@@ -1256,6 +1314,7 @@ class CBFSafetyNode:
             analytical = self.analytical_barrier.evaluate(q_probe, obs_eval)
             h_probe = analytical.h[0]
             G_probe = analytical.grad_q[0]
+            _lap()  # t_eval: analytical barrier (per-link h + Kx7 Jacobian)
             if int(h_probe.numel()) > self.bernstein_core.K:
                 self.static_h_food.copy_(torch.clamp(h_probe[-1], max=0.25).view(1))
 
@@ -1278,6 +1337,7 @@ class CBFSafetyNode:
             active_idx = near_idx[active_mask][:self.cbf_active_constraints]
             h_det = h_probe[active_idx]
             G = G_probe[active_idx].contiguous()
+            _lap()  # t_select: topk + any + boolean-mask indexing (sync points)
         else:
             # Legacy formulation: hard-min over links at each obstacle point.
             with torch.no_grad():
@@ -1396,6 +1456,16 @@ class CBFSafetyNode:
             relaxation=self.cbf_projection_relaxation,
             max_velocity=self.max_joint_velocity,
         )
+        _lap()  # t_pocs: project_halfspaces_sequential
+        if prof and len(_t) >= 4:
+            ev = (_t[1] - _t[0]) * 1e3
+            sel = (_t[2] - _t[1]) * 1e3
+            pocs = (_t[3] - _t[2]) * 1e3
+            rospy.loginfo_throttle(
+                1.0,
+                "⏱️ [multicbf] K=%d  evaluate=%.2f ms | select(sync)=%.2f ms | "
+                "POCS=%.2f ms | sum=%.2f ms" % (
+                    int(G.shape[0]), ev, sel, pocs, ev + sel + pocs))
 
         constr = torch.mv(G, dq_projected) - bounds
         min_idx = torch.argmin(h_det)
@@ -1519,7 +1589,7 @@ class CBFSafetyNode:
         self.static_q.copy_(current_q)
         self.static_obs.copy_(local_obs)
         self.static_dq_nom.copy_(dq_nom)
-        if self.cbf_solver_mode == "fast_tangent":
+        if self.cbf_solver_mode in ("fast_tangent", "multi_graphed"):
             self.graph.replay()
             return self.static_dq_safe.detach()
         return self.solve_multicbf_projection(
@@ -1533,7 +1603,7 @@ class CBFSafetyNode:
         grad_h = self.static_grad_h.detach()
         grad_norm = torch.norm(grad_h, dim=1, keepdim=True)
         h_bias = 0.0
-        if self.cbf_solver_mode == "fast_tangent":
+        if self.cbf_solver_mode in ("fast_tangent", "multi_graphed"):
             h_bias = float(self.barrier.alpha) * float(
                 np.log(max(1, int(self.selected_count))))
         h_escape_t = (
@@ -3228,7 +3298,7 @@ class CBFSafetyNode:
                     else:
                         h_hard_val = nan
                         softmin_gap_val = nan
-                    if self.enable_cbf and self.cbf_solver_mode == "fast_tangent":
+                    if self.enable_cbf and self.cbf_solver_mode in ("fast_tangent", "multi_graphed"):
                         h_corr_val = h_val + float(self.barrier.alpha) * float(
                             np.log(max(1, int(self.selected_count))))
                     else:
@@ -3270,7 +3340,8 @@ class CBFSafetyNode:
                         float(cpu_buffer[38]),  # q_lead
                         float(cpu_buffer[36]),  # dq_real_norm
                         float(self._last_active_constraints
-                              if self.cbf_solver_mode == "multi_projected" else 1.0),
+                              if self.cbf_solver_mode in ("multi_projected", "multi_graphed")
+                              else 1.0),
                         0.0 if self.cbf_solver_mode == "fast_tangent" else 1.0,
                         1.0 if self.cbf_monitor_only else 0.0,
                         1.0 if self._contact_stopped else 0.0,
