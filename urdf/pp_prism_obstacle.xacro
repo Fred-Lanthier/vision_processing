@@ -2,7 +2,7 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="pp_prism_obstacle">
   <xacro:arg name="size_x" default="0.10"/>
   <xacro:arg name="size_y" default="0.06"/>
-  <xacro:arg name="height" default="0.18"/>
+  <xacro:arg name="height" default="0.36"/>
   <xacro:arg name="color_rgba" default="0 0 0 1"/>
 
   <link name="base_link">

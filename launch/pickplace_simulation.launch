@@ -20,9 +20,11 @@
   <arg name="obstacle_yaw" default="-0.160"/>
   <arg name="obstacle_radius" default="0.040"/>
   <arg name="obstacle_height" default="0.180"/>
-  <arg name="obstacle_gazebo_z" default="0.840"/>
   <arg name="obstacle_prism_size_x" default="0.100"/>
   <arg name="obstacle_prism_size_y" default="0.060"/>
+  <arg name="obstacle_prism_height" default="0.360"/>
+  <arg name="obstacle_gazebo_z"
+       default="$(eval 0.75 + 0.5 * (float(arg('obstacle_prism_height')) if arg('obstacle_shape') == 'prism' else float(arg('obstacle_height'))))"/>
 
   <include file="$(find gazebo_ros)/launch/empty_world.launch">
     <arg name="world_name" value="$(find vision_processing)/worlds/feeding.world"/>
@@ -45,12 +47,12 @@
         args="-urdf -model red_cube -param red_cube_description
               -x 0.56 -y -0.035 -z 0.77"/>
 
-  <!-- Brown place box: 1 cm high, center world (0.515,-0.35,0.755), top at 0.76. -->
+  <!-- Brown place box: 1 cm high, center world (0.515,-0.50,0.755), top at 0.76. -->
   <param name="brown_box_description"
          textfile="$(find vision_processing)/urdf/brown_box.urdf"/>
   <node name="spawn_brown_box" pkg="gazebo_ros" type="spawn_model"
         args="-urdf -model brown_box -param brown_box_description
-              -x 0.515 -y -0.35 -z 0.755"/>
+              -x 0.515 -y -0.50 -z 0.755"/>
 
   <!-- Static CBF test obstacle: Gazebo pose is table-frame xy, plus table-top z=0.75. -->
   <param name="pp_cylinder_obstacle_description"
@@ -68,7 +70,7 @@
          command="$(find xacro)/xacro $(find vision_processing)/urdf/pp_prism_obstacle.xacro
                   size_x:=$(arg obstacle_prism_size_x)
                   size_y:=$(arg obstacle_prism_size_y)
-                  height:=$(arg obstacle_height)"/>
+                  height:=$(arg obstacle_prism_height)"/>
   <node name="spawn_pp_cbf_prism" pkg="gazebo_ros" type="spawn_model"
         if="$(eval arg('obstacle_enabled') and arg('obstacle_shape') == 'prism')"
         args="-urdf -model pp_cbf_prism -param pp_prism_obstacle_description

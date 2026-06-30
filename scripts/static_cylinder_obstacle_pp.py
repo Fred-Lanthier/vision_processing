@@ -32,6 +32,36 @@ def transform_local(points, center_x, center_y, base_z, yaw):
     return points.astype(np.float32)
 
 
+def _fibonacci_sphere_offsets(radius, num_points):
+    """Return uniformly distributed surface offsets for a sphere."""
+    radius = float(radius)
+    num_points = int(num_points)
+    if radius <= 0.0:
+        raise ValueError("Sphere radius must be positive.")
+    if num_points < 4:
+        raise ValueError("A sphere point cloud requires at least four points.")
+
+    indices = np.arange(num_points, dtype=np.float64) + 0.5
+    z = 1.0 - 2.0 * indices / num_points
+    radial = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    theta = np.pi * (1.0 + np.sqrt(5.0)) * indices
+    unit_sphere = np.column_stack([
+        radial * np.cos(theta),
+        radial * np.sin(theta),
+        z,
+    ])
+    return np.ascontiguousarray(radius * unit_sphere, dtype=np.float32)
+
+
+def _linear_motion_position(initial_position, velocity, elapsed):
+    """Position of a constant-velocity obstacle after ``elapsed`` seconds."""
+    initial = np.asarray(initial_position, dtype=np.float32)
+    velocity = np.asarray(velocity, dtype=np.float32)
+    if initial.shape != (3,) or velocity.shape != (3,):
+        raise ValueError("Initial position and velocity must each contain x, y, z.")
+    return initial + velocity * np.float32(max(0.0, float(elapsed)))
+
+
 def sample_cylinder_surface(radius, height, num_points):
     num_points = max(16, int(num_points))
     radius = float(radius)
@@ -224,6 +254,35 @@ class StaticObstaclePP:
         self.crescent_bite_offset = float(rospy.get_param("~crescent_bite_offset", 0.030))
         self.num_points = int(rospy.get_param("~num_points", 1000))
 
+        # Camera-independent moving obstacle. This mirrors persistent_cloud_node:
+        # the sphere is overlaid only on the published obstacle cloud, so it does
+        # not leave a stale point trail as it moves.
+        self.moving_sphere_enabled = bool(rospy.get_param("~moving_sphere_enabled", False))
+        self.moving_sphere_initial_position = np.array([
+            float(rospy.get_param("~moving_sphere_initial_x", 0.30)),
+            float(rospy.get_param("~moving_sphere_initial_y", -9.6)),
+            float(rospy.get_param("~moving_sphere_initial_z", 0.5)),
+        ], dtype=np.float32)
+        self.moving_sphere_velocity = np.array([
+            float(rospy.get_param("~moving_sphere_velocity_x", 0.0)),
+            float(rospy.get_param("~moving_sphere_velocity_y", 0.30)),
+            float(rospy.get_param("~moving_sphere_velocity_z", 0.0)),
+        ], dtype=np.float32)
+        self.moving_sphere_radius = float(rospy.get_param("~moving_sphere_radius", 0.08))
+        self.moving_sphere_num_points = int(rospy.get_param("~moving_sphere_num_points", 1000))
+        self._moving_sphere_start_time = None
+        self._moving_sphere_offsets = None
+        if self.moving_sphere_enabled:
+            values = np.concatenate([
+                self.moving_sphere_initial_position,
+                self.moving_sphere_velocity,
+                np.array([self.moving_sphere_radius], dtype=np.float32),
+            ])
+            if not np.isfinite(values).all():
+                raise ValueError("Moving-sphere position, velocity, and radius must be finite.")
+            self._moving_sphere_offsets = _fibonacci_sphere_offsets(
+                self.moving_sphere_radius, self.moving_sphere_num_points)
+
         if self.shape == "cylinder":
             local = sample_cylinder_surface(self.radius, self.height, self.num_points)
         elif self.shape == "prism":
@@ -238,8 +297,9 @@ class StaticObstaclePP:
         else:
             raise ValueError("~shape must be one of: cylinder, crescent, prism")
 
-        self.points = transform_local(local, self.center_x, self.center_y,
-                                      self.base_z, self.yaw)
+        self.static_points = transform_local(local, self.center_x, self.center_y,
+                                             self.base_z, self.yaw)
+        self.points = self.static_points
 
         self.pub = rospy.Publisher(self.topic, PointCloud2, queue_size=1)
         self.extra_pub = None
@@ -256,18 +316,57 @@ class StaticObstaclePP:
             self.base_z + 0.5 * self.height,
             self.yaw,
             self.height,
-            len(self.points),
+            len(self.static_points),
             self.topic,
             self.extra_topic or "none",
         )
+        if self.moving_sphere_enabled:
+            rospy.loginfo(
+                "PP moving sphere obstacle: initial=(%.3f, %.3f, %.3f) "
+                "velocity=(%.3f, %.3f, %.3f) radius=%.3f points=%d",
+                self.moving_sphere_initial_position[0],
+                self.moving_sphere_initial_position[1],
+                self.moving_sphere_initial_position[2],
+                self.moving_sphere_velocity[0],
+                self.moving_sphere_velocity[1],
+                self.moving_sphere_velocity[2],
+                self.moving_sphere_radius,
+                len(self._moving_sphere_offsets),
+            )
 
-    def _cloud_msg(self):
-        header = Header(stamp=rospy.Time.now(), frame_id=self.frame_id)
-        return pc2.create_cloud_xyz32(header, self.points)
+    def _moving_sphere_center(self, now_sec=None):
+        if not self.moving_sphere_enabled:
+            return None
 
-    def _marker_msg(self):
+        now_sec = rospy.get_time() if now_sec is None else float(now_sec)
+        if self._moving_sphere_start_time is None or \
+                now_sec < self._moving_sphere_start_time:
+            self._moving_sphere_start_time = now_sec
+
+        elapsed = now_sec - self._moving_sphere_start_time
+        return _linear_motion_position(
+            self.moving_sphere_initial_position,
+            self.moving_sphere_velocity,
+            elapsed)
+
+    def _generate_moving_sphere(self, now_sec=None):
+        center = self._moving_sphere_center(now_sec)
+        if center is None:
+            return None
+        return self._moving_sphere_offsets + center[None, :]
+
+    def _combined_points(self, sphere_points):
+        if sphere_points is None or len(sphere_points) == 0:
+            return self.static_points
+        return np.vstack([self.static_points, sphere_points]).astype(np.float32)
+
+    def _cloud_msg(self, points, stamp):
+        header = Header(stamp=stamp, frame_id=self.frame_id)
+        return pc2.create_cloud_xyz32(header, points)
+
+    def _marker_msg(self, stamp):
         marker = Marker()
-        marker.header.stamp = rospy.Time.now()
+        marker.header.stamp = stamp
         marker.header.frame_id = self.frame_id
         marker.ns = "pp_cbf_obstacle"
         marker.id = 0
@@ -306,14 +405,47 @@ class StaticObstaclePP:
             marker.points.append(Point())
         return marker
 
+    def _moving_sphere_marker_msg(self, stamp, center):
+        if center is None:
+            return None
+
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = self.frame_id
+        marker.ns = "pp_cbf_obstacle"
+        marker.id = 1
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(center[0])
+        marker.pose.position.y = float(center[1])
+        marker.pose.position.z = float(center[2])
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 2.0 * self.moving_sphere_radius
+        marker.scale.y = 2.0 * self.moving_sphere_radius
+        marker.scale.z = 2.0 * self.moving_sphere_radius
+        marker.color.r = 0.75
+        marker.color.g = 0.05
+        marker.color.b = 0.75
+        marker.color.a = 0.55
+        return marker
+
     def run(self):
         rate = rospy.Rate(max(1.0, self.publish_rate_hz))
         while not rospy.is_shutdown():
-            msg = self._cloud_msg()
+            stamp = rospy.Time.now()
+            now_sec = rospy.get_time()
+            sphere_center = self._moving_sphere_center(now_sec)
+            sphere_points = None
+            if sphere_center is not None:
+                sphere_points = self._moving_sphere_offsets + sphere_center[None, :]
+            msg = self._cloud_msg(self._combined_points(sphere_points), stamp)
             self.pub.publish(msg)
             if self.extra_pub is not None:
                 self.extra_pub.publish(msg)
-            self.marker_pub.publish(self._marker_msg())
+            self.marker_pub.publish(self._marker_msg(stamp))
+            sphere_marker = self._moving_sphere_marker_msg(stamp, sphere_center)
+            if sphere_marker is not None:
+                self.marker_pub.publish(sphere_marker)
             rate.sleep()
 
 

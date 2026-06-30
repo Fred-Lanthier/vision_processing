@@ -23,14 +23,14 @@ rosbag record --lz4 -O runPP1.bag -e \
     '/cbf_safety/diagnostics(_layout)?$|/joint_states$|/perception/persistent_obstacles$|/pipeline/timing/.*'
 
 
-rosbag record --lz4 -O runPP3.bag -e '/cbf_safety/diagnostics(_layout)?$|/joint_states$|/planner/nominal_joint_velocity$|/planner/
+rosbag record --lz4 -O runPP6.bag -e '/cbf_safety/diagnostics(_layout)?$|/joint_states$|/planner/nominal_joint_velocity$|/planner/
   nominal_joint_command$|/planner/nominal_trajectory$|/joint_group_velocity_controller/command$|/perception/persistent_obstacles$|/perception/
   cleaned_obstacles$|/pipeline/timing/.*'
   
 When it is done, run :
 
-python3 scripts/plot_cbf_diagnostics.py runPP1.bag --csv for the plots of one bag
+python3 scripts/plot_cbf_diagnostics.py runPP6.bag --csv for the plots of one bag
 
 For comparison : 
 
-python3 scripts/analyze_trajectory.py run7.bag run8_NO_CBF.bag -o trajectory_comparison_3
+python3 scripts/analyze_trajectory.py runPP5.bag runPP6.bag -o trajectory_comparison_4

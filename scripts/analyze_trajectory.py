@@ -5,13 +5,14 @@ Inputs: one bag recorded with the CBF active and one recorded in
 monitor-only + contact-stop mode (baseline), same scene and seed:
     rosbag record /cbf_safety/diagnostics /cbf_safety/diagnostics_layout \
         /cbf_safety/contact_event /joint_states /perception/persistent_obstacles \
-        /perception/persistent_target /planner/nominal_trajectory
+        /perception/persistent_target /perception/target_cube \
+        /planner/nominal_trajectory
 
-The views are centered on the target (the food) with a fixed, configurable
+The views are centered on the initial target (the food) with a fixed, configurable
 box (--view-up/--view-down/--view-left/--view-right, in cm) so the deviation
 of the safe path away from the baseline reads at a glance. The target is the
-centroid of /perception/persistent_target if recorded, else --target x y z,
-else the CBF fork-tip endpoint.
+centroid of the first valid target cloud if recorded, else --target x y z,
+else the initial CBF fork-tip/TCP point as an explicit fallback.
 
 Outputs:
   comparison_avec_sans.png  fork-tip paths (XY + XZ) through the obstacle
@@ -37,24 +38,30 @@ import sensor_msgs.point_cloud2 as pc2
 
 PANDA_JOINTS = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
                 'panda_joint5', 'panda_joint6', 'panda_joint7']
-TARGET_TOPIC = "/perception/persistent_target"
+DEFAULT_TARGET_TOPICS = (
+    "/perception/persistent_target",
+    "/perception/target_cube",
+)
 
 
-def read_target_centroid(path):
-    """Median centroid (base frame) of the last target cloud in the bag, or None.
+def read_target_centroid(path, topics):
+    """Median centroid (base frame) of the first target cloud in the bag.
 
     The median is robust to the few smeared/outlier points the persistent target
-    can carry, so the view recenters on the actual food, not on a stray voxel."""
-    last = None
+    can carry, so the view recenters on the actual food, not on a stray voxel.
+    Using the first valid cloud keeps the plots centered on the target's initial
+    coordinates instead of the final grasped/carried position.
+
+    Returns (centroid, topic, t_sec) or (None, None, None).
+    """
+    topics = list(topics)
     with rosbag.Bag(path) as bag:
-        for _, msg, _ in bag.read_messages(topics=[TARGET_TOPIC]):
+        for topic, msg, t in bag.read_messages(topics=topics):
             pts = np.array(list(pc2.read_points(
                 msg, field_names=("x", "y", "z"), skip_nans=True)))
             if len(pts):
-                last = pts.reshape(-1, 3)
-    if last is None or not len(last):
-        return None
-    return np.median(last, axis=0)
+                return np.median(pts.reshape(-1, 3), axis=0), topic, t.to_sec()
+    return None, None, None
 
 
 def load_run(path):
@@ -187,6 +194,10 @@ def main():
                     metavar=("X", "Y", "Z"),
                     help="manual target (food) position [m] to center the views "
                          "on; overrides the recorded target cloud")
+    ap.add_argument("--target-topic", action="append", default=None,
+                    help="PointCloud2 topic to use for the initial target center. "
+                         "Can be repeated. Default: /perception/persistent_target "
+                         "and /perception/target_cube")
     ap.add_argument("--view-up", type=float, default=30.0,
                     help="view half-extent above the target [cm]")
     ap.add_argument("--view-down", type=float, default=30.0,
@@ -219,16 +230,29 @@ def main():
     if obs is not None and len(obs) > 4000:
         obs = obs[np.random.default_rng(0).choice(len(obs), 4000, replace=False)]
 
-    # Target (food) the views recenter on: manual override, else the recorded
-    # target cloud, else the CBF fork-tip endpoint (the fork reaches the food).
+    # Target (food) the views recenter on: manual override, else the first valid
+    # recorded target cloud, else the initial CBF fork-tip/TCP point.
+    target_source = "manual --target"
     if args.target is not None:
         target = np.asarray(args.target, dtype=float)
     else:
-        target = read_target_centroid(args.cbf_bag)
+        target_topics = args.target_topic or DEFAULT_TARGET_TOPICS
+        target = None
+        for bag_path in (args.cbf_bag, args.baseline_bag):
+            target, topic, target_time = read_target_centroid(bag_path, target_topics)
+            if target is not None:
+                target_source = (
+                    f"first cloud on {topic} in {os.path.basename(bag_path)} "
+                    f"at t={target_time:.3f}s")
+                break
         if target is None:
-            target = tips["cbf"][0][-1]
+            target = tips["cbf"][0][0]
+            target_source = (
+                "fallback: initial CBF fork-tip/TCP point; no target cloud was "
+                "recorded, so pass --target X Y Z or record /perception/target_cube")
     print(f"target (view center): ({target[0]:.3f}, {target[1]:.3f}, "
           f"{target[2]:.3f}) m")
+    print(f"target source: {target_source}")
     # Per-direction half-extents [m]: vertical = up/down, horizontal = left/right.
     m_up, m_down = args.view_up / 100.0, args.view_down / 100.0
     m_left, m_right = args.view_left / 100.0, args.view_right / 100.0

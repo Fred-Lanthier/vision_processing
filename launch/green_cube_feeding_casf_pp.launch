@@ -23,7 +23,7 @@
 
   <arg name="cube_prompt" default="red cube"/>
   <arg name="box_prompt"  default="white box"/>
-  <arg name="pickplace_model_name" default="last_fm_model_pickplace_10D_1024.ckpt"/>
+  <arg name="pickplace_model_name" default="best_fm_model_pickplace_10D_1024.ckpt"/>
   <arg name="condition_num_points" default="1024"/>
   <arg name="planner_rate_hz" default="3"/>
   <arg name="control_rate_hz" default="100.0"/>
@@ -33,26 +33,40 @@
   <!-- Static PP CBF obstacle. Coordinates are in the robot/table frame; Gazebo
        spawn adds the table-top z offset internally. -->
   <arg name="obstacle_enabled" default="true"/>
-  <arg name="obstacle_shape" default="cylinder"/>
+  <arg name="obstacle_shape" default="prism"/>
   <arg name="obstacle_x" default="0.535"/>
   <arg name="obstacle_y" default="-0.190"/>
   <!-- Local +Y faces the red cube by default. This matters for the crescent. -->
   <arg name="obstacle_yaw" default="-0.160"/>
   <arg name="obstacle_radius" default="0.040"/>
-  <arg name="obstacle_height" default="0.180"/>
-  <!-- Gazebo world z for the cylinder center. Table top is z=0.75, so the
-       default is 0.75 + obstacle_height/2 = 0.84. -->
-  <arg name="obstacle_gazebo_z" default="0.840"/>
-  <arg name="obstacle_prism_size_x" default="0.100"/>
+  <arg name="obstacle_height" default="0.360"/>
+  <arg name="obstacle_prism_size_x" default="0.200"/>
   <arg name="obstacle_prism_size_y" default="0.060"/>
+  <arg name="obstacle_prism_height" default="0.360"/>
+  <!-- Gazebo world z for the obstacle center. Table top is z=0.75, so the
+       default keeps the selected obstacle resting on the table. -->
+  <arg name="obstacle_gazebo_z"
+       default="$(eval 0.75 + 0.5 * (float(arg('obstacle_prism_height')) if arg('obstacle_shape') == 'prism' else float(arg('obstacle_height'))))"/>
   <arg name="obstacle_crescent_outer_radius" default="0.055"/>
   <arg name="obstacle_crescent_inner_radius" default="0.055"/>
   <arg name="obstacle_crescent_bite_offset" default="0.030"/>
   <arg name="obstacle_cloud_points" default="1000"/>
   <arg name="obstacle_cloud_topic" default="/perception/cleaned_obstacles"/>
   <arg name="obstacle_cloud_extra_topic" default="/perception/persistent_obstacles"/>
+  <!-- Camera-independent moving obstacle, same idea as green_cube_feeding_casf:
+       it is added to the published obstacle cloud without leaving a stale trail. -->
+  <arg name="moving_sphere_enabled" default="true"/>
+  <arg name="moving_sphere_initial_x" default="0.25"/>
+  <arg name="moving_sphere_initial_y" default="-3.2"/>
+  <arg name="moving_sphere_initial_z" default="0.38"/>
+  <arg name="moving_sphere_velocity_x" default="0.0"/>
+  <arg name="moving_sphere_velocity_y" default="0.1"/>
+  <arg name="moving_sphere_velocity_z" default="0.0"/>
+  <arg name="moving_sphere_radius" default="0.08"/>
+  <arg name="moving_sphere_num_points" default="1000"/>
 
   <!-- Online CBF tuning, matching the tested feeding values where applicable. -->
+  <arg name="enable_cbf" default="true"/>
   <arg name="cbf_node_type" default="cbf_safety_node_Bernstein_multicbf.py"/>
   <arg name="cbf_graph_points" default="100"/>
   <arg name="cbf_preprocess_max_points" default="2048"/>
@@ -64,8 +78,15 @@
   <arg name="cbf_sdf_self_filter_margin" default="-0.05"/>
   <arg name="cbf_sdf_prefilter_radius" default="0.4"/>
   <arg name="cbf_sdf_prefilter_max_points" default="2048"/>
-  <arg name="cbf_solver_mode" default="fast_tangent"/>
-  <arg name="cbf_active_constraints" default="2"/>
+  <!-- PP needs the obstacle shield on the whole gripper/arm body. fast_tangent
+       collapses the analytical per-link barriers to only the current min link;
+       multi_graphed keeps the CUDA-graph speed while projecting through the
+       selected per-link half-spaces. There are 9 protected PP links below. -->
+  <arg name="cbf_solver_mode" default="multi_graphed"/>
+  <arg name="cbf_active_constraints" default="9"/>
+  <!-- POCS sweeps over the active per-link half-space constraints. -->
+  <arg name="cbf_constraint_sweeps" default="6"/>
+  <arg name="cbf_final_constraint_mode" default="solver_bound"/>
   <arg name="cbf_multi_gradient_mode" default="analytical"/>
   <arg name="cbf_multi_fd_eps" default="0.001"/>
   <arg name="cbf_kappa" default="3.0"/>
@@ -75,23 +96,24 @@
   <arg name="cbf_enforce_final_constraint" default="true"/>
   <arg name="cbf_command_dt" default="0.05"/>
   <arg name="cbf_direct_position_mode" default="integrated"/>
-  <arg name="cbf_position_correction_dt" default="0.08"/>
+  <arg name="cbf_position_correction_dt" default="0.2"/>
   <arg name="cbf_max_command_lead" default="0.05"/>
   <arg name="cbf_h_activate" default="0.04"/>
-  <arg name="cbf_max_inward_speed" default="0.20"/>
-  <arg name="cbf_recovery_speed" default="0.05"/>
+  <arg name="cbf_max_inward_speed" default="0.3"/>
+  <arg name="cbf_recovery_speed" default="0.3"/>
   <arg name="cbf_recovery_depth" default="0.015"/>
-  <arg name="cbf_max_correction_speed" default="0.20"/>
-  <arg name="cbf_recovery_max_correction_speed" default="0.55"/>
+  <arg name="cbf_max_correction_speed" default="0.3"/>
+  <arg name="cbf_recovery_max_correction_speed" default="0.85"/>
+  <arg name="cbf_repair_grad_min" default="0.03"/>
   <arg name="cbf_projection_iters" default="3"/>
   <arg name="cbf_projection_relaxation" default="1.0"/>
   <arg name="cbf_tracking_feedback_mode" default="tangent_near"/>
   <arg name="cbf_passthrough_when_inactive" default="true"/>
   <arg name="cbf_monitor_only" default="false"/>
   <arg name="cbf_filter_tau" default="0.08"/>
-  <arg name="cbf_velocity_filter_tau" default="0.15"/>
+  <arg name="cbf_velocity_filter_tau" default="0.08"/>
   <arg name="cbf_diagnostics_decimation" default="4"/>
-  <arg name="barrier_alpha" default="0.005"/>
+  <arg name="barrier_alpha" default="0.002"/>
   <arg name="d_safe" default="0.015"/>
 
   <!-- Trajectory retiming (was using the planner's internal defaults: joint_speed
@@ -132,13 +154,15 @@
     <arg name="obstacle_yaw" value="$(arg obstacle_yaw)"/>
     <arg name="obstacle_radius" value="$(arg obstacle_radius)"/>
     <arg name="obstacle_height" value="$(arg obstacle_height)"/>
+    <arg name="obstacle_prism_height" value="$(arg obstacle_prism_height)"/>
     <arg name="obstacle_gazebo_z" value="$(arg obstacle_gazebo_z)"/>
     <arg name="obstacle_prism_size_x" value="$(arg obstacle_prism_size_x)"/>
     <arg name="obstacle_prism_size_y" value="$(arg obstacle_prism_size_y)"/>
   </include>
 
   <!-- 0.5. Camera-independent obstacle cloud for the online CBF. This mirrors
-       the spawned Gazebo cylinder in the robot/table world frame. -->
+       the spawned static obstacle and can add a synthetic moving sphere in the
+       robot/table world frame. -->
   <node name="pp_static_obstacle" pkg="vision_processing"
         type="static_cylinder_obstacle_pp.py" output="screen"
         if="$(arg obstacle_enabled)">
@@ -151,13 +175,23 @@
         <param name="yaw" value="$(arg obstacle_yaw)"/>
         <param name="base_z" value="0.0"/>
         <param name="radius" value="$(arg obstacle_radius)"/>
-        <param name="height" value="$(arg obstacle_height)"/>
+        <param name="height"
+               value="$(eval float(arg('obstacle_prism_height')) if arg('obstacle_shape') == 'prism' else float(arg('obstacle_height')))"/>
         <param name="prism_size_x" value="$(arg obstacle_prism_size_x)"/>
         <param name="prism_size_y" value="$(arg obstacle_prism_size_y)"/>
         <param name="crescent_outer_radius" value="$(arg obstacle_crescent_outer_radius)"/>
         <param name="crescent_inner_radius" value="$(arg obstacle_crescent_inner_radius)"/>
         <param name="crescent_bite_offset" value="$(arg obstacle_crescent_bite_offset)"/>
         <param name="num_points" value="$(arg obstacle_cloud_points)"/>
+        <param name="moving_sphere_enabled" value="$(arg moving_sphere_enabled)"/>
+        <param name="moving_sphere_initial_x" value="$(arg moving_sphere_initial_x)"/>
+        <param name="moving_sphere_initial_y" value="$(arg moving_sphere_initial_y)"/>
+        <param name="moving_sphere_initial_z" value="$(arg moving_sphere_initial_z)"/>
+        <param name="moving_sphere_velocity_x" value="$(arg moving_sphere_velocity_x)"/>
+        <param name="moving_sphere_velocity_y" value="$(arg moving_sphere_velocity_y)"/>
+        <param name="moving_sphere_velocity_z" value="$(arg moving_sphere_velocity_z)"/>
+        <param name="moving_sphere_radius" value="$(arg moving_sphere_radius)"/>
+        <param name="moving_sphere_num_points" value="$(arg moving_sphere_num_points)"/>
         <param name="publish_rate_hz" value="30.0"/>
   </node>
 
@@ -216,7 +250,7 @@
         <param name="model_name" value="$(arg pickplace_model_name)"/>
         <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
         <param name="controlled_link" value="panda_TCP"/>
-        <rosparam param="cbf_link_names">['panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
+        <rosparam param="cbf_link_names">['panda_link2', 'panda_link3', 'panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
         <param name="merged_cloud_contains_fork" value="true"/>
         <param name="tcp_frame" value="panda_TCP"/>
         <param name="gripper_open_threshold" value="0.03"/>
@@ -265,8 +299,8 @@
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
         <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
         <param name="controlled_link" value="panda_TCP"/>
-        <rosparam param="cbf_link_names">['panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
-        <param name="enable_cbf" value="true"/>
+        <rosparam param="cbf_link_names">['panda_link2', 'panda_link3', 'panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
+        <param name="enable_cbf" value="$(arg enable_cbf)"/>
         <param name="cbf_passthrough_when_inactive" value="$(arg cbf_passthrough_when_inactive)"/>
         <param name="cbf_monitor_only" value="$(arg cbf_monitor_only)"/>
         <param name="cbf_graph_points" value="$(arg cbf_graph_points)"/>
@@ -281,6 +315,8 @@
         <param name="cbf_sdf_prefilter_max_points" value="$(arg cbf_sdf_prefilter_max_points)"/>
         <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)"/>
         <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)"/>
+        <param name="cbf_constraint_sweeps" value="$(arg cbf_constraint_sweeps)"/>
+        <param name="cbf_final_constraint_mode" value="$(arg cbf_final_constraint_mode)"/>
         <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)"/>
         <param name="cbf_multi_fd_eps" value="$(arg cbf_multi_fd_eps)"/>
         <param name="cbf_grasp_box_enabled" value="false"/>
@@ -310,6 +346,7 @@
         <param name="cbf_recovery_depth" value="$(arg cbf_recovery_depth)"/>
         <param name="cbf_max_correction_speed" value="$(arg cbf_max_correction_speed)"/>
         <param name="cbf_recovery_max_correction_speed" value="$(arg cbf_recovery_max_correction_speed)"/>
+        <param name="cbf_repair_grad_min" value="$(arg cbf_repair_grad_min)"/>
         <param name="cbf_projection_iters" value="$(arg cbf_projection_iters)"/>
         <param name="cbf_projection_relaxation" value="$(arg cbf_projection_relaxation)"/>
         <param name="cbf_tracking_feedback_mode" value="$(arg cbf_tracking_feedback_mode)"/>

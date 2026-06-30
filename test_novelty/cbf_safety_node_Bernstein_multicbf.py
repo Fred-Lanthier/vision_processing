@@ -299,6 +299,11 @@ class CBFSafetyNode:
         # enters/exits the container vertically) is trusted instead.
         self.cbf_repair_grad_min = float(rospy.get_param(
             "~cbf_repair_grad_min", 0.1))
+        self.cbf_final_constraint_mode = str(rospy.get_param(
+            "~cbf_final_constraint_mode", "legacy_kappa")).lower()
+        if self.cbf_final_constraint_mode not in ("legacy_kappa", "solver_bound"):
+            raise ValueError(
+                "~cbf_final_constraint_mode must be 'legacy_kappa' or 'solver_bound'")
         self.cbf_projection_iters = max(1, int(rospy.get_param(
             "~cbf_projection_iters", 3)))
         self.cbf_projection_relaxation = float(rospy.get_param(
@@ -358,12 +363,15 @@ class CBFSafetyNode:
         # match this boundary, baked into the CUDA graph below.
         self.n_obs_robot_split = max(
             1, self.cbf_graph_points - max(0, self.cbf_grasp_obstacle_points))
-        # Alternating-projection passes over the two group half-spaces (POCS).
-        # 1 = single food-then-robot pass (only the robot constraint is then
-        # guaranteed); >1 iterates so BOTH the target and fork+robot half-spaces
-        # are satisfied at convergence. Baked into the CUDA graph below.
-        self.cbf_two_group_iters = max(
-            1, int(rospy.get_param("~cbf_two_group_iters", 6)))
+        # Number of POCS sweeps over the active half-space constraints. Each
+        # sweep projects dq onto every active constraint in turn; projecting onto
+        # one can re-violate a previously satisfied one, so 1 sweep only
+        # guarantees the last constraint while >1 iterates to a dq that satisfies
+        # them all at convergence. Covers both the per-link constraints
+        # (multi_graphed) and the two-group robot/grasp split. Baked into the
+        # CUDA graph below.
+        self.cbf_constraint_sweeps = max(
+            1, int(rospy.get_param("~cbf_constraint_sweeps", 6)))
         preprocess_max_points = int(rospy.get_param("~preprocess_max_points", 512))
         self.preprocess_max_points = (
             max(self.cbf_graph_points, preprocess_max_points)
@@ -567,6 +575,9 @@ class CBFSafetyNode:
         # out of this copy so command publication is not blocked by telemetry.
         self.command_buffer = torch.zeros(16, dtype=torch.float32, device=self.device)
         self._last_active_constraints = 0
+        self._graphed_active_constraints = (
+            max(1, min(self.cbf_active_constraints, self.bernstein_core.K))
+            if self.cbf_solver_mode == "multi_graphed" else 0)
         self._log_cuda_memory("CBF after runtime buffers")
 
         self.comp_times = []
@@ -791,6 +802,35 @@ class CBFSafetyNode:
         sdf_value = self.bernstein_core.get_whole_body_sdf_batch(
             obs, pose, q, return_per_link=False)
         return sdf_value.min(dim=1).values - self.d_safe
+
+    def _robot_constraint_bound(self, h):
+        h_activate = max(self.cbf_h_activate, 1e-6)
+        recovery_depth = max(self.cbf_recovery_depth, 1e-6)
+        outside_bound = -self.cbf_max_inward_speed * torch.clamp(
+            h / h_activate, min=0.0, max=1.0)
+        inside_bound = self.cbf_recovery_speed * torch.clamp(
+            (-h) / recovery_depth, min=0.0, max=1.0)
+        return torch.where(h > 0.0, outside_bound, inside_bound) \
+            + self.cbf_constraint_margin
+
+    def _constraint_residual(self, h, grad_h, dq):
+        gdq = (grad_h * dq).sum(dim=1)
+        if self.cbf_final_constraint_mode == "solver_bound":
+            return gdq - self._robot_constraint_bound(h)
+
+        kappa_eff = torch.where(
+            h < 0.0,
+            torch.full_like(h, self.cbf_recovery_kappa),
+            torch.full_like(h, self.cbf_kappa),
+        )
+        return gdq + kappa_eff * h - self.cbf_constraint_margin
+
+    def _diagnostic_active_constraints(self):
+        if self.cbf_solver_mode == "multi_graphed":
+            return self._graphed_active_constraints if self.selected_count > 0 else 0
+        if self.cbf_solver_mode == "multi_projected":
+            return self._last_active_constraints
+        return 1 if self.selected_count > 0 else 0
 
     def _evaluate_link_sdf_local(self, link_index, points_local):
         """Evaluate one protected link SDF in that link's local frame."""
@@ -1162,7 +1202,7 @@ class CBFSafetyNode:
         # static_constr / static_grad_h set to the robot group for the repair.
         two_group = (self.cbf_grasp_enabled and self.cbf_grasp_separate_constraint)
         n_robot = self.bernstein_core.K
-        two_group_iters = self.cbf_two_group_iters
+        constraint_sweeps = self.cbf_constraint_sweeps
 
         analytical_point_mask = None
         if self.cbf_multi_gradient_mode == "analytical" and two_group:
@@ -1226,7 +1266,7 @@ class CBFSafetyNode:
             if two_group:
                 self.static_h_food.copy_(torch.clamp(h_f, max=0.25))
             dq = dq_nom
-            for _ in range(two_group_iters):
+            for _ in range(constraint_sweeps):
                 if two_group:
                     dq = _qp_step(h_f, g_f, dq, *food_band)       # target half-space
                 for k in range(K_max):                            # robot links (last)
@@ -1255,7 +1295,7 @@ class CBFSafetyNode:
                 # below); far-from-obstacle spikes otherwise squash the plot.
                 self.static_h_food.copy_(torch.clamp(h_f, max=0.25))
                 dq = dq_nom
-                for _ in range(two_group_iters):
+                for _ in range(constraint_sweeps):
                     dq = _qp_step(h_f, g_f, dq, *food_band)    # target half-space
                     dq = _qp_step(h_r, g_r, dq, *robot_band)   # fork+robot (last)
                 self.static_grad_h.copy_(g_r)
@@ -2868,17 +2908,10 @@ class CBFSafetyNode:
                         # motion is preserved instead of braking to zero.
                         grad_h = self.static_grad_h.detach()
                         grad_norm_sq = (grad_h ** 2).sum(dim=1, keepdim=True)
-                        kappa_eff = torch.where(
-                            self.static_h.detach() < 0.0,
-                            torch.full_like(self.static_h.detach(), self.cbf_recovery_kappa),
-                            torch.full_like(self.static_h.detach(), self.cbf_kappa),
-                        )
-                        final_constr = (
-                            (grad_h * self.dq_safe_work).sum(dim=1)
-                            + kappa_eff * self.static_h.detach()
-                            - self.cbf_constraint_margin
-                        )
-                        final_active = self.static_h.detach() <= self.cbf_h_activate
+                        h_final = self.static_h.detach()
+                        final_constr = self._constraint_residual(
+                            h_final, grad_h, self.dq_safe_work)
+                        final_active = h_final <= self.cbf_h_activate
                         needs_repair = (
                             final_active
                             & (final_constr < 0.0)
@@ -2937,11 +2970,8 @@ class CBFSafetyNode:
                         dq_repaired = self.dq_safe_work + repair_delta
                         dq_repaired.clamp_(min=-self.max_joint_velocity, max=self.max_joint_velocity)
                         self.dq_safe_work.copy_(torch.where(needs_repair, dq_repaired, self.dq_safe_work))
-                        final_constr = (
-                            (grad_h * self.dq_safe_work).sum(dim=1)
-                            + kappa_eff * self.static_h.detach()
-                            - self.cbf_constraint_margin
-                        )
+                        final_constr = self._constraint_residual(
+                            h_final, grad_h, self.dq_safe_work)
                         self.static_constr.copy_(torch.where(
                             final_active,
                             final_constr,
@@ -3191,20 +3221,13 @@ class CBFSafetyNode:
                             grad_h_dbg = self.static_grad_h.detach()
                             self._maybe_check_gradient_direction(
                                 current_q, local_obs, h_now, grad_h_dbg)
-                            kappa_dbg = torch.where(
-                                h_now < 0.0,
-                                torch.full_like(h_now, self.cbf_recovery_kappa),
-                                torch.full_like(h_now, self.cbf_kappa),
-                            )
                             self.transfer_buffer[14].copy_(h_now.squeeze(0))
                             self.transfer_buffer[15].copy_(self.static_constr.squeeze(0))
                             self.transfer_buffer[71].copy_(
                                 self.static_h_food.detach().view(-1)[0])
-                            self.transfer_buffer[62].copy_((
-                                (grad_h_dbg * dq_nom_base).sum(dim=1)
-                                + kappa_dbg * h_now
-                                - self.cbf_constraint_margin
-                            ).view(-1)[0])
+                            self.transfer_buffer[62].copy_(
+                                self._constraint_residual(
+                                    h_now, grad_h_dbg, dq_nom_base).view(-1)[0])
                             self.transfer_buffer[63].copy_(torch.norm(grad_h_dbg))
 
                             dq_real = self.dq_real_measured.detach()
@@ -3219,11 +3242,8 @@ class CBFSafetyNode:
 
                             cmd_hdot = (grad_h_dbg * self.dq_safe_work).sum(dim=1)
                             real_hdot = (grad_h_dbg * dq_real).sum(dim=1)
-                            real_constr = (
-                                real_hdot
-                                + kappa_dbg * h_now
-                                - self.cbf_constraint_margin
-                            )
+                            real_constr = self._constraint_residual(
+                                h_now, grad_h_dbg, dq_real)
                             norm_dq_real = torch.norm(dq_real)
                         else:
                             self.transfer_buffer[14] = 1.0
@@ -3362,9 +3382,7 @@ class CBFSafetyNode:
                         float(cpu_buffer[16]),  # alignment
                         float(cpu_buffer[38]),  # q_lead
                         float(cpu_buffer[36]),  # dq_real_norm
-                        float(self._last_active_constraints
-                              if self.cbf_solver_mode in ("multi_projected", "multi_graphed")
-                              else 1.0),
+                        float(self._diagnostic_active_constraints()),
                         0.0 if self.cbf_solver_mode == "fast_tangent" else 1.0,
                         1.0 if self.cbf_monitor_only else 0.0,
                         1.0 if self._contact_stopped else 0.0,

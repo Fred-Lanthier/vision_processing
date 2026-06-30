@@ -286,11 +286,11 @@
        group; the rest go to the robot/fork group. Stops the food (smaller d_safe,
        closest) from taking all the slots and starving the robot/fork constraint. -->
   <arg name="cbf_grasp_obstacle_points" default="25" />
-  <!-- Alternating-projection passes over the two group half-spaces (POCS).
-       1 = single food-then-robot pass (only the robot constraint is then
-       guaranteed); >1 iterates so BOTH the target and fork+robot half-spaces
-       are satisfied at convergence. -->
-  <arg name="cbf_two_group_iters" default="6" />
+  <!-- Number of POCS sweeps over the active half-space constraints. 1 sweep
+       only guarantees the last constraint; >1 iterates to a dq that satisfies
+       them all at convergence. Covers both the per-link constraints and the
+       two-group robot/grasp split. -->
+  <arg name="cbf_constraint_sweeps" default="6" />
   <!-- Per-group braking/recovery band for the grasped-TARGET half-space. The
        cbf_* args above govern the fork+robot group; these govern the target
        group so its smaller d_safe gets its own proactive braking band and
@@ -600,7 +600,7 @@
         <param name="cbf_grasp_box_enabled" value="$(arg cbf_grasp_sdf_enabled)" />
         <param name="cbf_grasp_separate_constraint" value="$(arg cbf_grasp_separate_constraint)" />
         <param name="cbf_grasp_obstacle_points" value="$(arg cbf_grasp_obstacle_points)" />
-        <param name="cbf_two_group_iters" value="$(arg cbf_two_group_iters)" />
+        <param name="cbf_constraint_sweeps" value="$(arg cbf_constraint_sweeps)" />
         <!-- Per-group braking/recovery band for the grasped-target half-space. -->
         <param name="cbf_grasp_h_activate" value="$(arg cbf_grasp_h_activate)" />
         <param name="cbf_grasp_max_inward_speed" value="$(arg cbf_grasp_max_inward_speed)" />
