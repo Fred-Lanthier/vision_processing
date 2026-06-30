@@ -1,0 +1,350 @@
+<?xml version="1.0"?>
+<!-- PICK-AND-PLACE pipeline (Stages B-C wired; D/E = obstacle stage).
+     `_pp` copy spirit of green_cube_feeding_casf.launch, reusing the SAME system
+     for the pick-and-place policy. The feeding launch is left untouched.
+
+     Data path wired here:
+       static cam -> sam3_sam2_node_pp (red cube + brown box) -> 2 masks
+       -> 2x point_cloud_projector (target_cube / target_box)
+       -> condition_pcd_pickplace (gripper + cube + box, world frame)
+       -> casf_generative_node_PC_pp (controlled_link:=panda_TCP, pickplace ckpt)
+       -> /planner/nominal_trajectory  (+ RViz viz)
+
+     execute:=true also runs trajectory_executor -> CBF velocity safety shield
+     -> joint_group_velocity_controller. The PP obstacle stage uses a static
+     cylinder cloud, leaving the feeding launch and shared perception code alone. -->
+<launch>
+  <arg name="gui" default="true"/>
+  <arg name="launch_sam3_server" default="true"/>
+  <arg name="launch_rviz" default="true"/>
+  <arg name="execute" default="true"/>
+  <arg name="venv_python" default="/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3"/>
+  <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True"/>
+
+  <arg name="cube_prompt" default="red cube"/>
+  <arg name="box_prompt"  default="white box"/>
+  <arg name="pickplace_model_name" default="last_fm_model_pickplace_10D_1024.ckpt"/>
+  <arg name="condition_num_points" default="1024"/>
+  <arg name="planner_rate_hz" default="3"/>
+  <arg name="control_rate_hz" default="100.0"/>
+  <arg name="max_joint_velocity" default="0.7"/>
+  <arg name="single_shot" default="false"/>
+
+  <!-- Static PP CBF obstacle. Coordinates are in the robot/table frame; Gazebo
+       spawn adds the table-top z offset internally. -->
+  <arg name="obstacle_enabled" default="true"/>
+  <arg name="obstacle_shape" default="cylinder"/>
+  <arg name="obstacle_x" default="0.535"/>
+  <arg name="obstacle_y" default="-0.190"/>
+  <!-- Local +Y faces the red cube by default. This matters for the crescent. -->
+  <arg name="obstacle_yaw" default="-0.160"/>
+  <arg name="obstacle_radius" default="0.040"/>
+  <arg name="obstacle_height" default="0.180"/>
+  <!-- Gazebo world z for the cylinder center. Table top is z=0.75, so the
+       default is 0.75 + obstacle_height/2 = 0.84. -->
+  <arg name="obstacle_gazebo_z" default="0.840"/>
+  <arg name="obstacle_prism_size_x" default="0.100"/>
+  <arg name="obstacle_prism_size_y" default="0.060"/>
+  <arg name="obstacle_crescent_outer_radius" default="0.055"/>
+  <arg name="obstacle_crescent_inner_radius" default="0.055"/>
+  <arg name="obstacle_crescent_bite_offset" default="0.030"/>
+  <arg name="obstacle_cloud_points" default="1000"/>
+  <arg name="obstacle_cloud_topic" default="/perception/cleaned_obstacles"/>
+  <arg name="obstacle_cloud_extra_topic" default="/perception/persistent_obstacles"/>
+
+  <!-- Online CBF tuning, matching the tested feeding values where applicable. -->
+  <arg name="cbf_node_type" default="cbf_safety_node_Bernstein_multicbf.py"/>
+  <arg name="cbf_graph_points" default="100"/>
+  <arg name="cbf_preprocess_max_points" default="2048"/>
+  <arg name="cbf_candidate_filter" default="sdf"/>
+  <arg name="cbf_selection_metric" default="sdf"/>
+  <arg name="cbf_cluster_mode" default="topk"/>
+  <arg name="cbf_sdf_candidate_max_dist" default="0.35"/>
+  <arg name="cbf_sdf_prune_chunk_size" default="2048"/>
+  <arg name="cbf_sdf_self_filter_margin" default="-0.05"/>
+  <arg name="cbf_sdf_prefilter_radius" default="0.4"/>
+  <arg name="cbf_sdf_prefilter_max_points" default="2048"/>
+  <arg name="cbf_solver_mode" default="fast_tangent"/>
+  <arg name="cbf_active_constraints" default="2"/>
+  <arg name="cbf_multi_gradient_mode" default="analytical"/>
+  <arg name="cbf_multi_fd_eps" default="0.001"/>
+  <arg name="cbf_kappa" default="3.0"/>
+  <arg name="cbf_recovery_kappa" default="5.0"/>
+  <arg name="cbf_constraint_margin" default="0.001"/>
+  <arg name="cbf_recovery_switch_margin" default="0.015"/>
+  <arg name="cbf_enforce_final_constraint" default="true"/>
+  <arg name="cbf_command_dt" default="0.05"/>
+  <arg name="cbf_direct_position_mode" default="integrated"/>
+  <arg name="cbf_position_correction_dt" default="0.08"/>
+  <arg name="cbf_max_command_lead" default="0.05"/>
+  <arg name="cbf_h_activate" default="0.04"/>
+  <arg name="cbf_max_inward_speed" default="0.20"/>
+  <arg name="cbf_recovery_speed" default="0.05"/>
+  <arg name="cbf_recovery_depth" default="0.015"/>
+  <arg name="cbf_max_correction_speed" default="0.20"/>
+  <arg name="cbf_recovery_max_correction_speed" default="0.55"/>
+  <arg name="cbf_projection_iters" default="3"/>
+  <arg name="cbf_projection_relaxation" default="1.0"/>
+  <arg name="cbf_tracking_feedback_mode" default="tangent_near"/>
+  <arg name="cbf_passthrough_when_inactive" default="true"/>
+  <arg name="cbf_monitor_only" default="false"/>
+  <arg name="cbf_filter_tau" default="0.08"/>
+  <arg name="cbf_velocity_filter_tau" default="0.15"/>
+  <arg name="cbf_diagnostics_decimation" default="4"/>
+  <arg name="barrier_alpha" default="0.005"/>
+  <arg name="d_safe" default="0.015"/>
+
+  <!-- Trajectory retiming (was using the planner's internal defaults: joint_speed
+       @ 0.25 rad/s = slow). Raise trajectory_retime_joint_speed to go faster; the
+       max joint then moves at this rad/s. Keep it <= the tracker's
+       max_joint_velocity (0.7) or the arm lags the nominal. -->
+  <arg name="trajectory_retime_mode" default="joint_speed"/>
+  <arg name="trajectory_retime_joint_speed" default="0.3"/>
+  <arg name="trajectory_retime_joint_weights" default="1 1 1 1 1 1 1"/>
+  <arg name="trajectory_retime_min_segment_fraction" default="0.02"/>
+  <arg name="trajectory_waypoint_rate_hz" default="10.0"/>
+
+  <!-- Temporal ensembler: the FM pick-place policy is MULTIMODAL (offline you see
+       up- and down-branches from the same scene). Re-querying it every cycle lets
+       it flip mode at the grasp/bottom. Ensembling blends each future timestep over
+       the last few plans (weight = exp(-decay * age_s)) so an occasional off-mode
+       sample is outvoted by the consistent one. Set false to A/B the raw policy. -->
+  <arg name="use_temporal_ensembler" default="true"/>
+  <arg name="ensembler_buffer_size" default="5"/>
+  <arg name="ensembler_decay" default="1.5"/>
+  <arg name="trajectory_command_lookahead_time" default="0.05"/>
+
+  <!-- Static-camera topics (perception runs on the STATIC cam this time). -->
+  <arg name="static_rgb_topic"   default="/camera_static/color/image_raw"/>
+  <arg name="static_depth_topic" default="/camera_static/aligned_depth_to_color/image_raw"/>
+  <arg name="static_info_topic"  default="/camera_static/color/camera_info"/>
+  <arg name="static_cam_frame"   default="camera_static_optical_frame"/>
+
+  <!-- 0. Gazebo env + gripper Panda + cameras + velocity controller + sam3_server -->
+  <include file="$(find vision_processing)/launch/pickplace_simulation.launch">
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="launch_sam3_server" value="$(arg launch_sam3_server)"/>
+    <arg name="use_direct_group_velocity_controller" value="true"/>
+    <arg name="obstacle_enabled" value="$(arg obstacle_enabled)"/>
+    <arg name="obstacle_shape" value="$(arg obstacle_shape)"/>
+    <arg name="obstacle_x" value="$(arg obstacle_x)"/>
+    <arg name="obstacle_y" value="$(arg obstacle_y)"/>
+    <arg name="obstacle_yaw" value="$(arg obstacle_yaw)"/>
+    <arg name="obstacle_radius" value="$(arg obstacle_radius)"/>
+    <arg name="obstacle_height" value="$(arg obstacle_height)"/>
+    <arg name="obstacle_gazebo_z" value="$(arg obstacle_gazebo_z)"/>
+    <arg name="obstacle_prism_size_x" value="$(arg obstacle_prism_size_x)"/>
+    <arg name="obstacle_prism_size_y" value="$(arg obstacle_prism_size_y)"/>
+  </include>
+
+  <!-- 0.5. Camera-independent obstacle cloud for the online CBF. This mirrors
+       the spawned Gazebo cylinder in the robot/table world frame. -->
+  <node name="pp_static_obstacle" pkg="vision_processing"
+        type="static_cylinder_obstacle_pp.py" output="screen"
+        if="$(arg obstacle_enabled)">
+        <param name="frame_id" value="world"/>
+        <param name="shape" value="$(arg obstacle_shape)"/>
+        <param name="topic" value="$(arg obstacle_cloud_topic)"/>
+        <param name="extra_topic" value="$(arg obstacle_cloud_extra_topic)"/>
+        <param name="center_x" value="$(arg obstacle_x)"/>
+        <param name="center_y" value="$(arg obstacle_y)"/>
+        <param name="yaw" value="$(arg obstacle_yaw)"/>
+        <param name="base_z" value="0.0"/>
+        <param name="radius" value="$(arg obstacle_radius)"/>
+        <param name="height" value="$(arg obstacle_height)"/>
+        <param name="prism_size_x" value="$(arg obstacle_prism_size_x)"/>
+        <param name="prism_size_y" value="$(arg obstacle_prism_size_y)"/>
+        <param name="crescent_outer_radius" value="$(arg obstacle_crescent_outer_radius)"/>
+        <param name="crescent_inner_radius" value="$(arg obstacle_crescent_inner_radius)"/>
+        <param name="crescent_bite_offset" value="$(arg obstacle_crescent_bite_offset)"/>
+        <param name="num_points" value="$(arg obstacle_cloud_points)"/>
+        <param name="publish_rate_hz" value="30.0"/>
+  </node>
+
+  <!-- 1. SAM3 + SAM2 detect/track TWO objects (cube + box) on the static cam. -->
+  <node name="sam3_sam2_pp" pkg="vision_processing" type="sam3_sam2_node_pp.py" output="screen" cwd="node">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
+        <param name="cube_prompt" value="$(arg cube_prompt)"/>
+        <param name="box_prompt"  value="$(arg box_prompt)"/>
+        <param name="camera_frame" value="$(arg static_cam_frame)"/>
+        <param name="rgb_topic" value="$(arg static_rgb_topic)"/>
+  </node>
+
+  <!-- 2a. Projector: cube mask -> /perception/target_cube -->
+  <node name="projector_cube" pkg="vision_processing" type="point_cloud_projector_node.py" output="screen" cwd="node">
+        <param name="target_frame" value="world"/>
+        <param name="camera_frame" value="$(arg static_cam_frame)"/>
+        <param name="depth_topic" value="$(arg static_depth_topic)"/>
+        <param name="info_topic"  value="$(arg static_info_topic)"/>
+        <param name="rgb_topic"   value="$(arg static_rgb_topic)"/>
+        <param name="mask_topic"  value="/vision/sam2_mask_cube"/>
+        <param name="enable_fork_sam3_mask" value="false"/>
+        <param name="fork_sdf_filter" value="false"/>
+        <param name="enable_fork_filter" value="false"/>
+        <remap from="/perception/target" to="/perception/target_cube"/>
+        <remap from="/perception/obstacles" to="/perception/obstacles_cube"/>
+  </node>
+
+  <!-- 2b. Projector: box mask -> /perception/target_box -->
+  <node name="projector_box" pkg="vision_processing" type="point_cloud_projector_node.py" output="screen" cwd="node">
+        <param name="target_frame" value="world"/>
+        <param name="camera_frame" value="$(arg static_cam_frame)"/>
+        <param name="depth_topic" value="$(arg static_depth_topic)"/>
+        <param name="info_topic"  value="$(arg static_info_topic)"/>
+        <param name="rgb_topic"   value="$(arg static_rgb_topic)"/>
+        <param name="mask_topic"  value="/vision/sam2_mask_box"/>
+        <param name="enable_fork_sam3_mask" value="false"/>
+        <param name="fork_sdf_filter" value="false"/>
+        <param name="enable_fork_filter" value="false"/>
+        <remap from="/perception/target" to="/perception/target_box"/>
+        <remap from="/perception/obstacles" to="/perception/obstacles_box"/>
+  </node>
+
+  <!-- 3. Conditioning: gripper + cube + box -> /vision/merged_cloud (world) -->
+  <node name="condition_pickplace" pkg="vision_processing" type="condition_pcd_pickplace.py" output="screen">
+        <param name="num_points" value="$(arg condition_num_points)"/>
+        <param name="world_frame" value="world"/>
+        <param name="tcp_frame" value="panda_TCP"/>
+  </node>
+
+  <!-- 4. CASF generative planner, reused for the pick-and-place policy.
+       controlled_link:=panda_TCP -> the model predicts the TCP directly;
+       cbf_link_names without fork_tip -> gripper robot model. CASF correction
+       remains off; the online CBF node handles obstacle avoidance. -->
+  <node name="safe_generative_planner" pkg="vision_processing" type="casf_generative_node_PC_pp.py" output="screen" cwd="node">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
+        <param name="model_name" value="$(arg pickplace_model_name)"/>
+        <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
+        <param name="controlled_link" value="panda_TCP"/>
+        <rosparam param="cbf_link_names">['panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
+        <param name="merged_cloud_contains_fork" value="true"/>
+        <param name="tcp_frame" value="panda_TCP"/>
+        <param name="gripper_open_threshold" value="0.03"/>
+        <param name="wait_for_cbf_ready" value="true"/>
+        <param name="enable_casf_correction" value="false"/>
+        <param name="planner_rate_hz" value="$(arg planner_rate_hz)"/>
+        <param name="trajectory_retime_mode" value="$(arg trajectory_retime_mode)"/>
+        <param name="trajectory_retime_joint_speed" value="$(arg trajectory_retime_joint_speed)"/>
+        <param name="trajectory_retime_joint_weights" value="$(arg trajectory_retime_joint_weights)"/>
+        <param name="trajectory_retime_min_segment_fraction" value="$(arg trajectory_retime_min_segment_fraction)"/>
+        <param name="trajectory_waypoint_rate_hz" value="$(arg trajectory_waypoint_rate_hz)"/>
+        <param name="use_temporal_ensembler" value="$(arg use_temporal_ensembler)"/>
+        <param name="ensembler_buffer_size" value="$(arg ensembler_buffer_size)"/>
+        <param name="ensembler_decay" value="$(arg ensembler_decay)"/>
+        <param name="single_shot" value="$(arg single_shot)"/>
+        <param name="log_trajectory_timing" value="false"/>
+        <!-- torch.compile reduce-overhead uses CUDA-graph thread-local state; the
+             control loop runs in a ROS timer thread != the warmup thread, which
+             trips `_is_key_in_tls`. Feeding disables it too. -->
+        <param name="fm_use_torch_compile" value="false"/>
+  </node>
+
+  <!-- 5. Execution = the SAME chain as feeding: executor retimes the trajectory and
+       publishes the nominal joint POSITION + VELOCITY; the CBF node (5.1) closes the
+       loop to the velocity controller (feedforward + position feedback) and adds
+       safety once an obstacle source is wired. -->
+  <node name="trajectory_executor" pkg="vision_processing" type="trajectory_executor.py" output="screen"
+        if="$(arg execute)">
+        <param name="rate_hz" value="$(arg control_rate_hz)"/>
+        <param name="out_topic" value="/planner/nominal_joint_command"/>
+        <param name="velocity_out_topic" value="/planner/nominal_joint_velocity"/>
+        <param name="hold_current_until_trajectory" value="true"/>
+        <param name="use_progress_clock" value="true"/>
+        <param name="progress_lag_limit_rad" value="0.25"/>
+        <param name="cbf_hold_threshold" value="-1000.0"/>
+        <param name="anchor_mode" value="start"/>
+        <param name="command_lookahead_time" value="$(arg trajectory_command_lookahead_time)"/>
+        <param name="log_timing" value="false"/>
+  </node>
+
+  <!-- 5.1. Online CBF safety shield. Same CBF implementation as feeding, but with
+       the pick-place URDF, TCP frame, gripper/finger SDF links, and the static
+       cylinder obstacle cloud. -->
+  <node name="cbf_safety_Bernstein" pkg="vision_processing" type="$(arg cbf_node_type)"
+        output="screen" cwd="node" if="$(arg execute)">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
+        <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
+        <param name="controlled_link" value="panda_TCP"/>
+        <rosparam param="cbf_link_names">['panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
+        <param name="enable_cbf" value="true"/>
+        <param name="cbf_passthrough_when_inactive" value="$(arg cbf_passthrough_when_inactive)"/>
+        <param name="cbf_monitor_only" value="$(arg cbf_monitor_only)"/>
+        <param name="cbf_graph_points" value="$(arg cbf_graph_points)"/>
+        <param name="preprocess_max_points" value="$(arg cbf_preprocess_max_points)"/>
+        <param name="cbf_candidate_filter" value="$(arg cbf_candidate_filter)"/>
+        <param name="cbf_selection_metric" value="$(arg cbf_selection_metric)"/>
+        <param name="cbf_cluster_mode" value="$(arg cbf_cluster_mode)"/>
+        <param name="cbf_sdf_candidate_max_dist" value="$(arg cbf_sdf_candidate_max_dist)"/>
+        <param name="cbf_sdf_prune_chunk_size" value="$(arg cbf_sdf_prune_chunk_size)"/>
+        <param name="cbf_sdf_self_filter_margin" value="$(arg cbf_sdf_self_filter_margin)"/>
+        <param name="cbf_sdf_prefilter_radius" value="$(arg cbf_sdf_prefilter_radius)"/>
+        <param name="cbf_sdf_prefilter_max_points" value="$(arg cbf_sdf_prefilter_max_points)"/>
+        <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)"/>
+        <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)"/>
+        <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)"/>
+        <param name="cbf_multi_fd_eps" value="$(arg cbf_multi_fd_eps)"/>
+        <param name="cbf_grasp_box_enabled" value="false"/>
+        <param name="obs_topic" value="$(arg obstacle_cloud_topic)"/>
+        <!-- Drive the velocity controller, exactly like feeding. -->
+        <param name="publish_controller_command" value="false"/>
+        <param name="publish_velocity_controller_command" value="true"/>
+        <param name="rate_hz" value="$(arg control_rate_hz)"/>
+        <!-- Tracking law (identical gains to feeding / the old velocity_tracker_pp). -->
+        <param name="cbf_kp" value="5.0"/>
+        <param name="max_feedback_velocity" value="0.5"/>
+        <param name="cbf_filter_tau" value="$(arg cbf_filter_tau)"/>
+        <param name="cbf_velocity_filter_tau" value="$(arg cbf_velocity_filter_tau)"/>
+        <param name="max_joint_velocity" value="$(arg max_joint_velocity)"/>
+        <param name="cbf_kappa" value="$(arg cbf_kappa)"/>
+        <param name="cbf_recovery_kappa" value="$(arg cbf_recovery_kappa)"/>
+        <param name="cbf_constraint_margin" value="$(arg cbf_constraint_margin)"/>
+        <param name="cbf_recovery_switch_margin" value="$(arg cbf_recovery_switch_margin)"/>
+        <param name="cbf_enforce_final_constraint" value="$(arg cbf_enforce_final_constraint)"/>
+        <param name="cbf_command_dt" value="$(arg cbf_command_dt)"/>
+        <param name="cbf_direct_position_mode" value="$(arg cbf_direct_position_mode)"/>
+        <param name="cbf_position_correction_dt" value="$(arg cbf_position_correction_dt)"/>
+        <param name="cbf_max_command_lead" value="$(arg cbf_max_command_lead)"/>
+        <param name="cbf_h_activate" value="$(arg cbf_h_activate)"/>
+        <param name="cbf_max_inward_speed" value="$(arg cbf_max_inward_speed)"/>
+        <param name="cbf_recovery_speed" value="$(arg cbf_recovery_speed)"/>
+        <param name="cbf_recovery_depth" value="$(arg cbf_recovery_depth)"/>
+        <param name="cbf_max_correction_speed" value="$(arg cbf_max_correction_speed)"/>
+        <param name="cbf_recovery_max_correction_speed" value="$(arg cbf_recovery_max_correction_speed)"/>
+        <param name="cbf_projection_iters" value="$(arg cbf_projection_iters)"/>
+        <param name="cbf_projection_relaxation" value="$(arg cbf_projection_relaxation)"/>
+        <param name="cbf_tracking_feedback_mode" value="$(arg cbf_tracking_feedback_mode)"/>
+        <param name="barrier_alpha" value="$(arg barrier_alpha)"/>
+        <param name="d_safe" value="$(arg d_safe)"/>
+        <param name="cbf_integrate_from_current" value="true"/>
+        <param name="use_nominal_velocity_topic" value="true"/>
+        <param name="nominal_velocity_topic" value="/planner/nominal_joint_velocity"/>
+        <param name="nominal_velocity_timeout" value="0.25"/>
+        <param name="nominal_feedforward_gain" value="1.0"/>
+        <param name="tcp_frame" value="panda_TCP"/>
+        <param name="publish_diagnostics" value="true"/>
+        <param name="cbf_diagnostics_decimation" value="$(arg cbf_diagnostics_decimation)"/>
+        <param name="publish_viz_topics" value="$(arg launch_rviz)"/>
+  </node>
+
+  <!-- 5.5. Grasp: physically close near the cube width, weld for reliable Gazebo
+       carrying, then hold the fingers at the cube width so the grasp still looks
+       natural instead of visually crushing through the cube. -->
+  <arg name="grasp_enabled" default="true"/>
+  <node name="gripper_grasp_pp" pkg="vision_processing" type="gripper_grasp_node_pp.py"
+        output="screen" if="$(arg grasp_enabled)">
+        <param name="cube_model" value="red_cube"/>
+        <param name="tcp_frame" value="panda_TCP"/>
+        <param name="gripper_ns" value="/franka_gripper"/>
+        <param name="grasp_width" value="0.04"/>
+        <param name="grasp_force" value="40.0"/>
+        <param name="contact_weld_finger" value="0.024"/>
+        <param name="hold_after_weld" value="true"/>
+        <param name="hold_width" value="0.04"/>
+        <param name="open_width" value="0.08"/>
+  </node>
+
+  <!-- 6. RViz: visualize /vision/merged_cloud + /planner/nominal_trajectory. -->
+  <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find vision_processing)/config/cbf_config.rviz"
+        if="$(arg launch_rviz)"/>
+</launch>

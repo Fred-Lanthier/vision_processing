@@ -63,7 +63,7 @@ def get_next_n_trajectory_ids(base_dirs, n):
 # --------------------------------------------------------------------------- #
 class TrajectoryRecorder:
     def __init__(self, base_record_dir, record_links, cameras,
-                 record_interval=0.1, extra_id_dirs=None):
+                 record_interval=0.1, extra_id_dirs=None, record_actors=None):
         """
         Args:
             base_record_dir: dossier de sortie des trajectoires.
@@ -76,6 +76,10 @@ class TrajectoryRecorder:
             record_interval: intervalle d'enregistrement en secondes simulees.
             extra_id_dirs:   dossiers additionnels a scanner pour eviter les
                              collisions d'IDs (ex: dossier de preprocess).
+            record_actors:   dict {name: Actor} d'acteurs NON-robot (ex: le cube
+                             cible) dont on enregistre la pose (rel. base) a chaque
+                             step, sous state["actors"][name]. Sert au preprocess
+                             a reconstruire le nuage de la cible sans segmentation.
         """
         os.makedirs(base_record_dir, exist_ok=True)
         self.base_record_dir = base_record_dir
@@ -84,6 +88,7 @@ class TrajectoryRecorder:
         self.camera_uids = [c.uid for c in cameras]
         self.record_interval = record_interval
         self.id_scan_dirs = [base_record_dir] + (extra_id_dirs or [])
+        self.record_actors = record_actors or {}
 
     # -- debut d'episode --------------------------------------------------- #
     def start_episode(self, env):
@@ -147,6 +152,12 @@ class TrajectoryRecorder:
             link_rel[ln] = (rel.p, rel.q,
                             links[ln].linear_velocity, links[ln].angular_velocity)
 
+        # Poses (rel. base) des acteurs cibles (ex: cube), pour le batch.
+        actor_rel = {}
+        for name, actor in self.record_actors.items():
+            rel = base_inv * actor.pose
+            actor_rel[name] = (rel.p, rel.q)
+
         for b in range(self.B):
             if done_mask[b] or int(step_count[b]) % self.steps_per_record != 0:
                 continue
@@ -164,6 +175,14 @@ class TrajectoryRecorder:
                     "velocity": lv[b].cpu().numpy().tolist() + av[b].cpu().numpy().tolist(),
                 }
 
+            actor_states = {
+                name: {
+                    "position": p[b].cpu().numpy().tolist(),
+                    "orientation": q[b].cpu().numpy().tolist(),
+                }
+                for name, (p, q) in actor_rel.items()
+            }
+
             self.states[b].append({
                 "step_number": rec_idx,
                 "simulation_step": int(step_count[b]),
@@ -171,6 +190,7 @@ class TrajectoryRecorder:
                 "joint_positions": robot.get_qpos()[b].cpu().numpy().tolist(),
                 "joint_velocities": robot.get_qvel()[b].cpu().numpy().tolist(),
                 "links": link_states,
+                "actors": actor_states,
                 "cameras": {
                     c: {"rgb": f"{c}_rgb_step_{rec_idx:04d}.png",
                         "depth_npy": f"{c}_depth_step_{rec_idx:04d}.npy"}

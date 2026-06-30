@@ -123,7 +123,11 @@ class CBFSafetyNode:
         self._logged_first_nominal = False
         self._logged_first_safe_publish = False
 
-        urdf_path_raw = pkg_path + '/urdf/panda_camera.xacro' 
+        # Default = feeding fork robot (unchanged). Pick-and-place overrides this
+        # with ~urdf_path:=.../urdf/panda_pickplace.xacro so the CBF builds the
+        # gripper (no-fork) kinematics that match the pp Gazebo robot.
+        urdf_path_raw = str(rospy.get_param('~urdf_path',
+                                            pkg_path + '/urdf/panda_camera.xacro'))
 
         # Global Xacro -> URDF conversion
         if urdf_path_raw.endswith('.xacro'):
@@ -148,9 +152,26 @@ class CBFSafetyNode:
         
         # 2. On défini les links que l'on veut charger (correspondant aux links cinématiques dans l'ordre)
         # Pruning: We only protect the upper arm and wrist (Links 4-7 + Fork)
-        link_names = ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7', 'panda_hand', 'panda_rightfinger', 'panda_leftfinger', 'fork_tip']
+        # Dynamic: ~cbf_link_names lets pick-and-place pass the gripper set (no fork);
+        # default = the feeding fork set (unchanged). ~controlled_link is the link the
+        # FM trajectory is generated about (fork_tip feeding, panda_TCP pick-place).
+        link_names = list(rospy.get_param(
+            '~cbf_link_names',
+            ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
+             'panda_hand', 'panda_rightfinger', 'panda_leftfinger', 'fork_tip']))
         self.protected_link_names = link_names
-        self.fork_link_index = link_names.index('fork_tip')
+        self.controlled_link = str(rospy.get_param('~controlled_link', 'fork_tip'))
+        # The TOOL link is the protected SDF link whose SDF drives the TCP/grasp
+        # obstacle filtering. Use the controlled link if it is itself a protected SDF
+        # link (feeding: fork_tip); else the most distal protected link = the tool
+        # body (pick-place: panda_hand, since panda_TCP is a massless frame with no SDF).
+        if self.controlled_link in link_names:
+            self.fork_link_index = link_names.index(self.controlled_link)
+        elif 'panda_hand' in link_names:
+            self.fork_link_index = link_names.index('panda_hand')
+        else:
+            self.fork_link_index = len(link_names) - 1
+        self.tool_link = link_names[self.fork_link_index]
         self.protected_fk_tree = self.robot_layer.make_fk_subset(link_names)
         weight_handler.add_models(link_names, robot_name='panda')
         self._log_cuda_memory("CBF after Bernstein weights")
@@ -1836,9 +1857,11 @@ class CBFSafetyNode:
         return link_poses.get(link_name, None)
 
     def get_fork_tip_pose(self, q7):
-        # Use fork_tip so that it aligns with nominal_trajectory_follower
-        # and the Flow Matching trajectory coordinates.
-        return self.get_link_pose(q7, 'fork_tip')
+        # Pose of the controlled link (fork_tip feeding / panda_TCP pick-place) so it
+        # aligns with nominal_trajectory_follower and the Flow Matching trajectory
+        # coordinates. Full FK so frames like panda_TCP (not a protected SDF link)
+        # still resolve.
+        return self.get_link_pose(q7, self.controlled_link)
 
     def publish_safe_trajectory_marker(self, q_start, q_goal):
         q_start = q_start.detach()
@@ -2350,10 +2373,10 @@ class CBFSafetyNode:
                 q9_current = torch.cat([self.current_q.detach(), self.q_pad2], dim=1)
                 link_poses_current = self.robot_layer._native_forward_kinematics_subset(
                     q9_current, self.protected_fk_tree)
-                T_fork_center = link_poses_current.get('fork_tip', None)
+                T_fork_center = link_poses_current.get(self.tool_link, None)
                 if T_fork_center is None:
                     rospy.logwarn_throttle(
-                        5, "CBF preprocessing cannot find fork_tip in FK tree.")
+                        5, "CBF preprocessing cannot find tool link '%s' in FK tree." % self.tool_link)
                     return
                 mark_stage("fork_fk")
 

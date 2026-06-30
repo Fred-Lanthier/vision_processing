@@ -1,0 +1,138 @@
+<?xml version="1.0"?>
+<!-- Panda for the PICK-AND-PLACE Gazebo system.
+     Copy of panda_camera.xacro WITHOUT the fork: the FM pick-and-place policy
+     predicts the panda_TCP pose directly and grasps the cube with the gripper.
+     The static camera is repositioned to face the robot from the front (matching
+     the ManiSkill front-facing static cam used to collect/preprocess the data).
+     Do NOT use this for the feeding system (use panda_camera.xacro there). -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="panda">
+
+  <xacro:include filename="$(find franka_description)/robots/common/franka_robot.xacro"/>
+
+  <xacro:arg name="arm_id" default="panda" />
+
+  <xacro:franka_robot arm_id="$(arg arm_id)"
+                       joint_limits="${xacro.load_yaml('$(find franka_description)/robots/panda/joint_limits.yaml')}"
+                       parent="world"
+                       hand="true"
+                       gazebo="true"/>
+
+  <!-- TCP = controlled link for the pick-and-place policy (panda_hand + 0.1034 z). -->
+  <link name="panda_TCP"/>
+  <joint name="panda_TCP_joint" type="fixed">
+    <parent link="panda_hand"/>
+    <child link="panda_TCP"/>
+    <origin xyz="0 0 0.1034" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Keep panda_hand a STANDALONE Gazebo link so gazebo_ros_link_attacher can
+       weld the cube to it. By default Gazebo lumps fixed-joint links into the
+       parent (panda_link8); then the attacher can't find 'panda_hand' and
+       SEGFAULTS gzserver. Same trick the feeding rig uses for fork_tip. -->
+  <gazebo reference="panda_hand_joint">
+    <disableFixedJointLumping>true</disableFixedJointLumping>
+    <preserveFixedJoint>true</preserveFixedJoint>
+  </gazebo>
+
+  <!-- Static depth camera: front-facing, centred on the work line, looking back at
+       the robot/cube/box. Parented to `world` (= robot base in Gazebo). Pose derived
+       from the ManiSkill front static cam (base pos (0.90,-0.12,0.60), look
+       (0.30,-0.12,0.10)); rpy computed for the optical-frame convention below. -->
+  <joint name="camera_static_joint" type="fixed">
+    <parent link="world" />
+    <child link="camera_static_link" />
+    <!-- Aimed at the cube/box centroid with a steeper downward tilt so the small
+         cube sits in mid-frame, not the bottom rows where Gazebo depth is
+         unreliable (that emptied the cube target cloud). -->
+    <origin xyz="0.9 -0.19 0.62" rpy="0 1.003 3.1416" />
+  </joint>
+
+  <link name="camera_static_link">
+    <visual>
+      <geometry><box size="0.025 0.09 0.02"/></geometry>
+    </visual>
+    <inertial>
+      <mass value="0.1" /><inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4" />
+    </inertial>
+  </link>
+
+  <joint name="camera_static_optical_joint" type="fixed">
+    <parent link="camera_static_link"/><child link="camera_static_optical_frame"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <link name="camera_static_optical_frame"/>
+
+  <joint name="camera_wrist_joint" type="fixed">
+    <parent link="panda_TCP"/>
+    <child link="camera_wrist_link"/>
+    <origin xyz="-0.052 0.035 -0.045" rpy="0 ${-pi/2} 0"/>
+  </joint>
+
+  <link name="camera_wrist_link">
+    <visual>
+      <geometry><box size="0.025 0.09 0.02"/></geometry>
+    </visual>
+    <inertial>
+      <mass value="0.1" /><inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4" />
+    </inertial>
+  </link>
+
+  <joint name="camera_wrist_optical_joint" type="fixed">
+    <parent link="camera_wrist_link"/><child link="camera_wrist_optical_frame"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <link name="camera_wrist_optical_frame"/>
+
+  <gazebo reference="camera_static_link">
+    <material>Gazebo/Red</material>
+    <sensor type="depth" name="camera_static">
+      <update_rate>12.0</update_rate>
+      <camera>
+        <horizontal_fov>0.958</horizontal_fov>
+        <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+        <clip><near>0.1</near><far>10.0</far></clip>
+      </camera>
+      <plugin name="static_camera_controller" filename="libgazebo_ros_openni_kinect.so">
+        <cameraName>camera_static</cameraName>
+        <alwaysOn>true</alwaysOn>
+        <imageTopicName>color/image_raw</imageTopicName>
+        <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>
+        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
+        <frameName>camera_static_optical_frame</frameName>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="camera_wrist_link">
+    <material>Gazebo/Blue</material>
+    <sensor type="depth" name="camera_wrist">
+      <update_rate>12.0</update_rate>
+
+      <camera>
+        <horizontal_fov>0.973</horizontal_fov>
+        <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+        </image>
+        <clip>
+            <near>0.01</near> <far>10.0</far>
+        </clip>
+      </camera>
+
+      <plugin name="wrist_camera_controller" filename="libgazebo_ros_openni_kinect.so">
+        <cameraName>camera_wrist</cameraName>
+        <alwaysOn>true</alwaysOn>
+        <imageTopicName>color/image_raw</imageTopicName>
+        <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>
+        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
+        <frameName>camera_wrist_optical_frame</frameName>
+
+        <pointCloudCutoff>0.01</pointCloudCutoff>
+        <pointCloudCutoffMax>10.0</pointCloudCutoffMax>
+
+        <updateRate>12.0</updateRate>
+      </plugin>
+    </sensor>
+  </gazebo>
+</robot>

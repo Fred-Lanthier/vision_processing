@@ -32,9 +32,11 @@ class PickPlaceShelfEnv(PickCubeEnv):
     # world ~ (0, 0, 0.169) et l'empreinte de la camera EE au sol est ~ (-0.05, -0.035).
     # CUBE_HALF sert de repli ; on prefere self.cube_half_size si disponible.
     CUBE_HALF = 0.02
-    # Etagere BASSE (top a 0.12 m) : evite un grand lift qui redresserait le bras.
-    SHELF_HALF = (0.08, 0.08, 0.06)        # demi-tailles de l'etagere
-    SHELF_POS = (-0.10, -0.35, 0.06)       # a droite (-y) du robot, atteignable
+    # Boite TRES BASSE : 1 cm de haut (demi-hauteur 0.005), posee sur la table.
+    # Le depot est donc quasi au sol -> la trajectoire pick->place est un seul arc
+    # propre, sans grand lift vertical.
+    SHELF_HALF = (0.08, 0.08, 0.005)       # demi-tailles : boite 16x16x1 cm
+    SHELF_POS = (-0.10, -0.35, 0.005)      # a droite (-y) du robot, posee sur la table
     # Region de spawn du cube : RECENTREE sous l'effecteur au homing (empreinte
     # camera EE ~ (-0.05, -0.035)) pour qu'il soit toujours visible par la camera
     # poignet sur la frame initiale, tout en variant a chaque episode.

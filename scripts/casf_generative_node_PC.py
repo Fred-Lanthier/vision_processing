@@ -212,29 +212,38 @@ class CASFGenerativeNode:
         self.robot_layer = URDFLayer(urdf_path=urdf_path, device=self.device, package_dir=pkg_path, voxel_dir=voxel_dir)
         weight_handler = RDF_Weights(device=self.device, dtype=torch.float32)
         weight_handler.init_robot_folder(weights_dir, robot_name='panda')
-        link_names = [
+        # CBF protected links. Default = fork feeding rig (incl. fork_tip). For the
+        # pick-and-place gripper (no fork) pass ~cbf_link_names WITHOUT fork_tip.
+        default_link_names = [
             'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
             'panda_hand', 'fork_tip',
         ]
+        link_names = list(rospy.get_param("~cbf_link_names", default_link_names))
         weight_handler.add_models(link_names, robot_name='panda')
         self.bernstein_core = BernsteinCore(weight_handler, self.robot_layer, self.device, link_names)
         self.d_safe = float(rospy.get_param("~d_safe", 0.005))
         self.barrier_alpha = float(rospy.get_param("~barrier_alpha", 0.001))
         self.barrier = BernsteinBarrier(self.bernstein_core, d_safe=self.d_safe, alpha=self.barrier_alpha)
-        self.n_body_links = 5  # indices 0-4 in link_names (panda_link4 ... panda_hand)
-        
+        # Body links = all but a trailing tool link (the fork). With no fork in the
+        # list (gripper case) all links are body links -> n_body_links == len.
+        self.n_body_links = int(rospy.get_param("~n_body_links", 5))
+
         # 2. Initialize IK Solver (Ultra-fast Pybind11 Pinocchio)
-        # The FM model predicts fork-tip poses, but the robot IK target is the TCP.
-        # This matches scripts/trajectory_node_Fork.py:
-        #   T_world_fork = T_world_tcp @ T_tcp_fork_tip
-        #   T_world_tcp = T_world_fork @ inv(T_tcp_fork_tip)
-        xacro_file = os.path.join(pkg_path, 'urdf', 'panda_camera.xacro')
-        self.T_tcp_fork_tip = compute_T_child_parent_xacro(xacro_file, 'fork_tip', 'panda_TCP')
-        if self.T_tcp_fork_tip is None:
-            raise RuntimeError("Could not resolve fixed transform panda_TCP -> fork_tip")
+        # The FM model predicts the CONTROLLED link's pose; the robot IK target is the
+        # TCP. controlled_link defaults to 'fork_tip' (feeding); pick-and-place sets
+        # ~controlled_link:=panda_TCP so the model predicts the TCP directly (identity).
+        #   T_world_ctrl = T_world_tcp @ T_tcp_ctrl ;  T_world_tcp = T_world_ctrl @ inv(T_tcp_ctrl)
+        self.controlled_link = str(rospy.get_param("~controlled_link", "fork_tip"))
+        if self.controlled_link == 'panda_TCP':
+            # The model predicts the TCP directly (pick-and-place) -> identity.
+            self.T_tcp_fork_tip = np.eye(4)
+        else:
+            self.T_tcp_fork_tip = compute_T_child_parent_xacro(urdf_path_raw, self.controlled_link, 'panda_TCP')
+            if self.T_tcp_fork_tip is None:
+                raise RuntimeError(f"Could not resolve fixed transform panda_TCP -> {self.controlled_link}")
         self.T_tcp_fork_tip_inv = np.linalg.inv(self.T_tcp_fork_tip)
         self.ik_solver = fast_ik_module.FastIK(urdf_path, "panda_TCP")
-        rospy.loginfo("✅ FastIK targets panda_TCP; FM fork-tip poses are converted to TCP poses")
+        rospy.loginfo(f"✅ FastIK targets panda_TCP; FM '{self.controlled_link}' poses converted to TCP poses")
         self._q_warm = None
         
         # Debug: Print Pinocchio model joints
@@ -246,7 +255,7 @@ class CASFGenerativeNode:
         
         # 3. Initialize Fork-related components
         self.mesh_loader = RobotMeshLoaderOptimized(urdf_path)
-        fork_pts = self.mesh_loader.static_point_clouds.get('fork_tip', np.zeros((0, 3)))
+        fork_pts = self.mesh_loader.static_point_clouds.get(self.controlled_link, np.zeros((0, 3)))
         self.fork_pts_local = torch.from_numpy(fork_pts).float().to(self.device)
 
         # 4. Initialize Flow Matching Agent
@@ -702,12 +711,12 @@ class CASFGenerativeNode:
             
         link_poses = self.robot_layer._native_forward_kinematics(q_eval)
         
-        if 'fork_tip' not in link_poses:
-            rospy.logwarn_throttle(5, "FK failed: 'fork_tip' not found in URDF kinematics tree.")
+        if self.controlled_link not in link_poses:
+            rospy.logwarn_throttle(5, f"FK failed: '{self.controlled_link}' not found in URDF kinematics tree.")
             return
-            
+
         # Strictly use Forward Kinematics (FK) to avoid TF latency jitter
-        T_fork = link_poses['fork_tip'][0]
+        T_fork = link_poses[self.controlled_link][0]
         
         # Check for NaNs early
         if self.check_finite_debug and not torch.isfinite(T_fork).all():

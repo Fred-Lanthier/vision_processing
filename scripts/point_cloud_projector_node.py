@@ -47,6 +47,12 @@ class PointCloudProjectorNode:
         self._sam3_confidence = float(rospy.get_param("~fork_sam3_confidence",  0.4))
         self._mask_dilation   = int(rospy.get_param("~fork_mask_dilation_px",   0))
         self._enable_fork_sam3_mask = bool(rospy.get_param("~enable_fork_sam3_mask", False))
+        # Master switch for ALL fork removal (SAM3 mask, geometric capsule, 3D backup).
+        # Default True = unchanged feeding behaviour. Set False for the pick-and-place
+        # gripper (no fork): otherwise the geometric capsule mask zeroes depth at the
+        # tool region and wipes the target cloud, and the 3D backup runs on a bad
+        # (no fork_tip TF) capsule.
+        self._enable_fork_filter = bool(rospy.get_param("~enable_fork_filter", True))
 
         # 3D fork backup: an SDF shell around the TRUE fork surface (fork_tip.stl)
         # is the geometrically-correct backstop for the 2D mask's near-fork leaks.
@@ -105,7 +111,10 @@ class PointCloudProjectorNode:
                         [sub_depth, sub_mask], queue_size=5, slop=0.1)
         self.ts.registerCallback(self.sync_cb)
 
-        if self._enable_fork_sam3_mask:
+        if not self._enable_fork_filter:
+            if self.log_events:
+                rospy.loginfo("✅ Point Cloud Projector ready. Fork filter DISABLED (gripper / no fork).")
+        elif self._enable_fork_sam3_mask:
             # First SAM3 attempt after 15 s — gives the model time to finish loading.
             # sam3_server registers the ROS service BEFORE loading weights, so
             # wait_for_service() returning does NOT mean the model is ready.
@@ -434,7 +443,8 @@ class PointCloudProjectorNode:
         # container). Run the 3D backup always when the SDF shell is active; the
         # capsule stays a startup-only fallback (before the pixel mask exists).
         t_stage = time.perf_counter()
-        use_3d_fork_backup = (self.run_3d_fork_filter_backup
+        use_3d_fork_backup = self._enable_fork_filter and (
+                              self.run_3d_fork_filter_backup
                               or self.fork_filter.sdf_active
                               or self.fork_filter.pixel_mask is None)
         if obs_pts_cam is not None and use_3d_fork_backup:

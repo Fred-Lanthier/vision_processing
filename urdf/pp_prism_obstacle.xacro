@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="pp_prism_obstacle">
+  <xacro:arg name="size_x" default="0.10"/>
+  <xacro:arg name="size_y" default="0.06"/>
+  <xacro:arg name="height" default="0.18"/>
+  <xacro:arg name="color_rgba" default="0 0 0 1"/>
+
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="$(arg size_x) $(arg size_y) $(arg height)"/>
+      </geometry>
+      <material name="black">
+        <color rgba="$(arg color_rgba)"/>
+      </material>
+    </visual>
+
+    <collision>
+      <geometry>
+        <box size="$(arg size_x) $(arg size_y) $(arg height)"/>
+      </geometry>
+    </collision>
+
+    <inertial>
+      <mass value="2.0"/>
+      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.01"/>
+    </inertial>
+  </link>
+
+  <gazebo>
+    <static>true</static>
+  </gazebo>
+
+  <gazebo reference="base_link">
+    <material>Gazebo/Black</material>
+    <ambient>0 0 0 1</ambient>
+    <diffuse>0 0 0 1</diffuse>
+    <specular>0.01 0.01 0.01 1</specular>
+  </gazebo>
+</robot>

@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<!-- Brown place-target box. Matches the low ManiSkill PickPlace shelf:
+     half-sizes (0.08, 0.08, 0.005) -> full (0.16, 0.16, 0.01). Static:
+     it never moves, the cube is placed on its top face. base_link is at the box
+     CENTER, so spawn it at world (0.515, -0.35, 0.755) -> top face at z = 0.76. -->
+<robot name="brown_box">
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="0.16 0.16 0.01"/>
+      </geometry>
+      <material name="brown">
+        <color rgba="0.22 0.11 0.04 1"/>
+      </material>
+    </visual>
+
+    <collision>
+      <geometry>
+        <box size="0.16 0.16 0.01"/>
+      </geometry>
+    </collision>
+
+    <inertial>
+      <mass value="5.0"/>
+      <inertia ixx="0.02" ixy="0.0" ixz="0.0" iyy="0.02" iyz="0.0" izz="0.02"/>
+    </inertial>
+  </link>
+
+  <gazebo>
+    <static>true</static>
+  </gazebo>
+</robot>

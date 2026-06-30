@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="pp_cylinder_obstacle">
+  <xacro:arg name="radius" default="0.04"/>
+  <xacro:arg name="height" default="0.18"/>
+  <xacro:arg name="color_rgba" default="0.08 0.08 0.08 1"/>
+
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <cylinder radius="$(arg radius)" length="$(arg height)"/>
+      </geometry>
+      <material name="dark_gray">
+        <color rgba="$(arg color_rgba)"/>
+      </material>
+    </visual>
+
+    <collision>
+      <geometry>
+        <cylinder radius="$(arg radius)" length="$(arg height)"/>
+      </geometry>
+    </collision>
+
+    <inertial>
+      <mass value="2.0"/>
+      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.01"/>
+    </inertial>
+  </link>
+
+  <gazebo>
+    <static>true</static>
+  </gazebo>
+</robot>
