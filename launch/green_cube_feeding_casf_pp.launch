@@ -29,7 +29,7 @@
        The SAM pipeline keeps running either way; only the conditioning node's
        cube input switches. -->
   <arg name="use_gt_cube" default="false"/>
-  <arg name="pickplace_model_name" default="best_fm_model_pickplace_10D_1024_rdn.ckpt"/>
+  <arg name="pickplace_model_name" default="best_fm_model_pickplace_10D_1024.ckpt"/>
   <arg name="condition_num_points" default="1024"/>
   <arg name="planner_rate_hz" default="3"/>
   <arg name="control_rate_hz" default="100.0"/>
@@ -39,7 +39,7 @@
   <!-- Static PP CBF obstacle. Coordinates are in the robot/table frame; Gazebo
        spawn adds the table-top z offset internally. -->
   <arg name="obstacle_enabled" default="true"/>
-  <arg name="obstacle_shape" default="prism"/>
+  <arg name="obstacle_shape" default="crescent"/>
   <arg name="obstacle_x" default="0.535"/>
   <arg name="obstacle_y" default="-0.190"/>
   <!-- Local +Y faces the red cube by default. This matters for the crescent. -->
@@ -62,9 +62,9 @@
   <!-- Camera-independent moving obstacle, same idea as green_cube_feeding_casf:
        it is added to the published obstacle cloud without leaving a stale trail. -->
   <arg name="moving_sphere_enabled" default="true"/>
-  <arg name="moving_sphere_initial_x" default="0.05"/>
+  <arg name="moving_sphere_initial_x" default="0.10"/>
   <arg name="moving_sphere_initial_y" default="-0.190"/>
-  <arg name="moving_sphere_initial_z" default="0.5"/>
+  <arg name="moving_sphere_initial_z" default="0.55"/>
   <arg name="moving_sphere_velocity_x" default="0.0"/>
   <arg name="moving_sphere_velocity_y" default="0.0"/>
   <arg name="moving_sphere_velocity_z" default="0.0"/>
@@ -114,6 +114,42 @@
   <arg name="cbf_projection_iters" default="3"/>
   <arg name="cbf_projection_relaxation" default="1.0"/>
   <arg name="cbf_tracking_feedback_mode" default="tangent_near"/>
+  <!-- QP projection metric ablation. identity = legacy Euclidean min-norm
+       (correction lands on the joint with the largest moment arm on the
+       barrier, e.g. joint 2 pulling the shoulder back in runPP13). task =
+       weighted by W^-1 with W = Jp^T Jp + w_rot Jo^T Jo + lambda I of the
+       controlled link (panda_TCP): the same half-space is enforced, but the
+       correction prefers the TCP null space (elbow swivel), minimizing the
+       deviation of the executed TCP path from the FM nominal. -->
+  <arg name="cbf_projection_metric" default="task"/>
+  <arg name="cbf_task_metric_lambda" default="0.01"/>
+  <arg name="cbf_task_metric_rot_weight" default="0.01"/>
+  <arg name="cbf_task_metric_update_every" default="1"/>
+  <!-- Active null-space clearance: the QP only cancels inward velocity, so a
+       nominal pushing a body link at an obstacle parks the arm at h~0 forever.
+       This drive adds gain * proximity * N grad_h BEFORE the QP: the posture
+       deforms away from the critical obstacle (elbow swivel, TCP unchanged)
+       as soon as h < the activate distance, unblocking the path instead of
+       stalling on it. The swivel speed tops out at the gain [rad/s]. 0 = off.
+       Requires cbf_projection_metric task. -->
+  <arg name="cbf_nullspace_clearance_gain" default="0.3"/>
+  <arg name="cbf_nullspace_clearance_h_activate" default="0.15"/>
+  <!-- CASF Riemannian warp kept OFF: too slow at runtime. TCP-path blocks are
+       handled reactively instead, by the CBF escape with the tangential lift
+       term (below). -->
+  <arg name="enable_casf_correction" default="false"/>
+  <!-- Deadlock escape for obstacles blocking the TCP path itself (runPP14:
+       cube->box transport pinned 40 s at the prism wall; the barrier gradient
+       only pushes BACK, and null-space deformation has no authority on a
+       hand-borne constraint). When stuck near the barrier, add a velocity
+       TANGENT to the barrier that lifts the controlled link (+z, over the
+       wall): g^T dq_lift = 0, so it costs nothing in safety, and the QP still
+       filters it against all other links. Deactivates at h > h_release. -->
+  <arg name="cbf_escape_enabled" default="true"/>
+  <arg name="cbf_escape_h_trigger" default="0.02"/>
+  <arg name="cbf_escape_h_release" default="0.05"/>
+  <arg name="cbf_escape_lift_gain" default="0.2"/>
+  <arg name="cbf_escape_max_velocity" default="0.15"/>
   <arg name="cbf_passthrough_when_inactive" default="true"/>
   <arg name="cbf_monitor_only" default="false"/>
   <arg name="cbf_filter_tau" default="0.08"/>
@@ -279,7 +315,11 @@
         <param name="tcp_frame" value="panda_TCP"/>
         <param name="gripper_open_threshold" value="0.03"/>
         <param name="wait_for_cbf_ready" value="true"/>
-        <param name="enable_casf_correction" value="false"/>
+        <!-- Warp off by default (too slow online). runPP14 showed the failure
+             this leaves: the obstacle-blind policy demands cube->box THROUGH
+             the prism wall and the TCP parks there. Handled reactively by the
+             CBF escape lift (cbf_escape_lift_gain) instead. -->
+        <param name="enable_casf_correction" value="$(arg enable_casf_correction)"/>
         <param name="planner_rate_hz" value="$(arg planner_rate_hz)"/>
         <param name="trajectory_retime_mode" value="$(arg trajectory_retime_mode)"/>
         <param name="trajectory_retime_joint_speed" value="$(arg trajectory_retime_joint_speed)"/>
@@ -374,6 +414,17 @@
         <param name="cbf_projection_iters" value="$(arg cbf_projection_iters)"/>
         <param name="cbf_projection_relaxation" value="$(arg cbf_projection_relaxation)"/>
         <param name="cbf_tracking_feedback_mode" value="$(arg cbf_tracking_feedback_mode)"/>
+        <param name="cbf_projection_metric" value="$(arg cbf_projection_metric)"/>
+        <param name="cbf_task_metric_lambda" value="$(arg cbf_task_metric_lambda)"/>
+        <param name="cbf_task_metric_rot_weight" value="$(arg cbf_task_metric_rot_weight)"/>
+        <param name="cbf_task_metric_update_every" value="$(arg cbf_task_metric_update_every)"/>
+        <param name="cbf_nullspace_clearance_gain" value="$(arg cbf_nullspace_clearance_gain)"/>
+        <param name="cbf_nullspace_clearance_h_activate" value="$(arg cbf_nullspace_clearance_h_activate)"/>
+        <param name="cbf_escape_enabled" value="$(arg cbf_escape_enabled)"/>
+        <param name="cbf_escape_h_trigger" value="$(arg cbf_escape_h_trigger)"/>
+        <param name="cbf_escape_h_release" value="$(arg cbf_escape_h_release)"/>
+        <param name="cbf_escape_lift_gain" value="$(arg cbf_escape_lift_gain)"/>
+        <param name="cbf_escape_max_velocity" value="$(arg cbf_escape_max_velocity)"/>
         <param name="barrier_alpha" value="$(arg barrier_alpha)"/>
         <param name="d_safe" value="$(arg d_safe)"/>
         <param name="cbf_integrate_from_current" value="true"/>

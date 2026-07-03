@@ -299,6 +299,68 @@ class CBFSafetyNode:
         # enters/exits the container vertically) is trusted instead.
         self.cbf_repair_grad_min = float(rospy.get_param(
             "~cbf_repair_grad_min", 0.1))
+        # Metric for the QP min-norm projection. "identity" is the Euclidean
+        # joint-space projection (legacy: dq_delta ∝ grad_h, so the correction
+        # lands on whichever joint has the largest moment arm on the barrier,
+        # regardless of what that does to the task trajectory). "task" projects
+        # in the metric W = Jp^T Jp + w_rot Jo^T Jo + lambda I of the controlled
+        # link (TCP/fork_tip): among all dq satisfying the same half-space, pick
+        # the one that moves the task frame least, so body-link constraints
+        # (e.g. the elbow near an obstacle) resolve through the arm's null space
+        # instead of fighting the nominal. The half-space itself is unchanged:
+        # safety is identical, only the correction direction differs.
+        self.cbf_projection_metric = str(rospy.get_param(
+            "~cbf_projection_metric", "identity")).lower()
+        if self.cbf_projection_metric not in ("identity", "task"):
+            raise ValueError(
+                "~cbf_projection_metric must be 'identity' or 'task'")
+        if (self.cbf_projection_metric == "task"
+                and self.cbf_solver_mode == "multi_projected"):
+            raise ValueError(
+                "~cbf_projection_metric 'task' is only wired into the graphed "
+                "solver modes (fast_tangent / multi_graphed)")
+        self.cbf_task_metric_enabled = self.cbf_projection_metric == "task"
+        # lambda: joint-space cost of null-space motion relative to the ~sigma^2
+        # (~0.1-0.5) task-space cost. Smaller = freer null-space swivel.
+        self.cbf_task_metric_lambda = float(rospy.get_param(
+            "~cbf_task_metric_lambda", 0.01))
+        # Orientation-vs-position trade in W: 0.01 treats 1 rad of task-frame
+        # rotation like 10 cm of translation. Matters for the fork/TCP attitude.
+        self.cbf_task_metric_rot_weight = float(rospy.get_param(
+            "~cbf_task_metric_rot_weight", 0.01))
+        self.cbf_task_metric_update_every = max(1, int(rospy.get_param(
+            "~cbf_task_metric_update_every", 1)))
+        self._task_metric_cycle = 0
+        # Active null-space clearance ("deform while following"). The QP
+        # correction, in ANY metric, only cancels inward velocity at the
+        # barrier: nothing ever seeks MORE clearance than the bound demands, so
+        # a nominal that keeps pushing a body link at an obstacle parks the arm
+        # at h~0 indefinitely. This term adds dq_clear = gain * proximity *
+        # N grad_h, with N the null-space projector of the controlled-link
+        # 6D Jacobian: the posture actively deforms away from the critical
+        # obstacle (elbow swivel) while the TCP stays exactly on the FM path.
+        # It is injected BEFORE the QP, so every per-link half-space still
+        # filters it. 0.0 disables (legacy). Requires the task metric (uses
+        # its per-cycle Jacobian).
+        self.cbf_nullspace_clearance_gain = float(rospy.get_param(
+            "~cbf_nullspace_clearance_gain", 0.0))
+        self.cbf_nullspace_clearance_h_activate = float(rospy.get_param(
+            "~cbf_nullspace_clearance_h_activate", self.cbf_h_activate))
+        if (self.cbf_nullspace_clearance_gain > 0.0
+                and not self.cbf_task_metric_enabled):
+            # The identity ablation arm must stay pure legacy: disable the
+            # clearance drive (it needs the task Jacobian anyway) rather than
+            # refusing to start.
+            rospy.logwarn(
+                "cbf_nullspace_clearance_gain=%.3g ignored: requires "
+                "cbf_projection_metric 'task' (running pure legacy identity)",
+                self.cbf_nullspace_clearance_gain)
+            self.cbf_nullspace_clearance_gain = 0.0
+        rospy.loginfo(
+            "CBF projection metric: %s (lambda=%.3g, rot_weight=%.3g, "
+            "nullspace_clearance_gain=%.3g)",
+            self.cbf_projection_metric, self.cbf_task_metric_lambda,
+            self.cbf_task_metric_rot_weight, self.cbf_nullspace_clearance_gain)
         self.cbf_final_constraint_mode = str(rospy.get_param(
             "~cbf_final_constraint_mode", "legacy_kappa")).lower()
         if self.cbf_final_constraint_mode not in ("legacy_kappa", "solver_bound"):
@@ -435,6 +497,25 @@ class CBFSafetyNode:
             "~cbf_escape_normal_h_trigger", 0.0))
         self.cbf_escape_max_velocity = float(rospy.get_param(
             "~cbf_escape_max_velocity", 0.08))
+        # Directed lift escape for head-on TCP-path blocks (runPP14: hand parked
+        # at the prism wall during cube->box transport). The stock escape
+        # amplifies the NOMINAL's tangential component, which is ~zero when the
+        # nominal points straight into the wall; and the null-space clearance
+        # has no authority on a hand-borne constraint. This term instead adds a
+        # velocity that raises the controlled link while staying TANGENT to the
+        # barrier (component along grad_h projected out): g^T dq_lift = 0, so it
+        # never trades safety, and the QP still filters it against the other
+        # link half-spaces. Requires the task metric (uses its Jacobian). Gated
+        # to constraints WITHOUT null-space room, so it complements (not fights)
+        # the clearance drive. 0.0 disables.
+        self.cbf_escape_lift_gain = float(rospy.get_param(
+            "~cbf_escape_lift_gain", 0.0))
+        if self.cbf_escape_lift_gain > 0.0 and not self.cbf_task_metric_enabled:
+            rospy.logwarn(
+                "cbf_escape_lift_gain=%.3g ignored: requires "
+                "cbf_projection_metric 'task' (needs the task Jacobian)",
+                self.cbf_escape_lift_gain)
+            self.cbf_escape_lift_gain = 0.0
         self._cbf_escape_active_cycles = 0
 
         self.enable_cbf = _bool_param("~enable_cbf", True)
@@ -1132,6 +1213,23 @@ class CBFSafetyNode:
         self.static_h_food = torch.full((batch_size,), float('nan'), device=self.device)
         self.static_constr = torch.zeros((batch_size,), device=self.device)
         self.static_grad_h = torch.zeros((batch_size, 7), device=self.device)
+        # W^-1 of the weighted min-norm projection. Identity = legacy Euclidean
+        # projection (bit-compatible); with cbf_projection_metric == "task" the
+        # control loop refreshes it every cycle OUTSIDE the graph and the graphed
+        # _qp_step just reads it, so the capture stays static-shape.
+        self.static_Winv = torch.eye(7, device=self.device)
+        self._task_metric_eye7 = torch.eye(7, device=self.device)
+        # Null-space projector of the controlled-link 6D Jacobian and its +z
+        # position row, refreshed by _update_task_metric; None until the first
+        # refresh.
+        self._task_metric_N = None
+        self._task_metric_Jz = None
+        # Escape-trigger scalars [h, |dq_safe-dq_nom|, |grad_h|]: async D2H
+        # into pinned memory, read one cycle late via event query (no sync).
+        # Init = far-from-barrier so the escape stays off until real data.
+        self._esc_pin = torch.tensor([1.0, 0.0, 1.0]).pin_memory()
+        self._esc_vals = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+        self._esc_event = torch.cuda.Event()
         self.graph = None
         if self.cbf_solver_mode not in ("fast_tangent", "multi_graphed"):
             self._log_cuda_memory("Multi-CBF runtime buffers ready")
@@ -1174,9 +1272,14 @@ class CBFSafetyNode:
             gdq = (grad_h * dq_in).sum(dim=-1)
             constr = torch.where(active, gdq - bound, torch.ones_like(gdq))
             self.static_constr.copy_(constr)
-            denom  = (grad_h ** 2).sum(dim=-1)
+            # Weighted min-norm step: dq_delta = c * W^-1 g / (g^T W^-1 g).
+            # static_Winv == I reproduces the legacy Euclidean projection
+            # exactly; either way grad_h^T dq_delta == c, so the half-space is
+            # satisfied identically and only the correction direction changes.
+            w_grad = grad_h @ self.static_Winv
+            denom  = (grad_h * w_grad).sum(dim=-1)
             correction = torch.clamp(bound - gdq, min=0.0)
-            dq_delta = correction.unsqueeze(-1) * grad_h / (denom.unsqueeze(-1) + 1e-4)
+            dq_delta = correction.unsqueeze(-1) * w_grad / (denom.unsqueeze(-1) + 1e-4)
             if max_correction_speed > 0.0:
                 delta_norm = torch.norm(dq_delta, dim=-1, keepdim=True)
                 scale = torch.clamp(max_correction_speed / (delta_norm + 1e-6), max=1.0)
@@ -1646,6 +1749,83 @@ class CBFSafetyNode:
         forward_speed = (dq_fb * tangent_dir).sum(dim=1, keepdim=True).clamp(min=0.0)
         return forward_speed * tangent_dir
 
+    def _update_task_metric(self, current_q):
+        """Refresh static_Winv (+ null-space projector / lift row) from the
+        controlled-link Jacobian at the current q, via one batched
+        finite-difference FK. Runs in the PREPROCESS timer thread (~30 Hz), NOT
+        the 100 Hz control loop: putting it in the control path cost ~25 ms of
+        GPU contention per cycle (runPP14: cbf_ms p50 4.8 -> 29.8 ms). The
+        metric is a slowly-varying preconditioner, so <=33 ms staleness
+        (<0.025 rad of joint motion) is irrelevant; the control thread only
+        reads the buffers. All linear algebra is numpy on the 8 downloaded
+        poses -- cuSolver on 7x7/6x6 is ~13x slower than numpy and adds sync
+        points."""
+        self._task_metric_cycle += 1
+        if (self._task_metric_cycle - 1) % self.cbf_task_metric_update_every:
+            return
+        eps = 1e-3
+        q_batch = current_q.detach().view(1, 7).expand(8, 7).clone()
+        q_batch[1:].add_(eps * self._task_metric_eye7)
+        T = self.get_link_pose(q_batch, self.controlled_link)
+        if T is None:
+            return
+        Tc = T.detach().cpu().numpy().astype(np.float64)            # [8,4,4]
+        # Rows of dP are dp/dq_i, so Jp^T Jp == dP @ dP^T (same for omega).
+        dP = (Tc[1:, :3, 3] - Tc[0, :3, 3]) / eps                   # [7,3]
+        dR = (Tc[1:, :3, :3] @ Tc[0, :3, :3].T - np.eye(3)) / eps   # ~skew(w_i)
+        omega = 0.5 * np.stack([
+            dR[:, 2, 1] - dR[:, 1, 2],
+            dR[:, 0, 2] - dR[:, 2, 0],
+            dR[:, 1, 0] - dR[:, 0, 1],
+        ], axis=1)                                                   # [7,3]
+        W = (dP @ dP.T
+             + self.cbf_task_metric_rot_weight * (omega @ omega.T)
+             + self.cbf_task_metric_lambda * np.eye(7))
+        self.static_Winv.copy_(
+            torch.from_numpy(np.linalg.inv(W).astype(np.float32)))
+        if self.cbf_nullspace_clearance_gain > 0.0 or self.cbf_escape_lift_gain > 0.0:
+            # Damped null-space projector N = I - J^+ J of the full 6D task
+            # (position + orientation): motions in range(N) leave the TCP pose
+            # unchanged to first order (the Panda's 1-DOF elbow swivel).
+            J = np.concatenate([dP.T, omega.T], axis=0)              # 6x7
+            N = np.eye(7) - J.T @ np.linalg.solve(
+                J @ J.T + 1e-4 * np.eye(6), J)
+            # Reference swap is atomic under the GIL; the control thread reads
+            # whichever full projector is current.
+            self._task_metric_N = torch.from_numpy(
+                N.astype(np.float32)).to(self.device)
+        if self.cbf_escape_lift_gain > 0.0:
+            # dz_TCP/dq row of the position Jacobian: the joint direction that
+            # raises the controlled link, used by the lift escape.
+            self._task_metric_Jz = torch.from_numpy(
+                dP[:, 2].astype(np.float32)).view(1, 7).to(self.device)
+
+    def _nullspace_clearance_velocity(self):
+        """Posture deformation velocity: push the body away from the critical
+        obstacle inside the task null space, ramped by barrier proximity.
+        Reads the previous cycle's h / grad_h (one 100 Hz cycle stale). All
+        tensor ops: no GPU->CPU sync in the control path. The result is added
+        to the nominal BEFORE the QP, so every half-space still filters it
+        (e.g. a swivel toward another obstacle gets clipped by that link's
+        constraint)."""
+        if self.cbf_nullspace_clearance_gain <= 0.0 or self._task_metric_N is None:
+            return None
+        g = self.static_grad_h.detach()                       # [1,7], last cycle
+        n_g = g @ self._task_metric_N                         # N symmetric
+        n_norm = torch.norm(n_g, dim=1, keepdim=True)
+        g_norm = torch.norm(g, dim=1, keepdim=True)
+        h_act = max(self.cbf_nullspace_clearance_h_activate, 1e-6)
+        proximity = torch.clamp(
+            (h_act - self.static_h.detach().view(-1, 1)) / h_act,
+            min=0.0, max=1.0)
+        # Authority ramps with the fraction of grad_h that lies in the null
+        # space: a constraint acting on the TCP itself (n_g ~ 0) has no
+        # deformation room and gets no spurious push.
+        align = torch.clamp(n_norm / (0.3 * g_norm + 1e-6), max=1.0)
+        gate = (g_norm > 1e-3).float()
+        return (self.cbf_nullspace_clearance_gain * proximity * align * gate
+                * n_g / (n_norm + 1e-6))
+
     def _run_velocity_cbf_solver(self, current_q, local_obs, dq_nom):
         self.static_q.copy_(current_q)
         self.static_obs.copy_(local_obs)
@@ -1656,7 +1836,27 @@ class CBFSafetyNode:
         return self.solve_multicbf_projection(
             current_q, local_obs, dq_nom).detach()
 
-    def _compute_escape_velocity(self, dq_nom_base, dq_safe_base):
+    def _queue_escape_state(self, dq_nom_cbf):
+        """Enqueue an async D2H copy of the escape-trigger scalars (h,
+        |dq_safe - dq_nom|, |grad_h|) into pinned memory after the solve.
+        _compute_escape_velocity reads them NEXT cycle if the copy has
+        completed (event query, never blocks). The old synchronous .cpu()
+        here drained the contended GPU queue every 100 Hz cycle."""
+        if not self.cbf_escape_enabled:
+            return
+        vals = torch.stack((
+            self.static_h.detach().view(-1)[0],
+            torch.norm(self.dq_safe_work - dq_nom_cbf),
+            torch.norm(self.static_grad_h.detach()),
+        ))
+        self._esc_pin.copy_(vals, non_blocking=True)
+        self._esc_event.record()
+
+    def _compute_escape_velocity(self, dq_nom_base):
+        """Escape decision from the PREVIOUS cycle's solve state (one 10 ms
+        cycle stale -- the trigger is hysteresis/counter based, so this is
+        equivalent in behavior but allows a single graph replay per cycle and
+        no mid-loop sync)."""
         if not self.cbf_escape_enabled:
             self._cbf_escape_active_cycles = 0
             return torch.zeros_like(dq_nom_base), False
@@ -1667,20 +1867,12 @@ class CBFSafetyNode:
         if self.cbf_solver_mode in ("fast_tangent", "multi_graphed"):
             h_bias = float(self.barrier.alpha) * float(
                 np.log(max(1, int(self.selected_count))))
-        h_escape_t = (
-            self.static_h.detach() + h_bias
-            if self.cbf_escape_use_bias_corrected_h
-            else self.static_h.detach()
-        )
-        base_delta_t = torch.norm(dq_safe_base - dq_nom_base)
-        metrics = torch.cat([
-            h_escape_t.view(-1),
-            base_delta_t.view(1),
-            grad_norm.view(-1),
-        ]).float().cpu().numpy()
-        h_escape = float(metrics[0])
-        base_delta = float(metrics[1])
-        grad_norm_value = float(metrics[2])
+        if self._esc_event.query():
+            self._esc_vals = self._esc_pin.numpy().copy()
+        h_escape = float(self._esc_vals[0]) + (
+            h_bias if self.cbf_escape_use_bias_corrected_h else 0.0)
+        base_delta = float(self._esc_vals[1])
+        grad_norm_value = float(self._esc_vals[2])
 
         near_barrier = h_escape < self.cbf_escape_h_trigger
         release_barrier = h_escape > self.cbf_escape_h_release
@@ -1705,6 +1897,28 @@ class CBFSafetyNode:
         dq_tangent = dq_nom_base - normal_speed * normal_dir
         dq_escape_tangent = self.cbf_escape_tangent_gain * dq_tangent
         dq_escape = dq_escape_tangent
+
+        if self.cbf_escape_lift_gain > 0.0 and self._task_metric_Jz is not None:
+            # Directed lift for head-on blocks: raise the controlled link along
+            # the barrier's tangent plane (grad_h component projected out, so
+            # g^T dq_lift = 0 and safety is untouched). Authority ramps up as
+            # the null-space fraction of grad_h vanishes, i.e. exactly when the
+            # constraint is TCP-borne and the clearance drive can do nothing.
+            lift = self._task_metric_Jz
+            lift_t = lift - (lift * normal_dir).sum(
+                dim=1, keepdim=True) * normal_dir
+            lift_norm = torch.norm(lift_t, dim=1, keepdim=True)
+            lift_gate = torch.ones_like(lift_norm)
+            if self._task_metric_N is not None:
+                ns_frac = (
+                    torch.norm(grad_h @ self._task_metric_N, dim=1, keepdim=True)
+                    / (grad_norm + 1e-6))
+                lift_gate = torch.clamp(1.0 - ns_frac / 0.3, min=0.0, max=1.0)
+            dq_escape = dq_escape + torch.where(
+                lift_norm > 1e-3,
+                self.cbf_escape_lift_gain * lift_gate * lift_t
+                / (lift_norm + 1e-6),
+                torch.zeros_like(lift_t))
 
         if self.cbf_escape_normal_gain > 0.0:
             h_trigger = max(abs(self.cbf_escape_h_trigger), 1e-6)
@@ -2387,6 +2601,16 @@ class CBFSafetyNode:
         if self.current_q is None:
             return
 
+        # Task-metric refresh lives here (preprocess thread, ~30 Hz), off the
+        # 100 Hz control path. Before the obstacle early-return so the metric
+        # stays current even while the cloud is empty.
+        if self.cbf_task_metric_enabled:
+            try:
+                self._update_task_metric(self.current_q.detach())
+            except Exception as e:
+                rospy.logwarn_throttle(
+                    5.0, "task-metric update failed: %s", e)
+
         if self.profile_sync:
             torch.cuda.synchronize()
         t_start = time.perf_counter()
@@ -2848,21 +3072,34 @@ class CBFSafetyNode:
                 with torch.no_grad():
                     self.transfer_buffer[39:].zero_()
                     if self.enable_cbf:
+                        # (task-metric buffers are refreshed by the preprocess
+                        # timer thread; this loop only reads them)
+                        # Null-space clearance (posture deformation) and the
+                        # deadlock escape are both computed BEFORE the solve
+                        # from the previous cycle's h/grad_h, then filtered by
+                        # the SINGLE graph replay below. The old flow solved,
+                        # synced to evaluate the escape, and re-solved when
+                        # escaping -- two GPU-queue drains per cycle under
+                        # contention (runPP14: cbf_ms p50 17-26 ms vs 4.8
+                        # baseline). Both terms share the dq_escape diag slot.
+                        dq_clear = self._nullspace_clearance_velocity()
+                        dq_escape_t, escape_active = self._compute_escape_velocity(
+                            dq_nom_base)
+                        extra = dq_escape_t if escape_active else None
+                        if dq_clear is not None:
+                            extra = dq_clear if extra is None else extra + dq_clear
+                        dq_nom_cbf = dq_nom_base
+                        if extra is not None:
+                            dq_escape = extra
+                            dq_nom_cbf = torch.clamp(
+                                dq_nom_base + extra,
+                                min=-self.max_joint_velocity,
+                                max=self.max_joint_velocity)
                         local_obs = self.selected_obs # Read reference atomically
                         self.dq_safe_work.copy_(self._run_velocity_cbf_solver(
-                            current_q, local_obs, dq_nom_base))
-                        dq_escape, escape_active = self._compute_escape_velocity(
-                            dq_nom_base, self.dq_safe_work)
-                        if escape_active:
-                            dq_nom_torch = torch.clamp(
-                                dq_nom_base + dq_escape,
-                                min=-self.max_joint_velocity,
-                                max=self.max_joint_velocity,
-                            )
-                            self.dq_safe_work.copy_(self._run_velocity_cbf_solver(
-                                current_q, local_obs, dq_nom_torch))
-                        else:
-                            dq_nom_torch = dq_nom_base
+                            current_q, local_obs, dq_nom_cbf))
+                        self._queue_escape_state(dq_nom_cbf)
+                        dq_nom_torch = dq_nom_cbf
                     else:
                         self.dq_safe_work.copy_(dq_nom_torch)
 
@@ -2931,7 +3168,16 @@ class CBFSafetyNode:
                         # cbf_max_correction_speed so a degenerate gradient cannot
                         # produce a violent command; the residual violation is
                         # handled on later cycles as the geometry de-degenerates.
-                        repair_delta = repair_step * grad_h / (grad_norm_sq + 1e-6)
+                        # Same weighted projection as _qp_step (static_Winv == I
+                        # in identity mode): the repair keeps satisfying the raw
+                        # half-space, but distributes the fix in the task metric
+                        # so it does not undo the null-space-preferring solve.
+                        # The degeneracy gates below stay on the RAW |grad_h|.
+                        w_grad_final = grad_h @ self.static_Winv
+                        w_denom_final = (grad_h * w_grad_final).sum(
+                            dim=1, keepdim=True)
+                        repair_delta = repair_step * w_grad_final / (
+                            w_denom_final + 1e-6)
                         if (
                             self.cbf_max_correction_speed > 0.0
                             or self.cbf_recovery_max_correction_speed > 0.0
