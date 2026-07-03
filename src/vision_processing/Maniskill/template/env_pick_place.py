@@ -36,7 +36,15 @@ class PickPlaceShelfEnv(PickCubeEnv):
     # Le depot est donc quasi au sol -> la trajectoire pick->place est un seul arc
     # propre, sans grand lift vertical.
     SHELF_HALF = (0.08, 0.08, 0.005)       # demi-tailles : boite 16x16x1 cm
-    SHELF_POS = (-0.10, -0.35, 0.005)      # a droite (-y) du robot, posee sur la table
+    SHELF_POS = (-0.10, -0.35, 0.005)      # pose nominale (z fixe, sur la table)
+    # Region de spawn ALEATOIRE de l'etagere (x/y par episode, z fixe). Une pose
+    # fixe rendait la politique aveugle a tout deplacement de la boite au
+    # deploiement (40% du nuage hors distribution -> biais constant). La plage y
+    # couvre les positions deja utilisees en deploiement (base-rel -0.28 a -0.50,
+    # soit monde ManiSkill -0.28 a -0.50 ; x base-rel 0.465..0.565). Bord de
+    # l'etagere a y >= -0.20 : reste loin de la zone de spawn du cube (y >= -0.085).
+    SHELF_X_RANGE = (-0.15, -0.05)
+    SHELF_Y_RANGE = (-0.50, -0.28)
     # Region de spawn du cube : RECENTREE sous l'effecteur au homing (empreinte
     # camera EE ~ (-0.05, -0.035)) pour qu'il soit toujours visible par la camera
     # poignet sur la frame initiale, tout en variant a chaque episode.
@@ -67,8 +75,13 @@ class PickPlaceShelfEnv(PickCubeEnv):
         home_q = torch.tensor(home, device=dev, dtype=torch.float32).unsqueeze(0).repeat(b, 1)
         self.agent.reset(home_q)
 
-        # 2) Etagere fixe a droite.
-        shelf_p = torch.tensor([self.SHELF_POS], device=dev).repeat(b, 1)
+        # 2) Etagere a droite, position x/y ALEATOIRE par episode (z fixe).
+        sxr, syr = self.SHELF_X_RANGE, self.SHELF_Y_RANGE
+        sx = sxr[0] + torch.rand(b, device=dev) * (sxr[1] - sxr[0])
+        sy = syr[0] + torch.rand(b, device=dev) * (syr[1] - syr[0])
+        shelf_p = torch.zeros((b, 3), device=dev)
+        shelf_p[:, 0], shelf_p[:, 1] = sx, sy
+        shelf_p[:, 2] = self.SHELF_POS[2]
         shelf_q = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=dev).repeat(b, 1)
         self.shelf.set_pose(Pose.create_from_pq(p=shelf_p.contiguous(), q=shelf_q.contiguous()))
 
@@ -87,11 +100,12 @@ class PickPlaceShelfEnv(PickCubeEnv):
         )
         self.cube.set_pose(Pose.create_from_pq(p=cube_p.contiguous(), q=cube_q.contiguous()))
 
-        # 4) Cible de depot : centre du dessus de l'etagere + demi-cube.
-        self.place_target = torch.tensor(
-            [[self.SHELF_POS[0], self.SHELF_POS[1], self.shelf_top_z + cube_half]],
-            device=dev, dtype=torch.float32,
-        ).repeat(b, 1)
+        # 4) Cible de depot : centre du dessus de l'etagere + demi-cube
+        # (suit la position aleatoire de l'etagere de chaque env).
+        self.place_target = torch.stack(
+            [sx, sy, torch.full((b,), self.shelf_top_z + cube_half, device=dev)],
+            dim=1,
+        ).to(dtype=torch.float32)
 
     # ------------------------------------------------------------------ #
     def get_cube_pose(self):

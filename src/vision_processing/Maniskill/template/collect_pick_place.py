@@ -165,7 +165,7 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Collecte PICK-AND-PLACE (trajectoires = envs x episodes).")
     p.add_argument("--num-envs", type=int, default=4, help="envs simules en parallele")
-    p.add_argument("--num-episodes", type=int, default=5, help="episodes (resets) par env")
+    p.add_argument("--num-episodes", type=int, default=10, help="episodes (resets) par env")
     p.add_argument("--num-trajectories", type=int, default=None,
                    help="raccourci : fixe le TOTAL (lance dans 1 seul env, num_episodes = total)")
     p.add_argument("--arc-mode", choices=["parabola", "circle"], default="parabola",

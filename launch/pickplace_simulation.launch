@@ -47,12 +47,16 @@
         args="-urdf -model red_cube -param red_cube_description
               -x 0.56 -y -0.035 -z 0.77"/>
 
-  <!-- Brown place box: 1 cm high, center world (0.515,-0.50,0.755), top at 0.76. -->
+  <!-- Brown place box: 1 cm high, center world (0.515,-0.35,0.755), top at 0.76.
+       y=-0.35 matches the FIXED training shelf position (env_pick_place.py
+       SHELF_POS, base-rel (0.515,-0.35,0.005)): the policy never saw the box
+       anywhere else, so other positions put 40% of the conditioning cloud
+       out-of-distribution (constant trajectory bias). -->
   <param name="brown_box_description"
          textfile="$(find vision_processing)/urdf/brown_box.urdf"/>
   <node name="spawn_brown_box" pkg="gazebo_ros" type="spawn_model"
         args="-urdf -model brown_box -param brown_box_description
-              -x 0.515 -y -0.50 -z 0.755"/>
+              -x 0.515 -y -0.35 -z 0.755"/>
 
   <!-- Static CBF test obstacle: Gazebo pose is table-frame xy, plus table-top z=0.75. -->
   <param name="pp_cylinder_obstacle_description"

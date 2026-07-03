@@ -516,10 +516,10 @@ def train_flow_matching(
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             history['best_val_loss'] = best_val_loss
-            save_name = "best_fm_model_pickplace_10D_1024.ckpt"
+            save_name = "best_fm_model_pickplace_10D_1024_rdn.ckpt"
             print("Saved Best EMA Model")
         else:
-            save_name = "last_fm_model_pickplace_10D_1024.ckpt"
+            save_name = "last_fm_model_pickplace_10D_1024_rdn.ckpt"
 
         torch.save({
             'model_state_dict': model.state_dict(),

@@ -28,7 +28,7 @@ import rospy
 import rospkg
 import tf2_ros
 from sensor_msgs.msg import PointCloud2, JointState
-from std_msgs.msg import Header, Float32
+from std_msgs.msg import Header, Float32, String
 import sensor_msgs.point_cloud2 as pc2
 from scipy.spatial.transform import Rotation as R
 
@@ -88,6 +88,17 @@ class ConditionPcdPickPlace:
         self.tcp_frame = rospy.get_param("~tcp_frame", "panda_TCP")
         self.target_timeout = float(rospy.get_param("~target_timeout", 5.0))
         self.hold_on_loss = bool(rospy.get_param("~hold_last_target_on_loss", True))
+        # Cube cloud source: SAM projector (default) or the ground-truth
+        # cloud from gt_cube_cloud_node.py (use_gt_cube in launch).
+        self.cube_topic = rospy.get_param("~cube_topic", "/perception/target_cube")
+        # While the cube is grasped (state from gripper_grasp_node_pp), freeze
+        # its cloud in the TCP frame and move it with the hand: matches training,
+        # where the GT cube cloud follows the gripper during the carry, whereas
+        # live SAM either loses the occluded cube (stale persistent cloud at the
+        # pick location) or sees only slivers of it.
+        self.follow_cube_on_grasp = bool(rospy.get_param("~follow_cube_on_grasp", True))
+        self.grasp_state = "PRE_GRASP"
+        self.cube_tcp_snapshot = None
 
         self.rng = np.random.default_rng(0)
         self.cube_cloud = None;  self.cube_stamp = None
@@ -101,12 +112,14 @@ class ConditionPcdPickPlace:
         self.pub_gripper = rospy.Publisher('/vision/gripper_cloud', PointCloud2, queue_size=1)
         self.pub_dist = rospy.Publisher('/vision/gripper_cube_distance', Float32, queue_size=1)
 
-        rospy.Subscriber('/perception/target_cube', PointCloud2, self._cube_cb)
+        rospy.Subscriber(self.cube_topic, PointCloud2, self._cube_cb)
         rospy.Subscriber('/perception/target_box', PointCloud2, self._box_cb)
         rospy.Subscriber('/joint_states', JointState, self._joint_cb)
+        rospy.Subscriber('/pp_grasp/state', String, self._grasp_state_cb)
 
         self.rate = rospy.Rate(30)
-        rospy.loginfo("🚀 Condition PCD PickPlace (gripper + cube + box) ready")
+        rospy.loginfo("🚀 Condition PCD PickPlace (gripper + cube + box) ready "
+                      f"[cube <- {self.cube_topic}]")
 
     # -- callbacks --------------------------------------------------------- #
     def _read_xyz(self, msg):
@@ -128,6 +141,11 @@ class ConditionPcdPickPlace:
                 self.box_cloud = p; self.box_stamp = rospy.get_time()
         except Exception as e:
             rospy.logerr_throttle(5, f"box cloud: {e}")
+
+    def _grasp_state_cb(self, msg):
+        self.grasp_state = msg.data
+        if msg.data not in ("CLOSING", "GRASPED"):
+            self.cube_tcp_snapshot = None  # back to live perception
 
     def _joint_cb(self, msg):
         d = {n: p for n, p in zip(msg.name, msg.position)}
@@ -161,6 +179,7 @@ class ConditionPcdPickPlace:
         q = tr.transform.rotation
         Rm = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
         p = np.array([t.x, t.y, t.z])
+        self._tcp_Rm, self._tcp_p = Rm, p  # reused for the carried cube cloud
         n_f = max(1, n_finger // 2)
         g_tcp = build_gripper_tcp(self.q_left, self.q_right, n_body, n_f, self.rng)
         return (g_tcp @ Rm.T + p).astype(np.float32)
@@ -185,17 +204,31 @@ class ConditionPcdPickPlace:
             if grip is not None:
                 self.publish(self.pub_gripper, grip)
 
-            cube_ok = self.cube_cloud is not None and (self._fresh(self.cube_stamp) or self.hold_on_loss)
+            # Carried cube: freeze the last cloud in the TCP frame at grasp time
+            # and move it with the hand until release (mirrors training GT).
+            cube_used = self.cube_cloud
+            if (self.follow_cube_on_grasp and grip is not None
+                    and self.grasp_state in ("CLOSING", "GRASPED")):
+                if self.cube_tcp_snapshot is None and self.cube_cloud is not None:
+                    self.cube_tcp_snapshot = \
+                        (self.cube_cloud - self._tcp_p) @ self._tcp_Rm
+                if self.cube_tcp_snapshot is not None:
+                    cube_used = (self.cube_tcp_snapshot @ self._tcp_Rm.T
+                                 + self._tcp_p).astype(np.float32)
+
+            cube_ok = cube_used is not None and (self._fresh(self.cube_stamp)
+                                                 or self.hold_on_loss
+                                                 or self.cube_tcp_snapshot is not None)
             box_ok = self.box_cloud is not None and (self._fresh(self.box_stamp) or self.hold_on_loss)
 
             if grip is not None and cube_ok and box_ok:
                 merged = [self.stable_sample(grip, n_grip),
-                          self.stable_sample(self.cube_cloud, n_cube),
+                          self.stable_sample(cube_used, n_cube),
                           self.stable_sample(self.box_cloud, n_box)]
                 full = self.stable_sample(np.vstack(merged), self.num_points)
                 self.publish(self.pub_merged, full)
 
-                dmin = float(np.min(np.linalg.norm(self.cube_cloud - grip.mean(axis=0), axis=1)))
+                dmin = float(np.min(np.linalg.norm(cube_used - grip.mean(axis=0), axis=1)))
                 self.pub_dist.publish(Float32(data=dmin))
             elif grip is None:
                 rospy.loginfo_throttle(10, "Waiting for TF world->TCP (gripper cloud)...")

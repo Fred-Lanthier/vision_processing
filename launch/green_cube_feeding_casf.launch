@@ -21,7 +21,7 @@
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
   <arg name="planner_rate_hz" default="10" />
-  <arg name="trajectory_waypoint_rate_hz" default="10.0" />
+  <arg name="trajectory_waypoint_rate_hz" default="3.0" />
   <arg name="control_rate_hz" default="100.0" />
   <arg name="cbf_preprocess_rate_hz" default="30.0" />
   <arg name="viz_rate_hz" default="5.0" />
@@ -88,7 +88,7 @@
   <arg name="n_corr" default="5" />
   <arg name="alpha_corr" default="2.0" />
   <arg name="commit_distance" default="0.00" />
-  <arg name="cbf_kappa" default="3.0" />
+  <arg name="cbf_kappa" default="5.0" />
   <arg name="cbf_recovery_kappa" default="5.0" />
   <arg name="cbf_constraint_margin" default="0.001" />
   <arg name="cbf_recovery_switch_margin" default="0.015" />
@@ -171,7 +171,7 @@
   <arg name="persistent_floor_height_max_step"    default="0.0" />
   <!-- Camera-independent obstacle. In the Panda/world convention, -Y is the
        robot's right side; the default sphere moves only along +Y. -->
-  <arg name="moving_sphere_enabled" default="false" />
+  <arg name="moving_sphere_enabled" default="true" />
   <arg name="moving_sphere_initial_x" default="0.30" />
   <arg name="moving_sphere_initial_y" default="-9.6" />
   <arg name="moving_sphere_initial_z" default="0.5" />
@@ -214,9 +214,10 @@
   <!-- Fast tangent-preserving CUDA graph with an exact analytical gradient.
        The most critical local-Softmin robot link is the robot half-space; the
        grasp cloud remains a separate half-space when active. -->
-  <arg name="cbf_solver_mode" default="fast_tangent" />
+  <arg name="cbf_solver_mode" default="multi_graphed" />
   <arg name="cbf_profile_multicbf" default="false" />
-  <arg name="cbf_active_constraints" default="2" />
+  <arg name="cbf_active_constraints" default="9" />
+  <arg name="cbf_final_constraint_mode" default="solver_bound"/>
   <arg name="cbf_multi_gradient_mode" default="analytical" />
   <arg name="cbf_multi_fd_eps" default="0.001" />
   <arg name="cbf_h_activate" default="0.04" />
@@ -575,6 +576,7 @@
         <param name="cbf_diagnostics_decimation" value="$(arg cbf_diagnostics_decimation)" />
         <!-- multicbf-only parameters (unread by the Bernstein node) -->
         <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)" />
+        <param name="cbf_final_constraint_mode" value="$(arg cbf_final_constraint_mode)"/>
         <param name="cbf_profile_multicbf" value="$(arg cbf_profile_multicbf)" />
         <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)" />
         <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)" />

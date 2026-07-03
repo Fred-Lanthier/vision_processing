@@ -28,6 +28,7 @@ import tf2_ros
 import actionlib
 from sensor_msgs.msg import PointCloud2, JointState
 import sensor_msgs.point_cloud2 as pc2
+from std_msgs.msg import String
 from std_srvs.srv import Trigger, TriggerResponse
 
 try:
@@ -86,7 +87,7 @@ class GripperGraspNodePP:
         self.cloud_timeout = float(rospy.get_param("~cloud_timeout", 1.0))
         self.confirm_cycles = int(rospy.get_param("~confirm_cycles", 2))
         self.release_xy_radius = float(rospy.get_param("~release_xy_radius", 0.10))
-        self.release_z_clearance = float(rospy.get_param("~release_z_clearance", 0.04))
+        self.release_z_clearance = float(rospy.get_param("~release_z_clearance", 0.10))
         self.release_min_grasp_time = float(rospy.get_param("~release_min_grasp_time", 1.0))
         self.auto = bool(rospy.get_param("~auto", True))
         self.rate_hz = float(rospy.get_param("~rate_hz", 30.0))
@@ -107,6 +108,12 @@ class GripperGraspNodePP:
         self._attach_srv = None; self._detach_srv = None
         self._connect_gripper()
         self._connect_attacher()
+
+        # Latched grasp state (PRE_GRASP/CLOSING/GRASPED/RELEASED): lets the
+        # conditioning node attach the cube cloud to the hand while carried.
+        self.pub_state = rospy.Publisher('/pp_grasp/state', String,
+                                         queue_size=1, latch=True)
+        self.pub_state.publish(String(data=self.state))
 
         rospy.Subscriber(self.cube_topic, PointCloud2, self._cube_cb, queue_size=1)
         rospy.Subscriber(self.box_topic, PointCloud2, self._box_cb, queue_size=1)
@@ -157,6 +164,10 @@ class GripperGraspNodePP:
         return req
 
     # -- grasp / weld / release ---------------------------------------------
+    def _set_state(self, state):
+        self.state = state
+        self.pub_state.publish(String(data=state))
+
     def start_grasp(self):
         """Begin closing the gripper on the cube; weld happens on contact."""
         if self.state in ("CLOSING", "GRASPED"):
@@ -172,7 +183,7 @@ class GripperGraspNodePP:
         goal.speed = self.grasp_speed
         goal.force = self.grasp_force
         self._grasp_client.send_goal(goal)   # non-blocking
-        self.state = "CLOSING"; self.close_time = rospy.get_time()
+        self._set_state("CLOSING"); self.close_time = rospy.get_time()
         rospy.loginfo("✊ Closing gripper on %s (width=%.3f force=%.1fN) — weld on contact.",
                       self.cube_model, self.grasp_width, self.grasp_force)
         return True
@@ -203,7 +214,7 @@ class GripperGraspNodePP:
             return False
         try:
             self._attach_srv(self._attach_request())
-            self.state = "GRASPED"; self.grasp_time = rospy.get_time()
+            self._set_state("GRASPED"); self.grasp_time = rospy.get_time()
             self._hold_gripper_width()
             rospy.loginfo("🤝 Contact — welded %s to %s/%s (finger=%.4f).",
                           self.cube_model, self.robot_model, self.gripper_link,
@@ -223,7 +234,7 @@ class GripperGraspNodePP:
                 rospy.logwarn("detach failed: %s", e)
         if self._move_client is not None:
             self._move_client.send_goal(MoveGoal(width=self.open_width, speed=self.grasp_speed))
-        self.state = "RELEASED"
+        self._set_state("RELEASED")
         rospy.loginfo("👐 Released %s: detached + opened gripper to width=%.3f.",
                       self.cube_model, self.open_width)
         return True

@@ -68,6 +68,18 @@ OBJECT_SPECS = {
     "shelf": ([0.08, 0.08, 0.005], 900),   # boite 1 cm de haut (cf. SHELF_HALF)
 }
 
+# Filtrage de visibilite des objets cibles : ne garde que les faces visibles
+# depuis la camera statique du deploiement (back-face culling, exact pour une
+# boite convexe). Le pipeline reel (SAM + profondeur) ne voit que la coquille
+# faisant face a la camera ; echantillonner la surface COMPLETE creait un
+# decalage train/deploiement (centroide du nuage ~1-2 cm plus loin de la
+# camera). L'outil (pince) reste complet : au deploiement il est aussi
+# reconstruit analytiquement (condition_pcd_pickplace.py), pas vu par camera.
+# Camera statique du xacro : base-rel (0.9, -0.19, 0.62) ; base ManiSkill a
+# world (-0.615, 0, 0) -> monde ManiSkill (0.285, -0.19, 0.62).
+OBJECT_VISIBLE_ONLY = True
+STATIC_CAM_POS = np.array([0.285, -0.19, 0.62])
+
 # Repartition indicative des points bruts de l'outil avant FPS (oversampling).
 N_TOOL_BODY = 1200
 N_TOOL_FINGER = 450     # par doigt
@@ -105,6 +117,48 @@ def _sample_box_surface(half, center, n, rng):
         p[ax] = half[ax] * (1 if rng.random() < 0.5 else -1)  # colle sur la face
         pts[i] = p + center
     return pts
+
+
+def _sample_box_surface_with_normals(half, n, rng):
+    """Comme _sample_box_surface (centre origine) mais retourne aussi la normale
+    sortante de la face de chaque point (repere local de la boite)."""
+    half = np.asarray(half, dtype=np.float64)
+    areas = np.array([half[1] * half[2], half[0] * half[2], half[0] * half[1]])
+    areas = areas / areas.sum()
+    pts = np.empty((n, 3))
+    nrm = np.zeros((n, 3))
+    for i in range(n):
+        ax = rng.choice(3, p=areas)
+        sgn = 1.0 if rng.random() < 0.5 else -1.0
+        p = (rng.random(3) * 2 - 1) * half
+        p[ax] = half[ax] * sgn
+        pts[i] = p
+        nrm[i, ax] = sgn
+    return pts, nrm
+
+
+def sample_box_visible_world(half, R_obj, p_obj, n, rng, cam_pos, max_tries=10):
+    """n points sur les faces d'une boite (pose monde R_obj/p_obj) VISIBLES depuis
+    cam_pos (back-face culling : normale monde . (cam - point) > 0). Boite convexe
+    -> equivalent exact a l'auto-occlusion. N'inclut pas l'occlusion par d'autres
+    objets ni par le robot (approximation assumee)."""
+    kept = []
+    total = 0
+    for _ in range(max_tries):
+        loc, nrm = _sample_box_surface_with_normals(half, 3 * n, rng)
+        pw = loc @ R_obj.T + p_obj
+        nw = nrm @ R_obj.T
+        vis = np.einsum('ij,ij->i', nw, cam_pos[None, :] - pw) > 1e-12
+        if vis.any():
+            kept.append(pw[vis])
+            total += int(vis.sum())
+            if total >= n:
+                break
+    if total == 0:  # degenere (ne devrait pas arriver pour une boite)
+        loc, _ = _sample_box_surface_with_normals(half, n, rng)
+        return loc @ R_obj.T + p_obj
+    out = np.vstack(kept)
+    return out[:n] if len(out) >= n else out[np.arange(n) % len(out)]
 
 
 def build_tool_cloud_tcp(q_left, q_right, rng):
@@ -222,8 +276,12 @@ def process_trajectory(src_folder, dst_base, rng):
             half, n_pts = spec
             R_obj, _ = quat_wxyz_to_R_and_xyzw(obj['orientation'])
             p_obj = np.asarray(obj['position'], dtype=np.float64)
-            obj_local = _sample_box_surface(half, [0, 0, 0], n_pts, rng)
-            clouds.append(obj_local @ R_obj.T + p_obj)
+            if OBJECT_VISIBLE_ONLY:
+                clouds.append(sample_box_visible_world(
+                    half, R_obj, p_obj, n_pts, rng, STATIC_CAM_POS))
+            else:
+                obj_local = _sample_box_surface(half, [0, 0, 0], n_pts, rng)
+                clouds.append(obj_local @ R_obj.T + p_obj)
 
         merged_world = np.vstack(clouds)
         merged_world = downsample_fps(merged_world, NUM_POINTS)

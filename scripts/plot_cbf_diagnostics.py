@@ -561,6 +561,63 @@ def main():
     fig.tight_layout()
     ts.save(fig, outdir, "per_joint_velocity")
 
+    # 3c. Filter effect per joint -------------------------------------------
+    # Plot the raw commanded velocity (dq_ff + dq_fb) before the input low-pass
+    # filter against the filtered nominal velocity (dq_base) fed to the solver,
+    # for each joint individually. This reveals how the filter dampens high-frequency
+    # waypoint chatter and step command jumps per-joint.
+    fig, axes = plt.subplots(2, 4, figsize=(ts.TEXTWIDTH * 1.8, 4.6), sharex=True)
+    axes_flat = axes.ravel()
+    for j in range(7):
+        ax = axes_flat[j]
+        ax.axhline(0.0, color="k", lw=0.5, ls="-", alpha=0.25)
+        # Raw: before filter
+        ax.plot(t, dq_nom_raw[:, j], color=ts.ORANGE, lw=0.8, alpha=0.55,
+                label=r"$\dot{q}_{\mathrm{ff}}+\dot{q}_{\mathrm{fb}}$ (brute)")
+        # Filtered: after filter
+        ax.plot(t, s["dq_base"][:, j], color=ts.BLUE, lw=1.3, alpha=0.95,
+                solid_capstyle="round", solid_joinstyle="round",
+                label=r"$\dot{q}_{\mathrm{base}}$ (filtrée)")
+        ax.set_title(f"Articulation {j + 1}", fontsize=9)
+        if j % 4 == 0:
+            ax.set_ylabel("[rad/s]")
+    axes_flat[7].axis("off")
+    for ax in (axes_flat[4], axes_flat[5], axes_flat[6], axes_flat[3]):
+        ax.set_xlabel("t [s]")
+        ax.tick_params(labelbottom=True)
+    ts.fig_legend_top(fig, axes_flat[0], ncol=2)
+    fig.tight_layout()
+    ts.save(fig, outdir, "per_joint_filter_effect")
+
+    # 3d. Output filter effect per joint -------------------------------------
+    # Plot the raw QP solver output velocity (dq_pre_filter) before the output
+    # low-pass filter against the filtered safe velocity (dq_post_filter) for
+    # each joint individually. This shows how the output filter smooths high-frequency
+    # correction chatter caused by active constraint switches.
+    if dq_post_filter is not None:
+        fig, axes = plt.subplots(2, 4, figsize=(ts.TEXTWIDTH * 1.8, 4.6), sharex=True)
+        axes_flat = axes.ravel()
+        for j in range(7):
+            ax = axes_flat[j]
+            ax.axhline(0.0, color="k", lw=0.5, ls="-", alpha=0.25)
+            # Before: solver output (raw / pre-filter)
+            ax.plot(t, s["dq_pre_filter"][:, j], color=ts.ORANGE, lw=0.8, alpha=0.55,
+                    label=r"$\dot{q}_{\mathrm{pre}}$ (brute)")
+            # After: filtered output (post-filter)
+            ax.plot(t, dq_post_filter[:, j], color=ts.BLUE, lw=1.3, alpha=0.95,
+                    solid_capstyle="round", solid_joinstyle="round",
+                    label=r"$\dot{q}_{\mathrm{post}}$ (filtrée)")
+            ax.set_title(f"Articulation {j + 1}", fontsize=9)
+            if j % 4 == 0:
+                ax.set_ylabel("[rad/s]")
+        axes_flat[7].axis("off")
+        for ax in (axes_flat[4], axes_flat[5], axes_flat[6], axes_flat[3]):
+            ax.set_xlabel("t [s]")
+            ax.tick_params(labelbottom=True)
+        ts.fig_legend_top(fig, axes_flat[0], ncol=2)
+        fig.tight_layout()
+        ts.save(fig, outdir, "per_joint_output_filter_effect")
+
     # 4. Constraint residuals ----------------------------------------------
     fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))
     ax.plot(t, s["constr_pre"], color=ts.ORANGE, label="avant projection (brute)", lw=0.9)
