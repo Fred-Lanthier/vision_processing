@@ -89,6 +89,25 @@ class ForkGraspNode:
         self.grasp_fit_topic = rospy.get_param("~box_fit_topic", "/perception/target")
         # Drop snapshot points farther than this from the cloud median (smear).
         self.grasp_crop_radius = float(rospy.get_param("~grasp_crop_radius", 0.05))
+        # Grasped-cloud source. "perception" = snapshot of the perceived target
+        # (visible faces only: the UNDERSIDE that drags on the pile/bowl during
+        # the exit is missing, so h_food under-reports contact -- run102 read
+        # +7 mm while the food was physically dragging). "ground_truth" = full
+        # analytic box surface at the food's live Gazebo pose (the same
+        # "perfect perception" ablation as gt_cube_cloud_node in PP); falls
+        # back to the perception snapshot if the Gazebo service is missing.
+        self.grasp_cloud_source = str(rospy.get_param(
+            "~grasp_cloud_source", "perception")).lower()
+        # Default = the food_cube COLLISION box (0.03^3), which is what
+        # physically contacts; the visual box is 0.025^3.
+        self.gt_half = np.array([
+            float(rospy.get_param("~gt_half_x", 0.015)),
+            float(rospy.get_param("~gt_half_y", 0.015)),
+            float(rospy.get_param("~gt_half_z", 0.015))])
+        self.gt_num_points = int(rospy.get_param("~gt_num_points", 300))
+        # Gazebo world -> TF world (robot base on the table top at z=0.75).
+        self.gt_table_z_offset = float(rospy.get_param("~gt_table_z_offset", 0.75))
+        self._gt_state_srv = None
         self.publish_viz = bool(rospy.get_param("~publish_viz", True))
         # SDF envelope viz: one sphere per grasped point of radius
         # grasp_point_radius (the CBF's SDF=0 surface). Set envelope_radius to
@@ -228,11 +247,49 @@ class ForkGraspNode:
             return False
 
     # -- grasped cloud (protected/self-filtered by the CBF) ------------------
+    def _gt_box_points_world(self):
+        """Full analytic box surface at the food's live Gazebo pose, in the TF
+        world frame. Unlike the perception snapshot this includes the bottom
+        faces, so the food barrier can see pile/bowl contact under the carried
+        food."""
+        try:
+            from gazebo_msgs.srv import GetModelState
+            if self._gt_state_srv is None:
+                rospy.wait_for_service('/gazebo/get_model_state', timeout=2.0)
+                self._gt_state_srv = rospy.ServiceProxy(
+                    '/gazebo/get_model_state', GetModelState)
+            state = self._gt_state_srv(self.food_model, '')
+            if not state.success:
+                raise RuntimeError(state.status_message)
+        except Exception as e:
+            rospy.logwarn(
+                "GT grasp cloud unavailable (%s); using perception snapshot.", e)
+            return None
+        q = state.pose.orientation
+        Rm = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+        pos = np.array([state.pose.position.x, state.pose.position.y,
+                        state.pose.position.z - self.gt_table_z_offset])
+        half = self.gt_half
+        rng = np.random.default_rng(0)
+        # Area-weighted face sampling (same scheme as gt_cube_cloud_node).
+        areas = np.array([half[1] * half[2], half[0] * half[2], half[0] * half[1]])
+        n = self.gt_num_points
+        loc = (rng.random((n, 3)) * 2.0 - 1.0) * half
+        ax = rng.choice(3, size=n, p=areas / areas.sum())
+        sgn = np.where(rng.random(n) < 0.5, 1.0, -1.0)
+        loc[np.arange(n), ax] = half[ax] * sgn
+        return (loc @ Rm.T + pos).astype(np.float32)
+
     def _snapshot_grasp_cloud(self):
         """Snapshot the target into the fork frame so it rides the fork. Uses the
         live target (tight) and crops smear/outliers around the cloud median."""
         now = rospy.get_time()
-        if self._fit_pts is not None and (now - self._fit_stamp) <= self.cloud_timeout:
+        gt_pts = None
+        if self.grasp_cloud_source == "ground_truth":
+            gt_pts = self._gt_box_points_world()
+        if gt_pts is not None:
+            pts = gt_pts
+        elif self._fit_pts is not None and (now - self._fit_stamp) <= self.cloud_timeout:
             pts = self._fit_pts                       # live target: tight, current
         else:
             pts = self._target_pts                    # fallback: persistent target
@@ -253,10 +310,13 @@ class ForkGraspNode:
         t = np.array([t.x, t.y, t.z], dtype=np.float32)
         p_fork = ((R @ pts.T).T + t).astype(np.float32)   # world -> fork frame
 
-        med = np.median(p_fork, axis=0)
-        keep = np.linalg.norm(p_fork - med, axis=1) <= self.grasp_crop_radius
-        if keep.sum() >= 3:
-            p_fork = p_fork[keep]
+        # Median crop targets perception smear; the analytic GT box has none,
+        # and the crop radius (0.02) would clip its corners (0.026 from center).
+        if gt_pts is None:
+            med = np.median(p_fork, axis=0)
+            keep = np.linalg.norm(p_fork - med, axis=1) <= self.grasp_crop_radius
+            if keep.sum() >= 3:
+                p_fork = p_fork[keep]
 
         self._grasp_cloud_fork = p_fork
         self._publish_grasp_cloud()

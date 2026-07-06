@@ -29,7 +29,7 @@
        The SAM pipeline keeps running either way; only the conditioning node's
        cube input switches. -->
   <arg name="use_gt_cube" default="false"/>
-  <arg name="pickplace_model_name" default="best_fm_model_pickplace_10D_1024.ckpt"/>
+  <arg name="pickplace_model_name" default="best_fm_model_pickplace_10D_1024_rdn.ckpt"/>
   <arg name="condition_num_points" default="1024"/>
   <arg name="planner_rate_hz" default="3"/>
   <arg name="control_rate_hz" default="100.0"/>
@@ -39,7 +39,7 @@
   <!-- Static PP CBF obstacle. Coordinates are in the robot/table frame; Gazebo
        spawn adds the table-top z offset internally. -->
   <arg name="obstacle_enabled" default="true"/>
-  <arg name="obstacle_shape" default="crescent"/>
+  <arg name="obstacle_shape" default="prism"/>
   <arg name="obstacle_x" default="0.535"/>
   <arg name="obstacle_y" default="-0.190"/>
   <!-- Local +Y faces the red cube by default. This matters for the crescent. -->
@@ -70,6 +70,9 @@
   <arg name="moving_sphere_velocity_z" default="0.0"/>
   <arg name="moving_sphere_radius" default="0.08"/>
   <arg name="moving_sphere_num_points" default="1000"/>
+  <!-- Mirror the virtual sphere into Gazebo as a visual-only (collision-free)
+       model so it is visible there too, not just in RViz. -->
+  <arg name="moving_sphere_gazebo_mirror" default="true"/>
 
   <!-- Online CBF tuning, matching the tested feeding values where applicable. -->
   <arg name="enable_cbf" default="true"/>
@@ -90,6 +93,17 @@
        selected per-link half-spaces. There are 9 protected PP links below. -->
   <arg name="cbf_solver_mode" default="multi_graphed"/>
   <arg name="cbf_active_constraints" default="9"/>
+  <!-- Run the 100 Hz control loop on a high-priority CUDA stream, separate
+       from the ~30 Hz preprocess stream, so the command D2H readback stops
+       waiting behind the whole-body SDF batches under SAM2/FM contention
+       (runPP100: cbf_total p50 ~16 ms, loop at ~33 Hz effective). -->
+  <arg name="cbf_separate_streams" default="true"/>
+  <!-- Capture the ENTIRE per-cycle correction+command pipeline in the CUDA
+       graph (escape/clearance compose, solve, dynamic hdot, repair,
+       integration, command fill): one replay instead of ~90 eager ops. The
+       eager loop was dispatch/GIL-bound under SAM2+FM contention (~80 us per
+       op, cbf_correction p50 16 ms with the GPU idle at readback). -->
+  <arg name="cbf_graphed_control_step" default="true"/>
   <!-- POCS sweeps over the active per-link half-space constraints. -->
   <arg name="cbf_constraint_sweeps" default="6"/>
   <arg name="cbf_final_constraint_mode" default="solver_bound"/>
@@ -104,11 +118,14 @@
   <arg name="cbf_direct_position_mode" default="integrated"/>
   <arg name="cbf_position_correction_dt" default="0.02"/>
   <arg name="cbf_max_command_lead" default="0.05"/>
-  <arg name="cbf_h_activate" default="0.1"/>
+  <arg name="cbf_h_activate" default="0.08"/>
   <arg name="cbf_max_inward_speed" default="0.3"/>
   <arg name="cbf_recovery_speed" default="0.05"/>
   <arg name="cbf_recovery_depth" default="0.015"/>
-  <arg name="cbf_max_correction_speed" default="0.3"/>
+  <!-- Raised from 0.3: the task-metric correction has larger joint-space
+       norms, and the dynamic-hdot bound needs correction authority scaling
+       with obstacle speed (see run101 constr_final analysis in feeding). -->
+  <arg name="cbf_max_correction_speed" default="0.5"/>
   <arg name="cbf_recovery_max_correction_speed" default="0.5"/>
   <arg name="cbf_repair_grad_min" default="0.03"/>
   <arg name="cbf_projection_iters" default="3"/>
@@ -123,7 +140,7 @@
        deviation of the executed TCP path from the FM nominal. -->
   <arg name="cbf_projection_metric" default="task"/>
   <arg name="cbf_task_metric_lambda" default="0.01"/>
-  <arg name="cbf_task_metric_rot_weight" default="0.01"/>
+  <arg name="cbf_task_metric_rot_weight" default="0.05"/>
   <arg name="cbf_task_metric_update_every" default="1"/>
   <!-- Active null-space clearance: the QP only cancels inward velocity, so a
        nominal pushing a body link at an obstacle parks the arm at h~0 forever.
@@ -135,21 +152,55 @@
   <arg name="cbf_nullspace_clearance_gain" default="0.3"/>
   <arg name="cbf_nullspace_clearance_h_activate" default="0.15"/>
   <!-- CASF Riemannian warp kept OFF: too slow at runtime. TCP-path blocks are
-       handled reactively instead, by the CBF escape with the tangential lift
-       term (below). -->
+       handled reactively instead, by the CBF escape with the probed
+       tangential direction (below). -->
   <arg name="enable_casf_correction" default="false"/>
   <!-- Deadlock escape for obstacles blocking the TCP path itself (runPP14:
        cube->box transport pinned 40 s at the prism wall; the barrier gradient
        only pushes BACK, and null-space deformation has no authority on a
        hand-borne constraint). When stuck near the barrier, add a velocity
-       TANGENT to the barrier that lifts the controlled link (+z, over the
-       wall): g^T dq_lift = 0, so it costs nothing in safety, and the QP still
-       filters it against all other links. Deactivates at h > h_release. -->
+       TANGENT to the barrier (g^T dq = 0, so it costs nothing in safety, and
+       the QP still filters it against all other links). The DIRECTION is
+       chosen by the sampled-clearance probe (probe_enabled): K tangent-plane
+       directions are virtually stepped by probe_radii and scored by clearance
+       against the obstacle cloud + nominal-velocity alignment + a commitment
+       bonus (hysteresis, no side-flipping) - a floor penalty (the table is
+       not in the cloud). Runs at ~30 Hz in the preprocess thread; the 100 Hz
+       graph consumes the staged joint row unchanged. probe_enabled false
+       falls back to the old fixed +z lift. lift_gain stays the authority
+       [rad/s]. Deactivates at h > h_release. -->
   <arg name="cbf_escape_enabled" default="true"/>
   <arg name="cbf_escape_h_trigger" default="0.02"/>
   <arg name="cbf_escape_h_release" default="0.05"/>
   <arg name="cbf_escape_lift_gain" default="0.2"/>
   <arg name="cbf_escape_max_velocity" default="0.15"/>
+  <arg name="cbf_escape_probe_enabled" default="true"/>
+  <arg name="cbf_escape_probe_num_dirs" default="16"/>
+  <arg name="cbf_escape_probe_radii" default="0.05 0.10"/>
+  <arg name="cbf_escape_probe_clearance_cap" default="0.20"/>
+  <arg name="cbf_escape_probe_goal_weight" default="0.02"/>
+  <arg name="cbf_escape_probe_commit_weight" default="0.02"/>
+  <!-- Table top is z=0 in the CBF/world frame here. -->
+  <arg name="cbf_escape_probe_min_z" default="0.03"/>
+  <arg name="cbf_escape_probe_ema" default="0.3"/>
+  <!-- Tabu re-vote for concave obstacles (crescent bite): if the committed
+       escape direction yields < tabu_min_progress of TCP motion along itself
+       for tabu_timeout seconds (QP-clipped: wedged), it is penalized for
+       tabu_ttl seconds and the probe re-votes. Progress = displacement along
+       the direction, not h (a good tangential escape slides at h~trigger). -->
+  <arg name="cbf_escape_probe_tabu_timeout" default="1.5"/>
+  <arg name="cbf_escape_probe_tabu_min_progress" default="0.03"/>
+  <arg name="cbf_escape_probe_tabu_weight" default="0.1"/>
+  <arg name="cbf_escape_probe_tabu_ttl" default="8.0"/>
+  <!-- Exact hard-min barrier VALUE (Softmin keeps supplying the gradient):
+       the PP obstacle clouds are dense/synthetic, so the Softmin crowding
+       bias otherwise under-reports clearance. + time-varying CBF tightening
+       for a moving sphere (inert while the sphere velocity is 0). -->
+  <arg name="cbf_barrier_value_mode" default="soft"/>
+  <arg name="cbf_dynamic_hdot_enabled" default="true"/>
+  <arg name="cbf_dynamic_hdot_tau" default="0.05"/>
+  <arg name="cbf_dynamic_hdot_deadband" default="0.05"/>
+  <arg name="cbf_dynamic_hdot_max" default="0.5"/>
   <arg name="cbf_passthrough_when_inactive" default="true"/>
   <arg name="cbf_monitor_only" default="false"/>
   <arg name="cbf_filter_tau" default="0.08"/>
@@ -234,12 +285,19 @@
         <param name="moving_sphere_velocity_z" value="$(arg moving_sphere_velocity_z)"/>
         <param name="moving_sphere_radius" value="$(arg moving_sphere_radius)"/>
         <param name="moving_sphere_num_points" value="$(arg moving_sphere_num_points)"/>
+        <param name="gazebo_mirror_enabled" value="$(arg moving_sphere_gazebo_mirror)"/>
+        <param name="gazebo_z_offset" value="0.75"/>
         <param name="publish_rate_hz" value="30.0"/>
   </node>
 
   <!-- 1. SAM3 + SAM2 detect/track TWO objects (cube + box) on the static cam. -->
   <node name="sam3_sam2_pp" pkg="vision_processing" type="sam3_sam2_node_pp.py" output="screen" cwd="node">
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
+        <!-- GPU-bound node: cap the OMP intra-op pool so three torch
+             processes stop oversubscribing the 12 CPU cores (each defaults
+             to 12 spin-waiting threads), which inflated every eager-op
+             dispatch in the 100 Hz CBF loop to ~80 us. -->
+        <env name="OMP_NUM_THREADS" value="2"/>
         <param name="cube_prompt" value="$(arg cube_prompt)"/>
         <param name="box_prompt"  value="$(arg box_prompt)"/>
         <param name="camera_frame" value="$(arg static_cam_frame)"/>
@@ -307,6 +365,8 @@
        remains off; the online CBF node handles obstacle avoidance. -->
   <node name="safe_generative_planner" pkg="vision_processing" type="casf_generative_node_PC_pp.py" output="screen" cwd="node">
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
+        <!-- Same OMP cap as sam3_sam2_pp: keep CPU cores for the 100 Hz CBF loop. -->
+        <env name="OMP_NUM_THREADS" value="2"/>
         <param name="model_name" value="$(arg pickplace_model_name)"/>
         <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
         <param name="controlled_link" value="panda_TCP"/>
@@ -349,7 +409,10 @@
         <param name="hold_current_until_trajectory" value="true"/>
         <param name="use_progress_clock" value="true"/>
         <param name="progress_lag_limit_rad" value="0.25"/>
-        <param name="cbf_hold_threshold" value="-1000.0"/>
+        <!-- Freeze trajectory progress while the barrier is violated (h < 0)
+             so the nominal doesn't run ahead during a CBF deflection; the arm
+             resumes the planned path where it left it. -->
+        <param name="cbf_hold_threshold" value="0.0"/>
         <param name="anchor_mode" value="start"/>
         <param name="command_lookahead_time" value="$(arg trajectory_command_lookahead_time)"/>
         <param name="log_timing" value="false"/>
@@ -379,6 +442,8 @@
         <param name="cbf_sdf_prefilter_max_points" value="$(arg cbf_sdf_prefilter_max_points)"/>
         <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)"/>
         <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)"/>
+        <param name="cbf_separate_streams" value="$(arg cbf_separate_streams)"/>
+        <param name="cbf_graphed_control_step" value="$(arg cbf_graphed_control_step)"/>
         <param name="cbf_constraint_sweeps" value="$(arg cbf_constraint_sweeps)"/>
         <param name="cbf_final_constraint_mode" value="$(arg cbf_final_constraint_mode)"/>
         <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)"/>
@@ -425,6 +490,23 @@
         <param name="cbf_escape_h_release" value="$(arg cbf_escape_h_release)"/>
         <param name="cbf_escape_lift_gain" value="$(arg cbf_escape_lift_gain)"/>
         <param name="cbf_escape_max_velocity" value="$(arg cbf_escape_max_velocity)"/>
+        <param name="cbf_escape_probe_enabled" value="$(arg cbf_escape_probe_enabled)"/>
+        <param name="cbf_escape_probe_num_dirs" value="$(arg cbf_escape_probe_num_dirs)"/>
+        <param name="cbf_escape_probe_radii" value="$(arg cbf_escape_probe_radii)"/>
+        <param name="cbf_escape_probe_clearance_cap" value="$(arg cbf_escape_probe_clearance_cap)"/>
+        <param name="cbf_escape_probe_goal_weight" value="$(arg cbf_escape_probe_goal_weight)"/>
+        <param name="cbf_escape_probe_commit_weight" value="$(arg cbf_escape_probe_commit_weight)"/>
+        <param name="cbf_escape_probe_min_z" value="$(arg cbf_escape_probe_min_z)"/>
+        <param name="cbf_escape_probe_ema" value="$(arg cbf_escape_probe_ema)"/>
+        <param name="cbf_escape_probe_tabu_timeout" value="$(arg cbf_escape_probe_tabu_timeout)"/>
+        <param name="cbf_escape_probe_tabu_min_progress" value="$(arg cbf_escape_probe_tabu_min_progress)"/>
+        <param name="cbf_escape_probe_tabu_weight" value="$(arg cbf_escape_probe_tabu_weight)"/>
+        <param name="cbf_escape_probe_tabu_ttl" value="$(arg cbf_escape_probe_tabu_ttl)"/>
+        <param name="cbf_barrier_value_mode" value="$(arg cbf_barrier_value_mode)"/>
+        <param name="cbf_dynamic_hdot_enabled" value="$(arg cbf_dynamic_hdot_enabled)"/>
+        <param name="cbf_dynamic_hdot_tau" value="$(arg cbf_dynamic_hdot_tau)"/>
+        <param name="cbf_dynamic_hdot_deadband" value="$(arg cbf_dynamic_hdot_deadband)"/>
+        <param name="cbf_dynamic_hdot_max" value="$(arg cbf_dynamic_hdot_max)"/>
         <param name="barrier_alpha" value="$(arg barrier_alpha)"/>
         <param name="d_safe" value="$(arg d_safe)"/>
         <param name="cbf_integrate_from_current" value="true"/>

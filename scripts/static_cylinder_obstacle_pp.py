@@ -272,6 +272,14 @@ class StaticObstaclePP:
         self.moving_sphere_num_points = int(rospy.get_param("~moving_sphere_num_points", 1000))
         self._moving_sphere_start_time = None
         self._moving_sphere_offsets = None
+        # Gazebo mirror: spawn a visual-only (collision-free) sphere model and
+        # stream its pose, so the virtual CBF obstacle is visible in Gazebo
+        # without physically interacting with the robot. The CBF world frame
+        # sits on the table top, hence the +z offset into the Gazebo world.
+        self.gazebo_mirror_enabled = bool(rospy.get_param("~gazebo_mirror_enabled", False))
+        self.gazebo_z_offset = float(rospy.get_param("~gazebo_z_offset", 0.75))
+        self.gazebo_model_name = str(rospy.get_param("~gazebo_model_name", "pp_moving_sphere_viz"))
+        self._gazebo_state_pub = None
         if self.moving_sphere_enabled:
             values = np.concatenate([
                 self.moving_sphere_initial_position,
@@ -282,6 +290,8 @@ class StaticObstaclePP:
                 raise ValueError("Moving-sphere position, velocity, and radius must be finite.")
             self._moving_sphere_offsets = _fibonacci_sphere_offsets(
                 self.moving_sphere_radius, self.moving_sphere_num_points)
+            if self.gazebo_mirror_enabled:
+                self._setup_gazebo_mirror()
 
         if self.shape == "cylinder":
             local = sample_cylinder_surface(self.radius, self.height, self.num_points)
@@ -333,6 +343,85 @@ class StaticObstaclePP:
                 self.moving_sphere_radius,
                 len(self._moving_sphere_offsets),
             )
+
+    def _sphere_mirror_sdf(self):
+        r = self.moving_sphere_radius
+        # Purple + semi-transparent, matching the RViz marker.
+        return """
+<sdf version="1.6">
+  <model name="{name}">
+    <static>true</static>
+    <link name="link">
+      <visual name="visual">
+        <geometry><sphere><radius>{r}</radius></sphere></geometry>
+        <material>
+          <ambient>0.75 0.05 0.75 1</ambient>
+          <diffuse>0.75 0.05 0.75 1</diffuse>
+        </material>
+        <transparency>0.45</transparency>
+      </visual>
+    </link>
+  </model>
+</sdf>""".format(name=self.gazebo_model_name, r=r)
+
+    def _setup_gazebo_mirror(self):
+        from gazebo_msgs.msg import ModelState
+        from gazebo_msgs.srv import DeleteModel, SpawnModel
+        from geometry_msgs.msg import Pose
+
+        self._ModelState = ModelState
+        try:
+            rospy.wait_for_service("/gazebo/spawn_sdf_model", timeout=30.0)
+        except rospy.ROSException:
+            rospy.logwarn("Gazebo spawn service unavailable; moving-sphere "
+                          "Gazebo mirror disabled.")
+            return
+
+        # Clean up a leftover model from a previous run before respawning.
+        try:
+            delete = rospy.ServiceProxy("/gazebo/delete_model", DeleteModel)
+            delete(self.gazebo_model_name)
+        except rospy.ServiceException:
+            pass
+
+        pose = Pose()
+        pose.position.x = float(self.moving_sphere_initial_position[0])
+        pose.position.y = float(self.moving_sphere_initial_position[1])
+        pose.position.z = float(self.moving_sphere_initial_position[2]) + self.gazebo_z_offset
+        pose.orientation.w = 1.0
+        try:
+            spawn = rospy.ServiceProxy("/gazebo/spawn_sdf_model", SpawnModel)
+            resp = spawn(self.gazebo_model_name, self._sphere_mirror_sdf(),
+                         "", pose, "world")
+            if not resp.success:
+                rospy.logwarn("Moving-sphere Gazebo spawn failed: %s",
+                              resp.status_message)
+        except rospy.ServiceException as exc:
+            rospy.logwarn("Moving-sphere Gazebo spawn failed: %s", exc)
+            return
+
+        self._gazebo_state_pub = rospy.Publisher(
+            "/gazebo/set_model_state", ModelState, queue_size=1)
+
+        def _cleanup():
+            try:
+                delete_srv = rospy.ServiceProxy("/gazebo/delete_model", DeleteModel)
+                delete_srv(self.gazebo_model_name)
+            except rospy.ServiceException:
+                pass
+        rospy.on_shutdown(_cleanup)
+
+    def _publish_gazebo_mirror(self, center):
+        if self._gazebo_state_pub is None or center is None:
+            return
+        state = self._ModelState()
+        state.model_name = self.gazebo_model_name
+        state.pose.position.x = float(center[0])
+        state.pose.position.y = float(center[1])
+        state.pose.position.z = float(center[2]) + self.gazebo_z_offset
+        state.pose.orientation.w = 1.0
+        state.reference_frame = "world"
+        self._gazebo_state_pub.publish(state)
 
     def _moving_sphere_center(self, now_sec=None):
         if not self.moving_sphere_enabled:
@@ -446,6 +535,7 @@ class StaticObstaclePP:
             sphere_marker = self._moving_sphere_marker_msg(stamp, sphere_center)
             if sphere_marker is not None:
                 self.marker_pub.publish(sphere_marker)
+            self._publish_gazebo_mirror(sphere_center)
             rate.sleep()
 
 

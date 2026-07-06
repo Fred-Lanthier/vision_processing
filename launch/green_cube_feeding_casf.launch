@@ -101,7 +101,7 @@
   <arg name="cbf_max_command_lead" default="0.05" />
   <arg name="cbf_gradient_check_period" default="0.0" />
   <arg name="cbf_gradient_check_eps" default="0.001" />
-  <arg name="barrier_alpha" default="0.005" />
+  <arg name="barrier_alpha" default="0.0005" />
   <arg name="d_safe" default="0.015" />
   <arg name="cbf_publish_safety_envelope" default="true" />
   <arg name="cbf_safety_envelope_resolution" default="40" />
@@ -109,7 +109,7 @@
   <arg name="cbf_kp" default="5.0" />
   <arg name="max_feedback_velocity" default="0.5" />
   <arg name="cbf_filter_tau" default="0.05" />
-  <arg name="cbf_velocity_filter_tau" default="0.1" />
+  <arg name="cbf_velocity_filter_tau" default="0.05" />
   <arg name="cbf_use_nominal_velocity_topic" default="true" />
   <arg name="cbf_nominal_velocity_timeout" default="0.25" />
   <arg name="cbf_nominal_feedforward_gain" default="1.0" />
@@ -173,10 +173,10 @@
        robot's right side; the default sphere moves only along +Y. -->
   <arg name="moving_sphere_enabled" default="true" />
   <arg name="moving_sphere_initial_x" default="0.30" />
-  <arg name="moving_sphere_initial_y" default="-9.6" />
+  <arg name="moving_sphere_initial_y" default="-3.0" />
   <arg name="moving_sphere_initial_z" default="0.5" />
   <arg name="moving_sphere_velocity_x" default="0.0" />
-  <arg name="moving_sphere_velocity_y" default="0.30" />
+  <arg name="moving_sphere_velocity_y" default="0.10" />
   <arg name="moving_sphere_velocity_z" default="0.0" />
   <arg name="moving_sphere_radius" default="0.08" />
   <arg name="moving_sphere_num_points" default="1000" />
@@ -217,18 +217,57 @@
   <arg name="cbf_solver_mode" default="multi_graphed" />
   <arg name="cbf_profile_multicbf" default="false" />
   <arg name="cbf_active_constraints" default="9" />
+  <arg name="cbf_graphed_control_step" default="true"/>
+  <arg name="cbf_separate_streams" default="true"/>
   <arg name="cbf_final_constraint_mode" default="solver_bound"/>
   <arg name="cbf_multi_gradient_mode" default="analytical" />
   <arg name="cbf_multi_fd_eps" default="0.001" />
-  <arg name="cbf_h_activate" default="0.04" />
+  <arg name="cbf_h_activate" default="0.1" />
+  <!-- Barrier VALUE mode. soft = legacy Softmin value: under-reports clearance
+       by the crowding bias tau*log(M_eff) (~15 mm when the dense moving-sphere
+       cloud parks dozens of points within tau of the min), so the reported h
+       dips below 0 while the true clearance stays positive. hard = exact
+       per-link hard-min VALUE for the QP band + diagnostics; the smooth
+       Softmin still supplies the gradient direction. -->
+  <arg name="cbf_barrier_value_mode" default="soft" />
+  <!-- Time-varying CBF term for the moving obstacle: estimates the
+       environment-induced hdot (measured hdot minus the robot's own
+       grad_h.dq contribution) and tightens the active half-spaces by
+       clamp(-hdot_env - deadband, 0, max): the robot yields at the obstacle's
+       approach speed instead of discovering it one cycle at a time. Static
+       scenes fall inside the deadband -> zero effect. -->
+  <arg name="cbf_dynamic_hdot_enabled" default="true" />
+  <arg name="cbf_dynamic_hdot_tau" default="0.05" />
+  <arg name="cbf_dynamic_hdot_deadband" default="0.05" />
+  <arg name="cbf_dynamic_hdot_max" default="0.5" />
   <arg name="cbf_max_inward_speed" default="0.20" />
   <arg name="cbf_recovery_speed" default="0.05" />
   <arg name="cbf_recovery_depth" default="0.015" />
-  <arg name="cbf_max_correction_speed" default="0.20" />
+  <!-- Correction-speed cap per projection step AND for the repair. 0.20 was
+       sized for the static braking regime; the dynamic-hdot bound demands
+       corrections scaling with obstacle speed (run101 @ t~10s: sphere at
+       0.3 m/s, |grad_h| ~ 0.33 -> ~0.9 rad/s of joint motion needed, the
+       0.20 cap delivered 0.066 m/s of hdot and constr_final hit -0.086).
+       0.45 converges within 2 of the 6 POCS sweeps; degenerate-gradient
+       violence is still guarded by cbf_repair_grad_min + the denom gates. -->
+  <arg name="cbf_max_correction_speed" default="0.45" />
   <arg name="cbf_recovery_max_correction_speed" default="0.55" />
   <arg name="cbf_projection_iters" default="3" />
   <arg name="cbf_projection_relaxation" default="1.0" />
   <arg name="cbf_tracking_feedback_mode" default="tangent_near" />
+  <!-- Trajectory-fidelity stack (the pick-and-place technique), OFF by
+       default for feeding at user request: identity + gain 0 is bit-identical
+       legacy behavior. To try it on a feeding run:
+       cbf_projection_metric:=task cbf_nullspace_clearance_gain:=0.3
+       (rot_weight 0.05 protects fork orientation during skewering; the PP
+       lift escape stays out of feeding regardless: an autonomous "when stuck,
+       go up" reflex is inappropriate near the person's face). -->
+  <arg name="cbf_projection_metric" default="task" />
+  <arg name="cbf_task_metric_lambda" default="0.01" />
+  <arg name="cbf_task_metric_rot_weight" default="0.05" />
+  <arg name="cbf_task_metric_update_every" default="1" />
+  <arg name="cbf_nullspace_clearance_gain" default="0.3" />
+  <arg name="cbf_nullspace_clearance_h_activate" default="0.15" />
   <arg name="cbf_passthrough_when_inactive" default="true" />
   <!-- Baseline "sans CBF" mode: barrier and diagnostics still computed, no
        correction applied; the robot freezes at first estimated contact
@@ -243,6 +282,11 @@
   <arg name="log_bridge_events" default="false" />
   <arg name="trajectory_use_progress_clock" default="true" />
   <arg name="trajectory_progress_lag_limit_rad" default="0.25" />
+  <!-- Freeze the executor's trajectory progress clock while h < threshold
+       (nominal stops advancing during a CBF violation). -1000 = disabled
+       (legacy feeding behavior); 0.0 pauses only during actual violation.
+       If enabling, never raise toward h_activate: feeding legitimately
+       operates at h ~ 0-0.04 inside the bowl and would stall. -->
   <arg name="trajectory_cbf_hold_threshold" default="-1000.0" />
   <arg name="trajectory_anchor_mode" default="start" />
   <arg name="trajectory_command_lookahead_time" default="0.10" />
@@ -582,6 +626,11 @@
         <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)" />
         <param name="cbf_multi_fd_eps" value="$(arg cbf_multi_fd_eps)" />
         <param name="cbf_h_activate" value="$(arg cbf_h_activate)" />
+        <param name="cbf_barrier_value_mode" value="$(arg cbf_barrier_value_mode)" />
+        <param name="cbf_dynamic_hdot_enabled" value="$(arg cbf_dynamic_hdot_enabled)" />
+        <param name="cbf_dynamic_hdot_tau" value="$(arg cbf_dynamic_hdot_tau)" />
+        <param name="cbf_dynamic_hdot_deadband" value="$(arg cbf_dynamic_hdot_deadband)" />
+        <param name="cbf_dynamic_hdot_max" value="$(arg cbf_dynamic_hdot_max)" />
         <param name="cbf_max_inward_speed" value="$(arg cbf_max_inward_speed)" />
         <param name="cbf_recovery_speed" value="$(arg cbf_recovery_speed)" />
         <param name="cbf_recovery_depth" value="$(arg cbf_recovery_depth)" />
@@ -590,6 +639,12 @@
         <param name="cbf_projection_iters" value="$(arg cbf_projection_iters)" />
         <param name="cbf_projection_relaxation" value="$(arg cbf_projection_relaxation)" />
         <param name="cbf_tracking_feedback_mode" value="$(arg cbf_tracking_feedback_mode)" />
+        <param name="cbf_projection_metric" value="$(arg cbf_projection_metric)" />
+        <param name="cbf_task_metric_lambda" value="$(arg cbf_task_metric_lambda)" />
+        <param name="cbf_task_metric_rot_weight" value="$(arg cbf_task_metric_rot_weight)" />
+        <param name="cbf_task_metric_update_every" value="$(arg cbf_task_metric_update_every)" />
+        <param name="cbf_nullspace_clearance_gain" value="$(arg cbf_nullspace_clearance_gain)" />
+        <param name="cbf_nullspace_clearance_h_activate" value="$(arg cbf_nullspace_clearance_h_activate)" />
         <param name="cbf_passthrough_when_inactive" value="$(arg cbf_passthrough_when_inactive)" />
         <param name="cbf_monitor_only" value="$(arg cbf_monitor_only)" />
         <param name="contact_stop_enabled" value="$(arg contact_stop_enabled)" />
@@ -689,6 +744,15 @@
   <arg name="grasp_contact_cycles" default="2" />
   <!-- Crop radius (m) around the snapshot median; drops smeared/outlier points. -->
   <arg name="grasp_crop_radius" default="0.02" />
+  <!-- Grasped-cloud source for the CBF food barrier. ground_truth = full
+       analytic box at the food's live Gazebo pose, INCLUDING the underside the
+       camera never sees (run102: the carried food dragged on the pile while
+       h_food still read +7 mm, because the perception snapshot has no bottom
+       faces). perception = legacy visible-surface snapshot (the ablation arm). -->
+  <arg name="grasp_cloud_source" default="ground_truth" />
+  <!-- Half-extent of the GT box: food_cube COLLISION geometry is 0.03^3
+       (what physically contacts); the visual box is 0.025^3. -->
+  <arg name="grasp_gt_half_extent" default="0.015" />
   <!-- grasp_point_radius / grasp_softmin_beta / grasp_d_safe declared earlier
        (before the CBF node), since the CBF block reads them too. -->
   <node name="fork_grasp" pkg="vision_processing" type="fork_grasp_node.py"
@@ -710,6 +774,10 @@
         <!-- Snapshot from the live (tight) target, not the accumulated one. -->
         <param name="box_fit_topic" value="/perception/target" />
         <param name="grasp_crop_radius" value="$(arg grasp_crop_radius)" />
+        <param name="grasp_cloud_source" value="$(arg grasp_cloud_source)" />
+        <param name="gt_half_x" value="$(arg grasp_gt_half_extent)" />
+        <param name="gt_half_y" value="$(arg grasp_gt_half_extent)" />
+        <param name="gt_half_z" value="$(arg grasp_gt_half_extent)" />
         <!-- SDF envelope marker (/viz/grasp_sdf_envelope): per-point sphere
              radius = the CBF's grasp_point_radius, so it shows the SDF=0 surface.
              Use grasp_point_radius + d_safe to show the CBF keep-out boundary. -->

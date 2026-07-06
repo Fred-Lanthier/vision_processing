@@ -43,7 +43,7 @@ GROUPS = [
                     "ik_correction", "casf_warp", "trajectory_build",
                     "planner_total"]),
     ("safety",     ["critical_point_selection", "cbf_correction",
-                    "cbf_command", "cbf_total"]),
+                    "cbf_command", "cbf_d2h", "cbf_total"]),
 ]
 # Stages already aggregating their group (excluded from the breakdown sum but
 # used as the per-pass contribution in the end-to-end budget).
