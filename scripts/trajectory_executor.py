@@ -22,6 +22,9 @@ class TrajectoryExecutor:
     def __init__(self):
         rospy.init_node('trajectory_executor')
 
+        # Arm joint names for the /joint_states lookup. Default = panda; the
+        # xArm7 cross-embodiment launch passes xarm7_joint1..7.
+        self.joint_names = list(rospy.get_param('~joint_names', JOINT_NAMES))
         self.rate_hz      = rospy.get_param('~rate_hz',      50.0)
         self.hold_current_until_trajectory = rospy.get_param(
             '~hold_current_until_trajectory', False)
@@ -97,7 +100,7 @@ class TrajectoryExecutor:
     def _joint_cb(self, msg):
         now = rospy.Time.now()
         pos = {n: p for n, p in zip(msg.name, msg.position)}
-        q = [pos.get(j) for j in JOINT_NAMES]
+        q = [pos.get(j) for j in self.joint_names]
         if None not in q:
             q_current = np.array(q, dtype=np.float64)
             with self._state_lock:

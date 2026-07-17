@@ -1,0 +1,68 @@
+# Controllers for the xArm7 + welded Franka hand PICK-AND-PLACE sim
+# (urdf/xarm7_pickplace.xacro, spawned by pickplace_simulation_xarm.launch).
+# Sibling of simple_controllers.yaml (panda): same controller set, xarm7 joint
+# names, PID gains rescaled to the xArm7 effort limits (50/50/30/30/30/20/20 Nm
+# vs the Panda's 87/87/87/87/12/12/12).
+#
+# This file is SELF-CONTAINED: it also carries the franka_gripper controller
+# (franka_gazebo/FrankaGripperSim) that franka_hw_sim.yaml provides in the
+# panda sim. FrankaGripperSim only claims an EffortJointInterface on the two
+# finger joints, so it runs unchanged on the default gazebo_ros_control HW sim.
+
+joint_state_controller:
+  type: joint_state_controller/JointStateController
+  publish_rate: 60
+
+joint_group_position_controller:
+  type: position_controllers/JointGroupPositionController
+  joints:
+    - xarm7_joint1
+    - xarm7_joint2
+    - xarm7_joint3
+    - xarm7_joint4
+    - xarm7_joint5
+    - xarm7_joint6
+    - xarm7_joint7
+
+  constraints:
+    goal_time: 1.0
+    xarm7_joint1: {trajectory: 0.1, goal: 0.05}
+    xarm7_joint2: {trajectory: 0.1, goal: 0.05}
+    xarm7_joint3: {trajectory: 0.1, goal: 0.05}
+    xarm7_joint4: {trajectory: 0.1, goal: 0.05}
+    xarm7_joint5: {trajectory: 0.1, goal: 0.05}
+    xarm7_joint6: {trajectory: 0.1, goal: 0.05}
+    xarm7_joint7: {trajectory: 0.1, goal: 0.05}
+
+joint_group_velocity_controller:
+  type: vision_processing/JointGroupVelocityController
+  joints:
+    - xarm7_joint1
+    - xarm7_joint2
+    - xarm7_joint3
+    - xarm7_joint4
+    - xarm7_joint5
+    - xarm7_joint6
+    - xarm7_joint7
+  # Stop integrating and hold the last reference if the CBF stops publishing.
+  command_timeout: 0.10
+  max_abs_velocity: 0.70
+  max_position_lead: 0.05
+
+# Gripper action server (/franka_gripper/{grasp,move,homing,stop}), same as the
+# panda sim. The hand subtree keeps its panda_* names on the hybrid robot.
+franka_gripper:
+  type: franka_gazebo/FrankaGripperSim
+  arm_id: panda
+
+  finger1:
+    gains: { p: 100, i: 0, d: 1.0 }
+
+  finger2:
+    gains: { p: 100, i: 0, d: 1.0 }
+
+# NOTE: the DefaultRobotHWSim arm PID gains (effort mode) now live in a SEPARATE
+# file, config/xarm7_gazebo_pid_gains.yaml, loaded by pickplace_simulation_xarm.launch
+# only when arm_effort_mode:=true (default). arm_effort_mode:=false loads nothing
+# here -> kinematic SetPosition arm (known-good baseline, no contact physics).
+# The franka_gripper + arm/finger controllers above are loaded in BOTH modes.

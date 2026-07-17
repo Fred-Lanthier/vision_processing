@@ -20,7 +20,7 @@
   <arg name="casf_model_name" default="last_fm_model_9D_dynamics_1024.ckpt" />
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True" />
   <!-- waypoint_rate controls robot speed; control_rate controls interpolation/CBF update frequency. -->
-  <arg name="planner_rate_hz" default="10" />
+  <arg name="planner_rate_hz" default="5" />
   <arg name="trajectory_waypoint_rate_hz" default="3.0" />
   <arg name="control_rate_hz" default="100.0" />
   <arg name="cbf_preprocess_rate_hz" default="30.0" />
@@ -47,7 +47,7 @@
   <arg name="cbf_cluster_mode" default="topk" />
   <arg name="cbf_fork_mesh_selection_points" default="512" />
   <arg name="cbf_publish_yellow_points" default="false" />
-  <arg name="cbf_selected_obstacle_hold_time" default="0.25" />
+  <arg name="cbf_selected_obstacle_hold_time" default="0.1" />
   <arg name="cbf_selection_sticky_points" default="0" />
   <arg name="cbf_selection_sticky_radius" default="0.05" />
   <arg name="cbf_selection_sticky_score_margin" default="0.002" />
@@ -63,13 +63,22 @@
   <arg name="casf_alpha" default="10.0" />
   <arg name="enable_casf_correction" default="false" />
   <arg name="fm_noise_seed" default="7" />
-  <arg name="use_temporal_ensembler" default="false" />
+  <arg name="use_temporal_ensembler" default="true" />
   <arg name="planner_single_shot" default="false" />
   <arg name="planner_wait_for_cbf_ready" default="true" />
-  <arg name="ensembler_buffer_size" default="5" />
-  <arg name="ensembler_decay" default="0.5" />
+  <arg name="ensembler_buffer_size" default="1" />
+  <arg name="ensembler_decay" default="0.1" />
+  <!-- Dynamic-scene ensembler gate: blend only while the CBF reports a moving
+       obstacle closing on the robot (/cbf_safety/env_hdot = max dynamic-hdot
+       tightening, m/s; zero for static scenes by deadband design — raw h
+       cannot be used, feeding rides h~0 in the bowl). Supersedes the constant
+       use_temporal_ensembler flag when true. Gate holds ensembler_gate_hold
+       seconds past the last reading above ensembler_env_hdot_on. -->
+  <arg name="ensembler_dynamic_gate" default="true" />
+  <arg name="ensembler_env_hdot_on" default="0.04" />
+  <arg name="ensembler_gate_hold" default="4.0" />
   <arg name="trajectory_retime_mode" default="joint_speed" />
-  <arg name="trajectory_retime_joint_speed" default="0.25" />
+  <arg name="trajectory_retime_joint_speed" default="0.30" />
   <arg name="trajectory_retime_joint_weights" default="1 1 1 1 1 1 1" />
   <arg name="trajectory_retime_min_segment_fraction" default="0.02" />
   <arg name="planner_exit_lift_enabled" default="false" />
@@ -90,7 +99,7 @@
   <arg name="commit_distance" default="0.00" />
   <arg name="cbf_kappa" default="5.0" />
   <arg name="cbf_recovery_kappa" default="5.0" />
-  <arg name="cbf_constraint_margin" default="0.001" />
+  <arg name="cbf_constraint_margin" default="0.01" />
   <arg name="cbf_recovery_switch_margin" default="0.015" />
   <arg name="cbf_enforce_final_constraint" default="true" />
   <arg name="cbf_integrate_from_current" default="true" />
@@ -101,7 +110,7 @@
   <arg name="cbf_max_command_lead" default="0.05" />
   <arg name="cbf_gradient_check_period" default="0.0" />
   <arg name="cbf_gradient_check_eps" default="0.001" />
-  <arg name="barrier_alpha" default="0.0005" />
+  <arg name="barrier_alpha" default="0.002" />
   <arg name="d_safe" default="0.015" />
   <arg name="cbf_publish_safety_envelope" default="true" />
   <arg name="cbf_safety_envelope_resolution" default="40" />
@@ -173,7 +182,7 @@
        robot's right side; the default sphere moves only along +Y. -->
   <arg name="moving_sphere_enabled" default="true" />
   <arg name="moving_sphere_initial_x" default="0.30" />
-  <arg name="moving_sphere_initial_y" default="-3.0" />
+  <arg name="moving_sphere_initial_y" default="-2.8" />
   <arg name="moving_sphere_initial_z" default="0.5" />
   <arg name="moving_sphere_velocity_x" default="0.0" />
   <arg name="moving_sphere_velocity_y" default="0.10" />
@@ -186,6 +195,15 @@
   <arg name="condition_target_hold_max_age" default="0.0" />
   <arg name="planner_hold_last_condition_on_loss" default="true" />
   <arg name="planner_condition_hold_max_age" default="0.0" />
+  <!-- Reference-state conditioning (OOD guard): the planner conditions the FM
+       model on the measured q clamped to +-clamp rad (per joint) around the
+       executor's nominal command, so a CBF evasion cannot drag the model input
+       off the training manifold; the CBF + tracking feedback absorb the real
+       deviation. Fork points in the conditioning cloud are re-posed to the
+       clamped state to stay consistent. 0.0 = legacy (condition on raw q). -->
+  <arg name="condition_reference_clamp" default="0.1" />
+  <arg name="condition_reference_timeout" default="0.5" />
+  <arg name="condition_fork_match_radius" default="0.02" />
   <arg name="max_joint_velocity" default="0.7" />
   <arg name="tcp_filter_radius" default="0.40" />
   <arg name="fork_filter_radius" default="0.3" />
@@ -223,6 +241,21 @@
   <arg name="cbf_multi_gradient_mode" default="analytical" />
   <arg name="cbf_multi_fd_eps" default="0.001" />
   <arg name="cbf_h_activate" default="0.1" />
+  <!-- Two-rate reflex brake: a ~1 kHz layer between the 100 Hz CBF-QP and the
+       velocity controller that extrapolates h(t) ~ h + grad_h^T dq dt under
+       the held command and scales the velocity down if the extrapolation
+       heads below h_stop. Converts the discrete-time CBF into something much
+       closer to its continuous-time guarantee without touching the QP budget.
+       Requires the direct velocity-controller mode (the default) and the
+       analytical/multi_graphed gradient path (also the default).
+       ON by default for feeding; enable_cbf_reflex:=false is the
+       100 Hz-only ablation arm. -->
+  <arg name="enable_cbf_reflex" default="true" />
+  <arg name="cbf_reflex_rate_hz" default="1000.0" />
+  <!-- No horizon arg: the reflex measures its own decision period and
+       certifies only that, so the guarantee no longer assumes the CBF
+       solves within a hand-set latency (see cbf_reflex_node.py). -->
+  <arg name="cbf_reflex_h_stop" default="0.0" />
   <!-- Barrier VALUE mode. soft = legacy Softmin value: under-reports clearance
        by the crowding bias tau*log(M_eff) (~15 mm when the dense moving-sphere
        cloud parks dozens of points within tau of the min), so the reported h
@@ -238,7 +271,7 @@
        scenes fall inside the deadband -> zero effect. -->
   <arg name="cbf_dynamic_hdot_enabled" default="true" />
   <arg name="cbf_dynamic_hdot_tau" default="0.05" />
-  <arg name="cbf_dynamic_hdot_deadband" default="0.05" />
+  <arg name="cbf_dynamic_hdot_deadband" default="0.01" />
   <arg name="cbf_dynamic_hdot_max" default="0.5" />
   <arg name="cbf_max_inward_speed" default="0.20" />
   <arg name="cbf_recovery_speed" default="0.05" />
@@ -250,8 +283,8 @@
        0.20 cap delivered 0.066 m/s of hdot and constr_final hit -0.086).
        0.45 converges within 2 of the 6 POCS sweeps; degenerate-gradient
        violence is still guarded by cbf_repair_grad_min + the denom gates. -->
-  <arg name="cbf_max_correction_speed" default="0.45" />
-  <arg name="cbf_recovery_max_correction_speed" default="0.55" />
+  <arg name="cbf_max_correction_speed" default="1.0" />
+  <arg name="cbf_recovery_max_correction_speed" default="1.5" />
   <arg name="cbf_projection_iters" default="3" />
   <arg name="cbf_projection_relaxation" default="1.0" />
   <arg name="cbf_tracking_feedback_mode" default="tangent_near" />
@@ -264,7 +297,7 @@
        go up" reflex is inappropriate near the person's face). -->
   <arg name="cbf_projection_metric" default="task" />
   <arg name="cbf_task_metric_lambda" default="0.01" />
-  <arg name="cbf_task_metric_rot_weight" default="0.05" />
+  <arg name="cbf_task_metric_rot_weight" default="0.5" />
   <arg name="cbf_task_metric_update_every" default="1" />
   <arg name="cbf_nullspace_clearance_gain" default="0.3" />
   <arg name="cbf_nullspace_clearance_h_activate" default="0.15" />
@@ -476,8 +509,15 @@
         <param name="wait_for_cbf_ready" value="$(arg planner_wait_for_cbf_ready)" />
         <param name="hold_last_condition_on_loss" value="$(arg planner_hold_last_condition_on_loss)" />
         <param name="condition_hold_max_age" value="$(arg planner_condition_hold_max_age)" />
+        <param name="condition_reference_clamp" value="$(arg condition_reference_clamp)" />
+        <param name="condition_reference_timeout" value="$(arg condition_reference_timeout)" />
+        <param name="condition_reference_topic" value="/planner/nominal_joint_command" />
+        <param name="condition_fork_match_radius" value="$(arg condition_fork_match_radius)" />
         <param name="ensembler_buffer_size" value="$(arg ensembler_buffer_size)" />
         <param name="ensembler_decay" value="$(arg ensembler_decay)" />
+        <param name="ensembler_dynamic_gate" value="$(arg ensembler_dynamic_gate)" />
+        <param name="ensembler_env_hdot_on" value="$(arg ensembler_env_hdot_on)" />
+        <param name="ensembler_gate_hold" value="$(arg ensembler_gate_hold)" />
         <param name="log_trajectory_timing" value="$(arg log_trajectory_timing)" />
         <param name="fm_use_torch_compile" value="$(arg fm_use_torch_compile)" />
         <!-- CASF integration: n_pred controls pure FM trajectory smoothness;
@@ -573,13 +613,21 @@
          barrier_alpha — softmin temperature: higher = smoother gradient direction (try 0.003–0.007)
          d_safe        — minimum clearance enforced by the QP (metres) -->
   <node name="cbf_safety_Bernstein" pkg="vision_processing" type="$(arg cbf_node_type)" output="screen" cwd="node">
+        <!-- With the reflex layer, the CBF's velocity command is intercepted
+             and the reflex node owns the real controller topic. -->
+        <remap from="/joint_group_velocity_controller/command"
+               to="/cbf_safety/pre_reflex_command"
+               if="$(arg enable_cbf_reflex)" />
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
         <param name="enable_cbf"               value="true" />
+        <param name="cbf_reflex_publish"       value="$(arg enable_cbf_reflex)" />
         <param name="publish_controller_command" value="$(arg use_direct_group_position_controller)" />
         <param name="publish_velocity_controller_command"
                value="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))" />
         <param name="rate_hz"      value="$(arg control_rate_hz)" />
         <param name="cbf_graph_points" value="$(arg cbf_graph_points)" />
+        <param name="cbf_graphed_control_step" value="$(arg cbf_graphed_control_step)" />
+          <param name="cbf_separate_streams"     value="$(arg cbf_separate_streams)" />
         <param name="preprocess_max_points" value="$(arg cbf_preprocess_max_points)" />
         <param name="cbf_candidate_filter" value="$(arg cbf_candidate_filter)" />
         <param name="cbf_prism_margin" value="$(arg cbf_prism_margin)" />
@@ -712,6 +760,21 @@
         <param name="cuda_memory_log_period" value="$(arg cuda_memory_log_period)" />
         <param name="nominal_hold_deadband" value="$(arg nominal_hold_deadband)" />
         <param name="cbf_ema_alpha" value="$(arg cbf_ema_alpha)" />
+  </node>
+
+  <!-- 8.5. Reflex brake layer (only with enable_cbf_reflex:=true).
+       Consumes the intercepted CBF velocity command plus
+       /cbf_safety/reflex_state (h, env_hdot, grad_h per link) and republishes
+       an alpha-scaled velocity to the real controller topic at ~1 kHz.
+       Pure brake: it can only shrink the QP-certified velocity, never steer,
+       so it cannot introduce new constraint violations. -->
+  <node name="cbf_reflex" pkg="vision_processing" type="cbf_reflex_node.py"
+        output="screen" if="$(arg enable_cbf_reflex)">
+        <param name="rate_hz"  value="$(arg cbf_reflex_rate_hz)" />
+        <param name="h_stop"   value="$(arg cbf_reflex_h_stop)" />
+        <param name="h_activate" value="$(arg cbf_h_activate)" />
+        <param name="in_velocity_topic"  value="/cbf_safety/pre_reflex_command" />
+        <param name="out_velocity_topic" value="/joint_group_velocity_controller/command" />
   </node>
 
   <!-- 9. Trajectory Controller Bridge.

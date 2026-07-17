@@ -5,17 +5,27 @@ Produces the thesis result figures from one experiment bag:
   1. h_soft(t) with zero line and CBF-active / escape shading
   2. Joint-velocity decomposition |dq_ff|, |dq_fb|, |dq_base|, |dq_cbf_delta|,
      |dq_escape|, |dq_safe|
-  3. Pre- vs post-filter safe velocity (low-pass effect)
+  3. Pre- vs post-filter safe velocity (low-pass effect); per-joint figures
+     include the MEASURED velocity from /joint_states when recorded
   4. Post-repair constraint residual (negative = CBF inequality violated
      after filtering/clamping)
-  5. Pipeline timing boxplot
+  5. Pipeline timing boxplot (+ the 1 kHz reflex layer's per-tick compute
+     time from /pipeline/timing/cbf_reflex_compute when recorded)
+  5b. Per-stage timing over time: one panel per /pipeline/timing/* topic,
+     raw samples + rolling median, to see WHEN each stage is slow
   6. Mode-flag timeline (cap_active, recovery, escape, repair, EMA)
+  6b. Reflex Lipschitz validation: the online empirical estimate against the
+     configured ~grad_lipschitz L (certificate assumption), + the brake alpha
 
 Usage:
     python3 plot_cbf_diagnostics.py run.bag [-o outdir] [--csv]
 
 Record with:
-    rosbag record /cbf_safety/diagnostics /cbf_safety/diagnostics_layout
+    rosbag record /cbf_safety/diagnostics /cbf_safety/diagnostics_layout \
+        /joint_states /cbf_reflex/status -e '/pipeline/timing/.*'
+
+/cbf_reflex/status is REQUIRED for the Lipschitz-validation figure (thesis:
+it is what justifies the value of L in the parameter table).
 """
 
 import argparse
@@ -31,6 +41,8 @@ DIAG_TOPIC = "/cbf_safety/diagnostics"
 LAYOUT_TOPIC = "/cbf_safety/diagnostics_layout"
 JOINTS_TOPIC = "/joint_states"
 OBSTACLES_TOPIC = "/perception/persistent_obstacles"
+REFLEX_STATUS_TOPIC = "/cbf_reflex/status"
+TIMING_NS = "/pipeline/timing/"
 PANDA_JOINTS = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
                 'panda_joint5', 'panda_joint6', 'panda_joint7']
 
@@ -97,6 +109,146 @@ def load_motion(path, t0):
                 obs_t.append(ts)
                 obs.append(pts.reshape(-1, 3))
     return np.asarray(t_q), np.asarray(q), np.asarray(obs_t), obs
+
+
+def load_extras(path, t0, velocity_source="fd"):
+    """One extra bag pass for the executed-motion / reflex-layer series.
+
+    Returns (t_v, dq_meas, reflex_compute_ms, reflex_period_ms):
+      t_v, dq_meas   — measured joint velocities [rad/s] from /joint_states.
+                       (None, None) if the topic is missing.
+      reflex_*_ms    — per-tick compute time / achieved loop period of the
+                       1 kHz reflex brake (cbf_reflex_node.py), empty arrays
+                       when the reflex layer was off or not recorded.
+
+    velocity_source: "fd" (default) differentiates the recorded POSITIONS
+    (centered difference); "field" trusts the JointState velocity field. The
+    default is fd because the Gazebo/ros_control velocity field is not
+    reliable here: on run1000, stationary joints (position drift 0.0003 rad
+    over 11 s) reported a sustained ~0.6 rad/s — the integral of the reported
+    velocity is wildly inconsistent with the recorded positions. Positions
+    are trustworthy, so their derivative is the honest executed speed.
+    """
+    t_v, vel, pos = [], [], []
+    reflex_compute, reflex_period = [], []
+    with rosbag.Bag(path) as bag:
+        for topic, msg, t in bag.read_messages(
+                topics=[JOINTS_TOPIC,
+                        "/pipeline/timing/cbf_reflex_compute",
+                        "/pipeline/timing/cbf_reflex_period"]):
+            if topic == JOINTS_TOPIC:
+                p = dict(zip(msg.name, msg.position))
+                if not all(j in p for j in PANDA_JOINTS):
+                    continue
+                v = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+                t_v.append(t.to_sec() - t0)
+                pos.append([p[j] for j in PANDA_JOINTS])
+                vel.append([v.get(j, np.nan) for j in PANDA_JOINTS])
+            elif topic.endswith("cbf_reflex_compute"):
+                reflex_compute.append(float(msg.data))
+            else:
+                reflex_period.append(float(msg.data))
+    reflex_compute = np.asarray(reflex_compute)
+    reflex_period = np.asarray(reflex_period)
+    if len(t_v) < 3:
+        return None, None, reflex_compute, reflex_period
+    t_v = np.asarray(t_v)
+    vel = np.asarray(vel)
+    if velocity_source == "fd" or np.all(np.isnan(vel)):
+        pos = np.asarray(pos)
+        vel = np.empty_like(pos)
+        # Centered difference; one-sided at the ends. Guard repeated stamps.
+        dt2 = t_v[2:] - t_v[:-2]
+        dt2[dt2 <= 0] = np.median(dt2[dt2 > 0]) if (dt2 > 0).any() else 2e-2
+        vel[1:-1] = (pos[2:] - pos[:-2]) / dt2[:, None]
+        vel[0] = vel[1]
+        vel[-1] = vel[-2]
+    return t_v, vel, reflex_compute, reflex_period
+
+
+def load_reflex_status(path, t0):
+    """Read /cbf_reflex/status = [alpha, h_pred_min, n_brake, age, L_emp].
+
+    L_emp is the reflex node's ONLINE Lipschitz monitor: per cycle, the max
+    over near-barrier rows of ||grad_h(q) - grad_h(q')|| / ||q - q'||. The
+    certified extrapolation assumes the configured ~grad_lipschitz L bounds
+    it, so this series is what validates (or refutes) that assumption.
+
+    Returns (t, alpha, h_pred, n_brake, age, L_emp); empty arrays when the
+    topic was not recorded (reflex off, or bag recorded without it).
+    """
+    t, rows = [], []
+    with rosbag.Bag(path) as bag:
+        for _, msg, ts in bag.read_messages(topics=[REFLEX_STATUS_TOPIC]):
+            d = list(msg.data)
+            if len(d) >= 5:
+                t.append(ts.to_sec() - t0)
+                rows.append(d[:5])
+    if not rows:
+        return (np.array([]),) * 6
+    a = np.asarray(rows, dtype=np.float64)
+    return (np.asarray(t), a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4])
+
+
+def load_pipeline_timing(path, t0):
+    """stage -> (t, ms) for every /pipeline/timing/<stage> topic in the bag.
+
+    The messages are std_msgs/Float64 (no header), so the bag receipt time is
+    the only timebase available; it is the same one the diagnostics use, so the
+    stages line up with the rest of the figures. Empty dict when the timing
+    topics were not recorded.
+    """
+    series = {}
+    with rosbag.Bag(path) as bag:
+        topics = [tp for tp in bag.get_type_and_topic_info().topics
+                  if tp.startswith(TIMING_NS)]
+        if not topics:
+            return {}
+        for topic, msg, ts in bag.read_messages(topics=topics):
+            t, v = series.setdefault(topic[len(TIMING_NS):], ([], []))
+            t.append(ts.to_sec() - t0)
+            v.append(float(msg.data))
+    return {k: (np.asarray(a), np.asarray(b, dtype=np.float64))
+            for k, (a, b) in series.items()}
+
+
+def rolling_median(v, window):
+    """Centered rolling median of v; returns None when the window does not fit."""
+    w = int(window) | 1  # odd, so the window is centered on the sample
+    if w < 3 or len(v) < w:
+        return None
+    padded = np.pad(v, w // 2, mode="edge")
+    win = np.lib.stride_tricks.sliding_window_view(padded, w)
+    return np.median(win, axis=1)
+
+
+def bin_average(t_grid, t_src, v_src):
+    """Anti-aliased downsample of (t_src, v_src[N,D]) onto t_grid.
+
+    Averages all source samples falling in each grid cell (cell edges at the
+    midpoints between grid points). Point-sampling (np.interp) a ~1 kHz
+    measured stream onto a decimated diagnostics timebase aliases controller
+    chatter into fake square waves; the per-cell mean is the honest picture.
+    Cells with no source sample fall back to linear interpolation.
+    """
+    edges = np.concatenate((
+        [t_grid[0] - 0.5 * (t_grid[1] - t_grid[0])],
+        0.5 * (t_grid[:-1] + t_grid[1:]),
+        [t_grid[-1] + 0.5 * (t_grid[-1] - t_grid[-2])]))
+    idx = np.digitize(t_src, edges) - 1
+    ok = (idx >= 0) & (idx < len(t_grid))
+    sums = np.zeros((len(t_grid), v_src.shape[1]))
+    counts = np.zeros(len(t_grid))
+    np.add.at(sums, idx[ok], v_src[ok])
+    np.add.at(counts, idx[ok], 1.0)
+    out = np.empty_like(sums)
+    filled = counts > 0
+    out[filled] = sums[filled] / counts[filled, None]
+    if not filled.all():
+        for j in range(v_src.shape[1]):
+            out[~filled, j] = np.interp(
+                t_grid[~filled], t_src, v_src[:, j])
+    return out
 
 
 def _rate(ts):
@@ -252,6 +404,20 @@ def main():
                          "true-clearance overlay on h_evolution")
     ap.add_argument("--no-real-distance", action="store_true",
                     help="skip the offline true-clearance overlay on h_evolution")
+    ap.add_argument("--measured-velocity", choices=("fd", "field"),
+                    default="fd",
+                    help="source for the executed joint speed in the per-joint "
+                         "figure: fd = differentiate recorded positions "
+                         "(default; the Gazebo JointState velocity field "
+                         "reports phantom speed on stationary joints), "
+                         "field = trust the JointState velocity field")
+    ap.add_argument("--grad-lipschitz", type=float, default=5.0,
+                    help="reflex ~grad_lipschitz L actually configured; drawn "
+                         "as the assumed bound against the online empirical "
+                         "estimate (/cbf_reflex/status[4])")
+    ap.add_argument("--no-timing", action="store_true",
+                    help="skip the per-stage /pipeline/timing/* time-series "
+                         "figure (it needs one extra bag pass)")
     ap.add_argument("--no-summary", action="store_true",
                     help="skip the printed summary of the other recorded topics "
                          "(joint_states, persistent_obstacles, pipeline timing)")
@@ -265,6 +431,18 @@ def main():
     t, s, t0 = load_bag(args.bag)
     if not args.no_summary:
         print_bag_summary(args.bag)
+    # Measured joint velocities + reflex-layer timing (one shared bag pass).
+    # The measured velocity is bin-averaged onto the diagnostics timebase:
+    # the /joint_states stream is one to two orders of magnitude denser than
+    # the (possibly decimated) diagnostics, and point-sampling it aliases.
+    t_v, dq_meas, reflex_ms, reflex_period_ms = load_extras(
+        args.bag, t0, velocity_source=args.measured_velocity)
+    dq_meas_at_t = None
+    if t_v is not None and len(t_v) > 2:
+        dq_meas_at_t = bin_average(t, t_v, dq_meas)
+    else:
+        print("[per_joint_velocity] /joint_states not in bag — measured "
+              "velocity overlay skipped.")
     general_dir = "run_diag"
     outdir = args.outdir or os.path.splitext(args.bag)[0] + "_diag"
     outdir = os.path.join(general_dir, outdir)
@@ -528,7 +706,10 @@ def main():
     # the CBF can brake, stop or REVERSE an individual joint, which the (always
     # positive) norm hides. One panel per joint shows the chain
     #   nominal  ->  after CBF projection  ->  commanded (filter + repair)
-    # together with the per-joint correction Delta_q_CBF that produced it.
+    # together with the per-joint correction Delta_q_CBF that produced it and,
+    # when /joint_states was recorded, the MEASURED velocity actually executed
+    # by the controller — the commanded-vs-real gap is the controller tracking
+    # error plus, with the reflex layer on, its alpha-braking.
     # Wider than the text column (landscape figure): 4 panels across the text
     # width are too narrow on the time axis, so use ~1.8x the width.
     fig, axes = plt.subplots(2, 4, figsize=(ts.TEXTWIDTH * 1.8, 4.6), sharex=True)
@@ -547,6 +728,10 @@ def main():
         ax.plot(t, s["dq_final"][:, j], color=ts.BLUE, lw=1.3, alpha=0.95,
                 solid_capstyle="round", solid_joinstyle="round",
                 label=r"$\dot{q}_{\mathrm{final}}$ (commandée)")
+        # Executed: what the robot actually did.
+        if dq_meas_at_t is not None:
+            ax.plot(t, dq_meas_at_t[:, j], color=ts.PURPLE, lw=0.9,
+                    alpha=0.85, label=r"$\dot{q}$ mesurée (réelle)")
         ax.set_title(f"Articulation {j + 1}", fontsize=9)
         if j % 4 == 0:
             ax.set_ylabel("[rad/s]")
@@ -629,18 +814,163 @@ def main():
     fig.tight_layout()
     ts.save(fig, outdir, "constraint_residual")
 
+    # 4b. Sampled-data QP margin m(dq) ---------------------------------------
+    # State-dependent ZOH tightening (~cbf_sampled_data_margin in the multicbf
+    # node): every constraint row is raised by m(dq) = (L/2)||dq||^2 T, the
+    # sampled-data CBF term that guarantees h >= 0 over the WHOLE hold, not
+    # just at sample instants. Because it scales with the commanded speed, its
+    # magnitude and variability ARE the story: (a) time series on the shared
+    # timebase with the same activity shading as the other figures, (b) its
+    # distribution over the run. Skipped for bags recorded before the field
+    # existed, or reported as inactive when the toggle was off (all-zero).
+    if "sampled_margin" in s:
+        m_sd = np.asarray(s["sampled_margin"], dtype=float)
+        finite_m = np.isfinite(m_sd)
+        if finite_m.any() and np.nanmax(m_sd) > 1e-9:
+            mm = m_sd * 1e3  # [mm/s] — readable axis for 0..80 mm/s values
+            m_mean = float(np.nanmean(mm))
+            m_std = float(np.nanstd(mm))
+            m_p95 = float(np.nanpercentile(mm[finite_m], 95))
+            m_max = float(np.nanmax(mm))
+            fig, axes = plt.subplots(
+                2, 1, figsize=(ts.TEXTWIDTH, 4.4),
+                gridspec_kw={"height_ratios": [2.0, 1.0]})
+
+            ax = axes[0]
+            ax.plot(t, mm, color=ts.BLUE, lw=1.0,
+                    label=r"$m(\dot{q})$ (marge échantillonnée)")
+            ax.axhline(m_mean, color=ts.ORANGE, lw=1.0, ls="--",
+                       label=rf"moyenne $= {m_mean:.1f}$ mm/s")
+            ax.axhline(m_max, color=ts.GREY, lw=0.9, ls=":",
+                       label=rf"max $= {m_max:.1f}$ mm/s")
+            shade_active(ax, t, cbf_active, ts.GREEN, "projection CBF")
+            shade_active(ax, t, escape, ts.PURPLE, "échappement")
+            ax.set_xlabel("t [s]")
+            ax.set_ylabel(r"$m(\dot{q})$ [mm/s]")
+            ax.set_ylim(bottom=0.0)
+            ts.legend_top(ax, ncol=2)
+            ts.panel_label(ax, "(a)")
+
+            ax = axes[1]
+            ax.hist(mm[finite_m], bins=40, color=ts.BLUE, alpha=0.75)
+            ax.axvline(m_mean, color=ts.ORANGE, lw=1.0, ls="--")
+            ax.axvline(m_p95, color=ts.GREY, lw=0.9, ls=":")
+            ax.axvline(m_max, color=ts.GREY, lw=0.9, ls="-")
+            ax.set_xlabel(r"$m(\dot{q})$ [mm/s]")
+            ax.set_ylabel("cycles")
+            ts.stats_box(ax, "moyenne %.1f | é.-t. %.1f | p95 %.1f | "
+                             "max %.1f mm/s"
+                         % (m_mean, m_std, m_p95, m_max))
+            ts.panel_label(ax, "(b)")
+
+            fig.tight_layout()
+            ts.save(fig, outdir, "sampled_margin")
+        else:
+            print("[sampled_margin] field present but all-zero — "
+                  "cbf_sampled_data_margin was off for this run.")
+    else:
+        print("[sampled_margin] not in bag layout (older node) — skipping "
+              "the sampled-data margin figure.")
+
     # 5. Timing boxplot ------------------------------------------------------
+    # When the 1 kHz reflex layer ran, its per-tick compute time is appended
+    # as a fourth box (sampled on /pipeline/timing/cbf_reflex_compute). Same
+    # linear axis on purpose: the visual point is that the brake costs
+    # near-nothing next to the QP cycle ("heavy decision slow, cheap brake
+    # fast").
+    timing_data = [s[k][~np.isnan(s[k])] for k in
+                   ("cbf_ms", "q_cmd_ms", "total_ms")]
+    timing_labels = ["CBF", "commande", "total"]
+    if len(reflex_ms):
+        timing_data.append(reflex_ms)
+        timing_labels.append("réflexe\n(1 kHz)")
     fig, ax = plt.subplots(figsize=(3.8, 2.8))
-    keys = ["cbf_ms", "q_cmd_ms", "total_ms"]
-    bp = ax.boxplot([s[k][~np.isnan(s[k])] for k in keys],
+    bp = ax.boxplot(timing_data,
                     showfliers=False, patch_artist=True,
                     medianprops=dict(color=ts.ORANGE))
     for box in bp["boxes"]:
         box.set(facecolor="white", edgecolor=ts.BLUE)
-    ax.set_xticklabels(["CBF", "commande", "total"])
+    ax.set_xticklabels(timing_labels)
     ax.set_ylabel("temps de cycle [ms]")
     fig.tight_layout()
     ts.save(fig, outdir, "timing_boxplot")
+
+    # 5b. Per-stage timing over time -----------------------------------------
+    # The boxplot above collapses each stage to a distribution; this figure keeps
+    # the time axis, so WHEN a stage is slow is visible (warm-up, a burst while
+    # the obstacle set switches, a stage that drifts as the cloud grows) and not
+    # just how often. One panel per /pipeline/timing/* topic, stages ordered and
+    # colored by pipeline group (perception / planning / safety), sharing the
+    # time axis with every other figure. Each y axis is independent — the panels
+    # answer "how much does THIS stage vary", and the annotated median/p95/max
+    # carry the magnitude needed to compare across panels; a shared axis would
+    # flatten every cheap stage into a line at zero next to the FM generation.
+    if not args.no_timing:
+        timing_series = load_pipeline_timing(args.bag, t0)
+    else:
+        timing_series = {}
+    if timing_series:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from decode_pipeline_timing import ordered_stages
+        group_color = {"perception": ts.GREEN, "planning": ts.BLUE,
+                       "safety": ts.ORANGE, "other": ts.GREY}
+        # A stage that published nothing but zeros was compiled out of the run
+        # (e.g. fm_correction / casf_warp on a non-CASF pipeline); it has no
+        # variation to show, so it gets a line of text instead of a panel.
+        off = sorted(k for k, (_, v) in timing_series.items()
+                     if np.allclose(v, 0.0))
+        active = {k: v for k, v in timing_series.items() if k not in off}
+        if off:
+            print(f"[timing_per_stage] stages inactive (all-zero), not "
+                  f"plotted: {', '.join(off)}")
+        pairs = ordered_stages(active)
+        ncol = 3
+        nrow = int(np.ceil(len(pairs) / ncol))
+        fig, axes = plt.subplots(nrow, ncol, sharex=True,
+                                 figsize=(ts.TEXTWIDTH * 1.8, 1.6 * nrow + 0.9),
+                                 squeeze=False)
+        axes_flat = axes.ravel()
+        for k, (group, stage) in enumerate(pairs):
+            ax = axes_flat[k]
+            t_s, v_s = active[stage]
+            color = group_color[group]
+            # Raw samples faint, rolling median on top: the 1 kHz reflex stage
+            # has ~3 orders of magnitude more samples than the 8 Hz planner, so
+            # the raw trace alone is an unreadable band for the dense stages.
+            ax.plot(t_s, v_s, color=color, lw=0.6, alpha=0.35)
+            med = rolling_median(v_s, max(3, len(v_s) // 200))
+            if med is not None:
+                ax.plot(t_s, med, color=color, lw=1.2)
+            p95 = float(np.percentile(v_s, 95))
+            ax.axhline(p95, color=ts.GREY, lw=0.8, ls=":")
+            ax.set_title(stage, fontsize=9, color=color)
+            ax.set_ylim(bottom=0.0)
+            ts.stats_box(ax, "méd %.2f | p95 %.2f | max %.2f ms"
+                         % (np.median(v_s), p95, v_s.max()))
+            if k % ncol == 0:
+                ax.set_ylabel("[ms]")
+        for k in range(len(pairs), len(axes_flat)):
+            axes_flat[k].axis("off")
+        # sharex hides the ticks on every non-bottom row, but the last row can be
+        # partly disabled, so re-enable them on the lowest live panel per column.
+        for c in range(ncol):
+            col = [k for k in range(len(pairs)) if k % ncol == c]
+            if col:
+                axes_flat[col[-1]].set_xlabel("t [s]")
+                axes_flat[col[-1]].tick_params(labelbottom=True)
+        from matplotlib.lines import Line2D
+        present = {g for g, _ in pairs}
+        handles = [Line2D([], [], color=group_color[g], lw=1.4, label=g)
+                   for g in ("perception", "planning", "safety", "other")
+                   if g in present]
+        handles.append(Line2D([], [], color=ts.GREY, lw=0.8, ls=":", label="p95"))
+        fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.0, 1.0),
+                   ncol=len(handles), frameon=False, fontsize=9)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        ts.save(fig, outdir, "timing_per_stage")
+    elif not args.no_timing:
+        print("[timing_per_stage] no /pipeline/timing/* topics in bag — record "
+              "with: rosbag record -e '/pipeline/timing/.*'")
 
     # 6. Mode flags ----------------------------------------------------------
     flags = ["cap_active", "recovery_used", "grad_degenerate",
@@ -654,6 +984,49 @@ def main():
     ax.set_xlabel("t [s]")
     fig.tight_layout()
     ts.save(fig, outdir, "mode_flags")
+
+    # 6b. Reflex layer: Lipschitz assumption + braking activity ---------------
+    # Panel (a) validates certificate assumption (ii) of Section 4.x: the
+    # configured L must upper-bound the empirical gradient-Lipschitz estimate
+    # on the near-barrier rows. Transient spikes are critical-point switches
+    # (expected, and outside the smoothness assumption); the bulk must sit
+    # below the line. Panel (b) shows what the brake actually did.
+    (t_rfx, rfx_alpha, _rfx_hpred, _rfx_nbrake,
+     _rfx_age, rfx_L) = load_reflex_status(args.bag, t0)
+    if len(t_rfx) > 2:
+        L_cfg = args.grad_lipschitz
+        finite = np.isfinite(rfx_L) & (rfx_L > 0)
+        fig, axes = plt.subplots(2, 1, figsize=(ts.TEXTWIDTH, 4.4), sharex=True)
+
+        ax = axes[0]
+        ax.plot(t_rfx, rfx_L, color=ts.BLUE, lw=0.9,
+                label=r"$\hat{L}$ empirique (en ligne)")
+        ax.axhline(L_cfg, color=ts.ORANGE, lw=1.2, ls="--",
+                   label=rf"$L$ retenu $= {L_cfg:g}$")
+        if finite.any():
+            p99 = float(np.percentile(rfx_L[finite], 99))
+            ax.axhline(p99, color=ts.GREY, lw=0.9, ls=":",
+                       label=rf"p99 $= {p99:.2f}$")
+            above = 100.0 * float(np.mean(rfx_L[finite] > L_cfg))
+            ts.stats_box(ax, f"dépassements : {above:.2f} % des cycles")
+        ax.set_ylabel(r"[m/rad$^2$]")
+        ax.set_yscale("log")
+        ts.legend_top(ax, ncol=3)
+        ts.panel_label(ax, "(a)")
+
+        ax = axes[1]
+        ax.plot(t_rfx, rfx_alpha, color=ts.BLUE, lw=0.9)
+        ax.axhline(1.0, color="k", lw=0.6, ls="--")
+        ax.set_ylim(-0.05, 1.1)
+        ax.set_xlabel("t [s]")
+        ax.set_ylabel(r"$\alpha$ du frein")
+        ts.panel_label(ax, "(b)")
+
+        fig.tight_layout()
+        ts.save(fig, outdir, "reflex_lipschitz")
+    else:
+        print("[reflex_lipschitz] /cbf_reflex/status not in bag — record it "
+              "to validate the Lipschitz constant L (reflex must be on).")
 
     # 7. Commanded vs executed h-rate (multicbf nodes only) -------------------
     if "real_hdot" in s and not np.all(np.isnan(s["real_hdot"])):
@@ -695,6 +1068,41 @@ def main():
         "p99_total_ms": float(np.nanpercentile(
             s["total_ms"][~np.isnan(s["total_ms"])], 99)),
     }
+    if "sampled_margin" in s:
+        m_sd = np.asarray(s["sampled_margin"], dtype=float)
+        fin_m = np.isfinite(m_sd)
+        if fin_m.any() and np.nanmax(m_sd) > 1e-9:
+            summary["sampled_margin_mean"] = float(np.nanmean(m_sd))
+            summary["sampled_margin_std"] = float(np.nanstd(m_sd))
+            summary["sampled_margin_p95"] = float(
+                np.nanpercentile(m_sd[fin_m], 95))
+            summary["sampled_margin_max"] = float(np.nanmax(m_sd))
+    if len(t_rfx) > 2:
+        fin = np.isfinite(rfx_L) & (rfx_L > 0)
+        if fin.any():
+            summary["reflex_L_configured"] = float(args.grad_lipschitz)
+            summary["reflex_L_emp_median"] = float(np.median(rfx_L[fin]))
+            summary["reflex_L_emp_p95"] = float(np.percentile(rfx_L[fin], 95))
+            summary["reflex_L_emp_p99"] = float(np.percentile(rfx_L[fin], 99))
+            summary["reflex_L_emp_max"] = float(np.max(rfx_L[fin]))
+            summary["reflex_L_exceed_pct"] = 100.0 * float(
+                np.mean(rfx_L[fin] > args.grad_lipschitz))
+        summary["reflex_alpha_min"] = float(np.min(rfx_alpha))
+        summary["reflex_alpha_braking_pct"] = 100.0 * float(
+            np.mean(rfx_alpha < 0.999))
+    if len(reflex_ms):
+        summary["reflex_mean_compute_ms"] = float(np.mean(reflex_ms))
+        summary["reflex_p99_compute_ms"] = float(np.percentile(reflex_ms, 99))
+    if len(reflex_period_ms):
+        # Achieved reflex loop rate: 1 kHz is the target; Python+rospy jitter
+        # shows up here (thesis honesty number for the two-rate design).
+        summary["reflex_median_period_ms"] = float(np.median(reflex_period_ms))
+        summary["reflex_achieved_rate_hz"] = float(
+            1000.0 / np.median(reflex_period_ms))
+    if dq_meas_at_t is not None:
+        # Command-tracking gap: RMS of measured minus commanded velocity.
+        summary["rms_meas_vs_cmd_radps"] = float(np.sqrt(np.nanmean(
+            (dq_meas_at_t - s["dq_final"]) ** 2)))
     # Necessity of each low-pass: ratio of commanded-acceleration RMS before vs
     # after the filter (a chatter/jerk proxy). >1 means the filter smooths the
     # command; the larger the ratio the more the unfiltered command would have

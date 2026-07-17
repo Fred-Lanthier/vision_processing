@@ -1,0 +1,581 @@
+<?xml version="1.0"?>
+<!-- PICK-AND-PLACE pipeline, xARM7 CROSS-EMBODIMENT variant.
+     Same pipeline as green_cube_feeding_casf_pp.launch, but the robot is an
+     xArm7 with the FRANKA HAND welded on the flange (urdf/xarm7_pickplace.xacro):
+     the FM policy, its conditioning cloud (panda hand at the TCP), the gripper
+     width cue and the /franka_gripper grasp chain are byte-identical to the
+     panda run; only the arm embodiment (kinematics + per-link Bernstein SDFs
+     xarm7_link*_w.pt) changes. Thesis experiment: arm-embodiment transfer.
+
+     (Original header follows.)
+     PICK-AND-PLACE pipeline (Stages B-C wired; D/E = obstacle stage).
+     `_pp` copy spirit of green_cube_feeding_casf.launch, reusing the SAME system
+     for the pick-and-place policy. The feeding launch is left untouched.
+
+     Data path wired here:
+       static cam -> sam3_sam2_node_pp (red cube + brown box) -> 2 masks
+       -> 2x point_cloud_projector (target_cube / target_box)
+       -> condition_pcd_pickplace (gripper + cube + box, world frame)
+       -> casf_generative_node_PC_pp (controlled_link:=panda_TCP, pickplace ckpt)
+       -> /planner/nominal_trajectory  (+ RViz viz)
+
+     execute:=true also runs trajectory_executor -> CBF velocity safety shield
+     -> joint_group_velocity_controller. The PP obstacle stage uses a static
+     cylinder cloud, leaving the feeding launch and shared perception code alone. -->
+<launch>
+  <arg name="gui" default="true"/>
+  <arg name="launch_sam3_server" default="true"/>
+  <arg name="launch_rviz" default="true"/>
+  <arg name="execute" default="true"/>
+  <arg name="venv_python" default="/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3"/>
+  <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True"/>
+
+  <arg name="cube_prompt" default="red cube"/>
+  <arg name="box_prompt"  default="white box"/>
+  <!-- Cube conditioning source. false = SAM/depth cloud; true = analytic cloud
+       at the ground-truth Gazebo pose ("perfect SAM": exact pose/segmentation,
+       camera-visible faces only by default, see gt_cube_cloud_node ~visible_only).
+       The SAM pipeline keeps running either way; only the conditioning node's
+       cube input switches. -->
+  <arg name="use_gt_cube" default="false"/>
+  <arg name="pickplace_model_name" default="best_fm_model_pickplace_10D_1024_rdn.ckpt"/>
+  <arg name="condition_num_points" default="1024"/>
+  <arg name="planner_rate_hz" default="3"/>
+  <arg name="control_rate_hz" default="100.0"/>
+  <arg name="max_joint_velocity" default="0.7"/>
+  <arg name="single_shot" default="false"/>
+  <!-- true (default): effort-driven arm (real contact physics). false: kinematic
+       SetPosition arm (known-good baseline, no collisions). Toggle for A/B debug:
+       roslaunch ... arm_effort_mode:=false -->
+  <arg name="arm_effort_mode" default="false"/>
+  <!-- MUST be false: the FM policy conditions on the MEASURED TCP (pcd centered
+       at pos_fork from current joints), so the executed trajectory must be
+       anchored at the measured pose too. anchor_from_commanded=true pins the
+       plan onto the commanded pose, which in effort mode diverges from measured
+       by up to ~0.74 m (runxarm003: wp0 anchor error grew to 742 mm while the
+       IK hit the FM target wpLast at 0 mm) -> the FM then predicts the TCP below
+       the table. The wrist wind-up this was meant to fix is now handled by the
+       fast_ik joint-limit avoidance instead. -->
+  <arg name="anchor_from_commanded" default="false"/>
+
+  <!-- Static PP CBF obstacle. Coordinates are in the robot/table frame; Gazebo
+       spawn adds the table-top z offset internally. -->
+  <arg name="obstacle_enabled" default="true"/>
+  <arg name="obstacle_shape" default="prism"/>
+  <arg name="obstacle_x" default="0.535"/>
+  <arg name="obstacle_y" default="-0.190"/>
+  <!-- Local +Y faces the red cube by default. This matters for the crescent. -->
+  <arg name="obstacle_yaw" default="-0.160"/>
+  <arg name="obstacle_radius" default="0.040"/>
+  <arg name="obstacle_height" default="0.360"/>
+  <arg name="obstacle_prism_size_x" default="0.200"/>
+  <arg name="obstacle_prism_size_y" default="0.060"/>
+  <arg name="obstacle_prism_height" default="0.360"/>
+  <!-- Gazebo world z for the obstacle center. Table top is z=0.75, so the
+       default keeps the selected obstacle resting on the table. -->
+  <arg name="obstacle_gazebo_z"
+       default="$(eval 0.75 + 0.5 * (float(arg('obstacle_prism_height')) if arg('obstacle_shape') == 'prism' else float(arg('obstacle_height'))))"/>
+  <arg name="obstacle_crescent_outer_radius" default="0.055"/>
+  <arg name="obstacle_crescent_inner_radius" default="0.055"/>
+  <arg name="obstacle_crescent_bite_offset" default="0.030"/>
+  <arg name="obstacle_cloud_points" default="1000"/>
+  <arg name="obstacle_cloud_topic" default="/perception/cleaned_obstacles"/>
+  <arg name="obstacle_cloud_extra_topic" default="/perception/persistent_obstacles"/>
+  <!-- Camera-independent moving obstacle, same idea as green_cube_feeding_casf:
+       it is added to the published obstacle cloud without leaving a stale trail. -->
+  <arg name="moving_sphere_enabled" default="true"/>
+  <arg name="moving_sphere_initial_x" default="0.10"/>
+  <arg name="moving_sphere_initial_y" default="-0.190"/>
+  <arg name="moving_sphere_initial_z" default="0.55"/>
+  <arg name="moving_sphere_velocity_x" default="0.0"/>
+  <arg name="moving_sphere_velocity_y" default="0.0"/>
+  <arg name="moving_sphere_velocity_z" default="0.0"/>
+  <arg name="moving_sphere_radius" default="0.08"/>
+  <arg name="moving_sphere_num_points" default="1000"/>
+  <!-- Mirror the virtual sphere into Gazebo as a visual-only (collision-free)
+       model so it is visible there too, not just in RViz. -->
+  <arg name="moving_sphere_gazebo_mirror" default="true"/>
+
+  <!-- Online CBF tuning, matching the tested feeding values where applicable. -->
+  <arg name="enable_cbf" default="true"/>
+  <arg name="cbf_node_type" default="cbf_safety_node_Bernstein_multicbf.py"/>
+  <arg name="cbf_graph_points" default="100"/>
+  <arg name="cbf_preprocess_max_points" default="4096"/>
+  <arg name="cbf_candidate_filter" default="sdf"/>
+  <arg name="cbf_selection_metric" default="sdf"/>
+  <arg name="cbf_cluster_mode" default="topk"/>
+  <arg name="cbf_sdf_candidate_max_dist" default="0.35"/>
+  <arg name="cbf_sdf_prune_chunk_size" default="2048"/>
+  <arg name="cbf_sdf_self_filter_margin" default="-0.05"/>
+  <arg name="cbf_sdf_prefilter_radius" default="0.4"/>
+  <arg name="cbf_sdf_prefilter_max_points" default="4096"/>
+  <!-- PP needs the obstacle shield on the whole gripper/arm body. fast_tangent
+       collapses the analytical per-link barriers to only the current min link;
+       multi_graphed keeps the CUDA-graph speed while projecting through the
+       selected per-link half-spaces. There are 9 protected PP links below. -->
+  <arg name="cbf_solver_mode" default="multi_graphed"/>
+  <arg name="cbf_active_constraints" default="9"/>
+  <!-- Run the 100 Hz control loop on a high-priority CUDA stream, separate
+       from the ~30 Hz preprocess stream, so the command D2H readback stops
+       waiting behind the whole-body SDF batches under SAM2/FM contention
+       (runPP100: cbf_total p50 ~16 ms, loop at ~33 Hz effective). -->
+  <arg name="cbf_separate_streams" default="true"/>
+  <!-- Capture the ENTIRE per-cycle correction+command pipeline in the CUDA
+       graph (escape/clearance compose, solve, dynamic hdot, repair,
+       integration, command fill): one replay instead of ~90 eager ops. The
+       eager loop was dispatch/GIL-bound under SAM2+FM contention (~80 us per
+       op, cbf_correction p50 16 ms with the GPU idle at readback). -->
+  <arg name="cbf_graphed_control_step" default="true"/>
+  <!-- POCS sweeps over the active per-link half-space constraints. -->
+  <arg name="cbf_constraint_sweeps" default="6"/>
+  <arg name="cbf_final_constraint_mode" default="solver_bound"/>
+  <arg name="cbf_multi_gradient_mode" default="analytical"/>
+  <arg name="cbf_multi_fd_eps" default="0.001"/>
+  <arg name="cbf_kappa" default="5.0"/>
+  <arg name="cbf_recovery_kappa" default="5.0"/>
+  <arg name="cbf_constraint_margin" default="0.001"/>
+  <arg name="cbf_recovery_switch_margin" default="0.015"/>
+  <arg name="cbf_enforce_final_constraint" default="true"/>
+  <arg name="cbf_command_dt" default="0.05"/>
+  <arg name="cbf_direct_position_mode" default="integrated"/>
+  <arg name="cbf_position_correction_dt" default="0.02"/>
+  <arg name="cbf_max_command_lead" default="0.05"/>
+  <arg name="cbf_h_activate" default="0.08"/>
+  <arg name="cbf_max_inward_speed" default="0.3"/>
+  <arg name="cbf_recovery_speed" default="0.05"/>
+  <arg name="cbf_recovery_depth" default="0.015"/>
+  <!-- Raised from 0.3: the task-metric correction has larger joint-space
+       norms, and the dynamic-hdot bound needs correction authority scaling
+       with obstacle speed (see run101 constr_final analysis in feeding). -->
+  <arg name="cbf_max_correction_speed" default="0.5"/>
+  <arg name="cbf_recovery_max_correction_speed" default="0.5"/>
+  <arg name="cbf_repair_grad_min" default="0.03"/>
+  <arg name="cbf_projection_iters" default="3"/>
+  <arg name="cbf_projection_relaxation" default="1.0"/>
+  <arg name="cbf_tracking_feedback_mode" default="tangent_near"/>
+  <!-- QP projection metric ablation. identity = legacy Euclidean min-norm
+       (correction lands on the joint with the largest moment arm on the
+       barrier, e.g. joint 2 pulling the shoulder back in runPP13). task =
+       weighted by W^-1 with W = Jp^T Jp + w_rot Jo^T Jo + lambda I of the
+       controlled link (panda_TCP): the same half-space is enforced, but the
+       correction prefers the TCP null space (elbow swivel), minimizing the
+       deviation of the executed TCP path from the FM nominal. -->
+  <arg name="cbf_projection_metric" default="task"/>
+  <arg name="cbf_task_metric_lambda" default="0.01"/>
+  <arg name="cbf_task_metric_rot_weight" default="0.05"/>
+  <arg name="cbf_task_metric_update_every" default="1"/>
+  <!-- Active null-space clearance: the QP only cancels inward velocity, so a
+       nominal pushing a body link at an obstacle parks the arm at h~0 forever.
+       This drive adds gain * proximity * N grad_h BEFORE the QP: the posture
+       deforms away from the critical obstacle (elbow swivel, TCP unchanged)
+       as soon as h < the activate distance, unblocking the path instead of
+       stalling on it. The swivel speed tops out at the gain [rad/s]. 0 = off.
+       Requires cbf_projection_metric task. -->
+  <arg name="cbf_nullspace_clearance_gain" default="0.3"/>
+  <arg name="cbf_nullspace_clearance_h_activate" default="0.15"/>
+  <!-- CASF Riemannian warp kept OFF: too slow at runtime. TCP-path blocks are
+       handled reactively instead, by the CBF escape with the probed
+       tangential direction (below). -->
+  <arg name="enable_casf_correction" default="false"/>
+  <!-- Deadlock escape for obstacles blocking the TCP path itself (runPP14:
+       cube->box transport pinned 40 s at the prism wall; the barrier gradient
+       only pushes BACK, and null-space deformation has no authority on a
+       hand-borne constraint). When stuck near the barrier, add a velocity
+       TANGENT to the barrier (g^T dq = 0, so it costs nothing in safety, and
+       the QP still filters it against all other links). The DIRECTION is
+       chosen by the sampled-clearance probe (probe_enabled): K tangent-plane
+       directions are virtually stepped by probe_radii and scored by clearance
+       against the obstacle cloud + nominal-velocity alignment + a commitment
+       bonus (hysteresis, no side-flipping) - a floor penalty (the table is
+       not in the cloud). Runs at ~30 Hz in the preprocess thread; the 100 Hz
+       graph consumes the staged joint row unchanged. probe_enabled false
+       falls back to the old fixed +z lift. lift_gain stays the authority
+       [rad/s]. Deactivates at h > h_release. -->
+  <arg name="cbf_escape_enabled" default="true"/>
+  <arg name="cbf_escape_h_trigger" default="0.02"/>
+  <arg name="cbf_escape_h_release" default="0.05"/>
+  <arg name="cbf_escape_lift_gain" default="0.2"/>
+  <arg name="cbf_escape_max_velocity" default="0.15"/>
+  <arg name="cbf_escape_probe_enabled" default="true"/>
+  <arg name="cbf_escape_probe_num_dirs" default="16"/>
+  <arg name="cbf_escape_probe_radii" default="0.05 0.10"/>
+  <arg name="cbf_escape_probe_clearance_cap" default="0.20"/>
+  <arg name="cbf_escape_probe_goal_weight" default="0.02"/>
+  <arg name="cbf_escape_probe_commit_weight" default="0.02"/>
+  <!-- Table top is z=0 in the CBF/world frame here. -->
+  <arg name="cbf_escape_probe_min_z" default="0.03"/>
+  <arg name="cbf_escape_probe_ema" default="0.3"/>
+  <!-- Tabu re-vote for concave obstacles (crescent bite): if the committed
+       escape direction yields < tabu_min_progress of TCP motion along itself
+       for tabu_timeout seconds (QP-clipped: wedged), it is penalized for
+       tabu_ttl seconds and the probe re-votes. Progress = displacement along
+       the direction, not h (a good tangential escape slides at h~trigger). -->
+  <arg name="cbf_escape_probe_tabu_timeout" default="1.5"/>
+  <arg name="cbf_escape_probe_tabu_min_progress" default="0.03"/>
+  <arg name="cbf_escape_probe_tabu_weight" default="0.1"/>
+  <arg name="cbf_escape_probe_tabu_ttl" default="8.0"/>
+  <!-- Exact hard-min barrier VALUE (Softmin keeps supplying the gradient):
+       the PP obstacle clouds are dense/synthetic, so the Softmin crowding
+       bias otherwise under-reports clearance. + time-varying CBF tightening
+       for a moving sphere (inert while the sphere velocity is 0). -->
+  <arg name="cbf_barrier_value_mode" default="soft"/>
+  <arg name="cbf_dynamic_hdot_enabled" default="true"/>
+  <arg name="cbf_dynamic_hdot_tau" default="0.05"/>
+  <arg name="cbf_dynamic_hdot_deadband" default="0.05"/>
+  <arg name="cbf_dynamic_hdot_max" default="0.5"/>
+  <arg name="cbf_passthrough_when_inactive" default="true"/>
+  <arg name="cbf_monitor_only" default="false"/>
+  <arg name="cbf_filter_tau" default="0.08"/>
+  <arg name="cbf_velocity_filter_tau" default="0.1"/>
+  <arg name="cbf_diagnostics_decimation" default="4"/>
+  <arg name="barrier_alpha" default="0.002"/>
+  <arg name="d_safe" default="0.015"/>
+
+  <!-- Trajectory retiming (was using the planner's internal defaults: joint_speed
+       @ 0.25 rad/s = slow). Raise trajectory_retime_joint_speed to go faster; the
+       max joint then moves at this rad/s. Keep it <= the tracker's
+       max_joint_velocity (0.7) or the arm lags the nominal. -->
+  <arg name="trajectory_retime_mode" default="joint_speed"/>
+  <arg name="trajectory_retime_joint_speed" default="0.3"/>
+  <arg name="trajectory_retime_joint_weights" default="1 1 1 1 1 1 1"/>
+  <arg name="trajectory_retime_min_segment_fraction" default="0.02"/>
+  <arg name="trajectory_waypoint_rate_hz" default="10.0"/>
+
+  <!-- Temporal ensembler: the FM pick-place policy is MULTIMODAL (offline you see
+       up- and down-branches from the same scene). Re-querying it every cycle lets
+       it flip mode at the grasp/bottom. Ensembling blends each future timestep over
+       the last few plans (weight = exp(-decay * age_s)) so an occasional off-mode
+       sample is outvoted by the consistent one. Set false to A/B the raw policy. -->
+  <arg name="use_temporal_ensembler" default="false"/>
+  <arg name="ensembler_buffer_size" default="5"/>
+  <arg name="ensembler_decay" default="1.5"/>
+  <arg name="trajectory_command_lookahead_time" default="0.05"/>
+
+  <!-- Static-camera topics (perception runs on the STATIC cam this time). -->
+  <arg name="static_rgb_topic"   default="/camera_static/color/image_raw"/>
+  <arg name="static_depth_topic" default="/camera_static/aligned_depth_to_color/image_raw"/>
+  <arg name="static_info_topic"  default="/camera_static/color/camera_info"/>
+  <arg name="static_cam_frame"   default="camera_static_optical_frame"/>
+
+  <!-- 0. Gazebo env + gripper Panda + cameras + velocity controller + sam3_server -->
+  <include file="$(find vision_processing)/launch/pickplace_simulation_xarm.launch">
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="launch_sam3_server" value="$(arg launch_sam3_server)"/>
+    <arg name="use_direct_group_velocity_controller" value="true"/>
+    <arg name="arm_effort_mode" value="$(arg arm_effort_mode)"/>
+    <arg name="obstacle_enabled" value="$(arg obstacle_enabled)"/>
+    <arg name="obstacle_shape" value="$(arg obstacle_shape)"/>
+    <arg name="obstacle_x" value="$(arg obstacle_x)"/>
+    <arg name="obstacle_y" value="$(arg obstacle_y)"/>
+    <arg name="obstacle_yaw" value="$(arg obstacle_yaw)"/>
+    <arg name="obstacle_radius" value="$(arg obstacle_radius)"/>
+    <arg name="obstacle_height" value="$(arg obstacle_height)"/>
+    <arg name="obstacle_prism_height" value="$(arg obstacle_prism_height)"/>
+    <arg name="obstacle_gazebo_z" value="$(arg obstacle_gazebo_z)"/>
+    <arg name="obstacle_prism_size_x" value="$(arg obstacle_prism_size_x)"/>
+    <arg name="obstacle_prism_size_y" value="$(arg obstacle_prism_size_y)"/>
+  </include>
+
+  <!-- 0.5. Camera-independent obstacle cloud for the online CBF. This mirrors
+       the spawned static obstacle and can add a synthetic moving sphere in the
+       robot/table world frame. -->
+  <node name="pp_static_obstacle" pkg="vision_processing"
+        type="static_cylinder_obstacle_pp.py" output="screen"
+        if="$(arg obstacle_enabled)">
+        <param name="frame_id" value="world"/>
+        <param name="shape" value="$(arg obstacle_shape)"/>
+        <param name="topic" value="$(arg obstacle_cloud_topic)"/>
+        <param name="extra_topic" value="$(arg obstacle_cloud_extra_topic)"/>
+        <param name="center_x" value="$(arg obstacle_x)"/>
+        <param name="center_y" value="$(arg obstacle_y)"/>
+        <param name="yaw" value="$(arg obstacle_yaw)"/>
+        <param name="base_z" value="0.0"/>
+        <param name="radius" value="$(arg obstacle_radius)"/>
+        <param name="height"
+               value="$(eval float(arg('obstacle_prism_height')) if arg('obstacle_shape') == 'prism' else float(arg('obstacle_height')))"/>
+        <param name="prism_size_x" value="$(arg obstacle_prism_size_x)"/>
+        <param name="prism_size_y" value="$(arg obstacle_prism_size_y)"/>
+        <param name="crescent_outer_radius" value="$(arg obstacle_crescent_outer_radius)"/>
+        <param name="crescent_inner_radius" value="$(arg obstacle_crescent_inner_radius)"/>
+        <param name="crescent_bite_offset" value="$(arg obstacle_crescent_bite_offset)"/>
+        <param name="num_points" value="$(arg obstacle_cloud_points)"/>
+        <param name="moving_sphere_enabled" value="$(arg moving_sphere_enabled)"/>
+        <param name="moving_sphere_initial_x" value="$(arg moving_sphere_initial_x)"/>
+        <param name="moving_sphere_initial_y" value="$(arg moving_sphere_initial_y)"/>
+        <param name="moving_sphere_initial_z" value="$(arg moving_sphere_initial_z)"/>
+        <param name="moving_sphere_velocity_x" value="$(arg moving_sphere_velocity_x)"/>
+        <param name="moving_sphere_velocity_y" value="$(arg moving_sphere_velocity_y)"/>
+        <param name="moving_sphere_velocity_z" value="$(arg moving_sphere_velocity_z)"/>
+        <param name="moving_sphere_radius" value="$(arg moving_sphere_radius)"/>
+        <param name="moving_sphere_num_points" value="$(arg moving_sphere_num_points)"/>
+        <param name="gazebo_mirror_enabled" value="$(arg moving_sphere_gazebo_mirror)"/>
+        <param name="gazebo_z_offset" value="0.75"/>
+        <param name="publish_rate_hz" value="30.0"/>
+  </node>
+
+  <!-- 1. SAM3 + SAM2 detect/track TWO objects (cube + box) on the static cam. -->
+  <node name="sam3_sam2_pp" pkg="vision_processing" type="sam3_sam2_node_pp.py" output="screen" cwd="node">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
+        <!-- GPU-bound node: cap the OMP intra-op pool so three torch
+             processes stop oversubscribing the 12 CPU cores (each defaults
+             to 12 spin-waiting threads), which inflated every eager-op
+             dispatch in the 100 Hz CBF loop to ~80 us. -->
+        <env name="OMP_NUM_THREADS" value="2"/>
+        <param name="cube_prompt" value="$(arg cube_prompt)"/>
+        <param name="box_prompt"  value="$(arg box_prompt)"/>
+        <param name="camera_frame" value="$(arg static_cam_frame)"/>
+        <param name="rgb_topic" value="$(arg static_rgb_topic)"/>
+  </node>
+
+  <!-- 2a. Projector: cube mask -> /perception/target_cube -->
+  <node name="projector_cube" pkg="vision_processing" type="point_cloud_projector_node.py" output="screen" cwd="node">
+        <param name="target_frame" value="world"/>
+        <param name="camera_frame" value="$(arg static_cam_frame)"/>
+        <param name="depth_topic" value="$(arg static_depth_topic)"/>
+        <param name="info_topic"  value="$(arg static_info_topic)"/>
+        <param name="rgb_topic"   value="$(arg static_rgb_topic)"/>
+        <param name="mask_topic"  value="/vision/sam2_mask_cube"/>
+        <param name="enable_fork_sam3_mask" value="false"/>
+        <param name="fork_sdf_filter" value="false"/>
+        <param name="enable_fork_filter" value="false"/>
+        <remap from="/perception/target" to="/perception/target_cube"/>
+        <remap from="/perception/obstacles" to="/perception/obstacles_cube"/>
+  </node>
+
+  <!-- 2b. Projector: box mask -> /perception/target_box -->
+  <node name="projector_box" pkg="vision_processing" type="point_cloud_projector_node.py" output="screen" cwd="node">
+        <param name="target_frame" value="world"/>
+        <param name="camera_frame" value="$(arg static_cam_frame)"/>
+        <param name="depth_topic" value="$(arg static_depth_topic)"/>
+        <param name="info_topic"  value="$(arg static_info_topic)"/>
+        <param name="rgb_topic"   value="$(arg static_rgb_topic)"/>
+        <param name="mask_topic"  value="/vision/sam2_mask_box"/>
+        <param name="enable_fork_sam3_mask" value="false"/>
+        <param name="fork_sdf_filter" value="false"/>
+        <param name="enable_fork_filter" value="false"/>
+        <remap from="/perception/target" to="/perception/target_box"/>
+        <remap from="/perception/obstacles" to="/perception/obstacles_box"/>
+  </node>
+
+  <!-- 2c. Ground-truth cube cloud (use_gt_cube:=true): full box surface at the
+       live Gazebo pose of red_cube, published beside the SAM cloud. -->
+  <node name="gt_cube_cloud" pkg="vision_processing" type="gt_cube_cloud_node.py"
+        output="screen" if="$(arg use_gt_cube)">
+        <param name="model_name" value="red_cube"/>
+        <param name="topic" value="/perception/target_cube_gt"/>
+        <param name="world_frame" value="world"/>
+        <param name="table_z_offset" value="0.75"/>
+        <!-- Real Gazebo cube: 0.04 x 0.04 x 0.06. Training cube was 0.04^3;
+             set half_z to 0.02 to reproduce the training size instead. -->
+        <param name="half_x" value="0.02"/>
+        <param name="half_y" value="0.02"/>
+        <param name="half_z" value="0.03"/>
+        <param name="num_points" value="600"/>
+  </node>
+
+  <!-- 3. Conditioning: gripper + cube + box -> /vision/merged_cloud (world) -->
+  <node name="condition_pickplace" pkg="vision_processing" type="condition_pcd_pickplace.py" output="screen">
+        <param name="num_points" value="$(arg condition_num_points)"/>
+        <param name="world_frame" value="world"/>
+        <param name="tcp_frame" value="panda_TCP"/>
+        <param name="cube_topic" value="/perception/target_cube_gt" if="$(arg use_gt_cube)"/>
+        <param name="cube_topic" value="/perception/target_cube" unless="$(arg use_gt_cube)"/>
+  </node>
+
+  <!-- 4. CASF generative planner, reused for the pick-and-place policy.
+       controlled_link:=panda_TCP -> the model predicts the TCP directly;
+       cbf_link_names without fork_tip -> gripper robot model. CASF correction
+       remains off; the online CBF node handles obstacle avoidance. -->
+  <node name="safe_generative_planner" pkg="vision_processing" type="casf_generative_node_PC_pp.py" output="screen" cwd="node">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
+        <!-- Same OMP cap as sam3_sam2_pp: keep CPU cores for the 100 Hz CBF loop. -->
+        <env name="OMP_NUM_THREADS" value="2"/>
+        <param name="model_name" value="$(arg pickplace_model_name)"/>
+        <param name="urdf_path" value="$(find vision_processing)/urdf/xarm7_pickplace.xacro"/>
+        <param name="controlled_link" value="panda_TCP"/>
+        <rosparam param="cbf_link_names">['xarm7_link2', 'xarm7_link3', 'xarm7_link4','xarm7_link5','xarm7_link6','xarm7_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
+        <rosparam param="arm_joint_names">['xarm7_joint1','xarm7_joint2','xarm7_joint3','xarm7_joint4','xarm7_joint5','xarm7_joint6','xarm7_joint7']</rosparam>
+        <param name="voxel_dir" value="$(find vision_processing)/third_party/RDF/panda_layer/meshes/voxel_128_xarm7"/>
+        <!-- Dynamic-sim anchor fix: the effort-driven xArm7 lags the command, and
+             anchoring the nominal at the lagging /joint_states winds the wrist
+             (flailing). Anchor the plan at the COMMANDED position stream instead
+             (the executor's nominal_joint_command), which leads the physical arm.
+             Panda PP leaves this False (default) so it is unaffected. -->
+        <param name="anchor_from_commanded" value="$(arg anchor_from_commanded)"/>
+        <param name="commanded_joint_topic" value="/planner/nominal_joint_command"/>
+        <param name="merged_cloud_contains_fork" value="true"/>
+        <param name="tcp_frame" value="panda_TCP"/>
+        <param name="gripper_open_threshold" value="0.03"/>
+        <param name="wait_for_cbf_ready" value="true"/>
+        <!-- Warp off by default (too slow online). runPP14 showed the failure
+             this leaves: the obstacle-blind policy demands cube->box THROUGH
+             the prism wall and the TCP parks there. Handled reactively by the
+             CBF escape lift (cbf_escape_lift_gain) instead. -->
+        <param name="enable_casf_correction" value="$(arg enable_casf_correction)"/>
+        <param name="planner_rate_hz" value="$(arg planner_rate_hz)"/>
+        <param name="trajectory_retime_mode" value="$(arg trajectory_retime_mode)"/>
+        <param name="trajectory_retime_joint_speed" value="$(arg trajectory_retime_joint_speed)"/>
+        <param name="trajectory_retime_joint_weights" value="$(arg trajectory_retime_joint_weights)"/>
+        <param name="trajectory_retime_min_segment_fraction" value="$(arg trajectory_retime_min_segment_fraction)"/>
+        <param name="trajectory_waypoint_rate_hz" value="$(arg trajectory_waypoint_rate_hz)"/>
+        <param name="use_temporal_ensembler" value="$(arg use_temporal_ensembler)"/>
+        <param name="ensembler_buffer_size" value="$(arg ensembler_buffer_size)"/>
+        <param name="ensembler_decay" value="$(arg ensembler_decay)"/>
+        <param name="single_shot" value="$(arg single_shot)"/>
+        <param name="log_trajectory_timing" value="false"/>
+        <!-- torch.compile reduce-overhead uses CUDA-graph thread-local state; the
+             control loop runs in a ROS timer thread != the warmup thread, which
+             trips `_is_key_in_tls`. Feeding disables it too. -->
+        <param name="fm_use_torch_compile" value="false"/>
+  </node>
+
+  <!-- 5. Execution = the SAME chain as feeding: executor retimes the trajectory and
+       publishes the nominal joint POSITION + VELOCITY; the CBF node (5.1) closes the
+       loop to the velocity controller (feedforward + position feedback) and adds
+       safety once an obstacle source is wired. -->
+  <node name="trajectory_executor" pkg="vision_processing" type="trajectory_executor.py" output="screen"
+        if="$(arg execute)">
+        <param name="rate_hz" value="$(arg control_rate_hz)"/>
+        <param name="out_topic" value="/planner/nominal_joint_command"/>
+        <rosparam param="joint_names">['xarm7_joint1','xarm7_joint2','xarm7_joint3','xarm7_joint4','xarm7_joint5','xarm7_joint6','xarm7_joint7']</rosparam>
+        <param name="velocity_out_topic" value="/planner/nominal_joint_velocity"/>
+        <param name="hold_current_until_trajectory" value="true"/>
+        <param name="use_progress_clock" value="true"/>
+        <param name="progress_lag_limit_rad" value="0.25"/>
+        <!-- Freeze trajectory progress while the barrier is violated (h < 0)
+             so the nominal doesn't run ahead during a CBF deflection; the arm
+             resumes the planned path where it left it. -->
+        <param name="cbf_hold_threshold" value="0.0"/>
+        <param name="anchor_mode" value="start"/>
+        <param name="command_lookahead_time" value="$(arg trajectory_command_lookahead_time)"/>
+        <param name="log_timing" value="false"/>
+  </node>
+
+  <!-- 5.1. Online CBF safety shield. Same CBF implementation as feeding, but with
+       the pick-place URDF, TCP frame, gripper/finger SDF links, and the static
+       cylinder obstacle cloud. -->
+  <node name="cbf_safety_Bernstein" pkg="vision_processing" type="$(arg cbf_node_type)"
+        output="screen" cwd="node" if="$(arg execute)">
+        <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
+        <param name="urdf_path" value="$(find vision_processing)/urdf/xarm7_pickplace.xacro"/>
+        <param name="controlled_link" value="panda_TCP"/>
+        <rosparam param="cbf_link_names">['xarm7_link2', 'xarm7_link3', 'xarm7_link4','xarm7_link5','xarm7_link6','xarm7_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
+        <rosparam param="arm_joint_names">['xarm7_joint1','xarm7_joint2','xarm7_joint3','xarm7_joint4','xarm7_joint5','xarm7_joint6','xarm7_joint7']</rosparam>
+        <param name="voxel_dir" value="$(find vision_processing)/third_party/RDF/panda_layer/meshes/voxel_128_xarm7"/>
+        <param name="enable_cbf" value="$(arg enable_cbf)"/>
+        <param name="cbf_passthrough_when_inactive" value="$(arg cbf_passthrough_when_inactive)"/>
+        <param name="cbf_monitor_only" value="$(arg cbf_monitor_only)"/>
+        <param name="cbf_graph_points" value="$(arg cbf_graph_points)"/>
+        <param name="preprocess_max_points" value="$(arg cbf_preprocess_max_points)"/>
+        <param name="cbf_candidate_filter" value="$(arg cbf_candidate_filter)"/>
+        <param name="cbf_selection_metric" value="$(arg cbf_selection_metric)"/>
+        <param name="cbf_cluster_mode" value="$(arg cbf_cluster_mode)"/>
+        <param name="cbf_sdf_candidate_max_dist" value="$(arg cbf_sdf_candidate_max_dist)"/>
+        <param name="cbf_sdf_prune_chunk_size" value="$(arg cbf_sdf_prune_chunk_size)"/>
+        <param name="cbf_sdf_self_filter_margin" value="$(arg cbf_sdf_self_filter_margin)"/>
+        <param name="cbf_sdf_prefilter_radius" value="$(arg cbf_sdf_prefilter_radius)"/>
+        <param name="cbf_sdf_prefilter_max_points" value="$(arg cbf_sdf_prefilter_max_points)"/>
+        <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)"/>
+        <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)"/>
+        <param name="cbf_separate_streams" value="$(arg cbf_separate_streams)"/>
+        <param name="cbf_graphed_control_step" value="$(arg cbf_graphed_control_step)"/>
+        <param name="cbf_constraint_sweeps" value="$(arg cbf_constraint_sweeps)"/>
+        <param name="cbf_final_constraint_mode" value="$(arg cbf_final_constraint_mode)"/>
+        <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)"/>
+        <param name="cbf_multi_fd_eps" value="$(arg cbf_multi_fd_eps)"/>
+        <param name="cbf_grasp_box_enabled" value="false"/>
+        <param name="obs_topic" value="$(arg obstacle_cloud_topic)"/>
+        <!-- Drive the velocity controller, exactly like feeding. -->
+        <param name="publish_controller_command" value="false"/>
+        <param name="publish_velocity_controller_command" value="true"/>
+        <param name="rate_hz" value="$(arg control_rate_hz)"/>
+        <!-- Tracking law (identical gains to feeding / the old velocity_tracker_pp). -->
+        <param name="cbf_kp" value="5.0"/>
+        <param name="max_feedback_velocity" value="0.5"/>
+        <param name="cbf_filter_tau" value="$(arg cbf_filter_tau)"/>
+        <param name="cbf_velocity_filter_tau" value="$(arg cbf_velocity_filter_tau)"/>
+        <param name="max_joint_velocity" value="$(arg max_joint_velocity)"/>
+        <param name="cbf_kappa" value="$(arg cbf_kappa)"/>
+        <param name="cbf_recovery_kappa" value="$(arg cbf_recovery_kappa)"/>
+        <param name="cbf_constraint_margin" value="$(arg cbf_constraint_margin)"/>
+        <param name="cbf_recovery_switch_margin" value="$(arg cbf_recovery_switch_margin)"/>
+        <param name="cbf_enforce_final_constraint" value="$(arg cbf_enforce_final_constraint)"/>
+        <param name="cbf_command_dt" value="$(arg cbf_command_dt)"/>
+        <param name="cbf_direct_position_mode" value="$(arg cbf_direct_position_mode)"/>
+        <param name="cbf_position_correction_dt" value="$(arg cbf_position_correction_dt)"/>
+        <param name="cbf_max_command_lead" value="$(arg cbf_max_command_lead)"/>
+        <param name="cbf_h_activate" value="$(arg cbf_h_activate)"/>
+        <param name="cbf_max_inward_speed" value="$(arg cbf_max_inward_speed)"/>
+        <param name="cbf_recovery_speed" value="$(arg cbf_recovery_speed)"/>
+        <param name="cbf_recovery_depth" value="$(arg cbf_recovery_depth)"/>
+        <param name="cbf_max_correction_speed" value="$(arg cbf_max_correction_speed)"/>
+        <param name="cbf_recovery_max_correction_speed" value="$(arg cbf_recovery_max_correction_speed)"/>
+        <param name="cbf_repair_grad_min" value="$(arg cbf_repair_grad_min)"/>
+        <param name="cbf_projection_iters" value="$(arg cbf_projection_iters)"/>
+        <param name="cbf_projection_relaxation" value="$(arg cbf_projection_relaxation)"/>
+        <param name="cbf_tracking_feedback_mode" value="$(arg cbf_tracking_feedback_mode)"/>
+        <param name="cbf_projection_metric" value="$(arg cbf_projection_metric)"/>
+        <param name="cbf_task_metric_lambda" value="$(arg cbf_task_metric_lambda)"/>
+        <param name="cbf_task_metric_rot_weight" value="$(arg cbf_task_metric_rot_weight)"/>
+        <param name="cbf_task_metric_update_every" value="$(arg cbf_task_metric_update_every)"/>
+        <param name="cbf_nullspace_clearance_gain" value="$(arg cbf_nullspace_clearance_gain)"/>
+        <param name="cbf_nullspace_clearance_h_activate" value="$(arg cbf_nullspace_clearance_h_activate)"/>
+        <param name="cbf_escape_enabled" value="$(arg cbf_escape_enabled)"/>
+        <param name="cbf_escape_h_trigger" value="$(arg cbf_escape_h_trigger)"/>
+        <param name="cbf_escape_h_release" value="$(arg cbf_escape_h_release)"/>
+        <param name="cbf_escape_lift_gain" value="$(arg cbf_escape_lift_gain)"/>
+        <param name="cbf_escape_max_velocity" value="$(arg cbf_escape_max_velocity)"/>
+        <param name="cbf_escape_probe_enabled" value="$(arg cbf_escape_probe_enabled)"/>
+        <param name="cbf_escape_probe_num_dirs" value="$(arg cbf_escape_probe_num_dirs)"/>
+        <param name="cbf_escape_probe_radii" value="$(arg cbf_escape_probe_radii)"/>
+        <param name="cbf_escape_probe_clearance_cap" value="$(arg cbf_escape_probe_clearance_cap)"/>
+        <param name="cbf_escape_probe_goal_weight" value="$(arg cbf_escape_probe_goal_weight)"/>
+        <param name="cbf_escape_probe_commit_weight" value="$(arg cbf_escape_probe_commit_weight)"/>
+        <param name="cbf_escape_probe_min_z" value="$(arg cbf_escape_probe_min_z)"/>
+        <param name="cbf_escape_probe_ema" value="$(arg cbf_escape_probe_ema)"/>
+        <param name="cbf_escape_probe_tabu_timeout" value="$(arg cbf_escape_probe_tabu_timeout)"/>
+        <param name="cbf_escape_probe_tabu_min_progress" value="$(arg cbf_escape_probe_tabu_min_progress)"/>
+        <param name="cbf_escape_probe_tabu_weight" value="$(arg cbf_escape_probe_tabu_weight)"/>
+        <param name="cbf_escape_probe_tabu_ttl" value="$(arg cbf_escape_probe_tabu_ttl)"/>
+        <param name="cbf_barrier_value_mode" value="$(arg cbf_barrier_value_mode)"/>
+        <param name="cbf_dynamic_hdot_enabled" value="$(arg cbf_dynamic_hdot_enabled)"/>
+        <param name="cbf_dynamic_hdot_tau" value="$(arg cbf_dynamic_hdot_tau)"/>
+        <param name="cbf_dynamic_hdot_deadband" value="$(arg cbf_dynamic_hdot_deadband)"/>
+        <param name="cbf_dynamic_hdot_max" value="$(arg cbf_dynamic_hdot_max)"/>
+        <param name="barrier_alpha" value="$(arg barrier_alpha)"/>
+        <param name="d_safe" value="$(arg d_safe)"/>
+        <param name="cbf_integrate_from_current" value="true"/>
+        <param name="use_nominal_velocity_topic" value="true"/>
+        <param name="nominal_velocity_topic" value="/planner/nominal_joint_velocity"/>
+        <param name="nominal_velocity_timeout" value="0.25"/>
+        <param name="nominal_feedforward_gain" value="1.0"/>
+        <param name="tcp_frame" value="panda_TCP"/>
+        <param name="publish_diagnostics" value="true"/>
+        <param name="cbf_diagnostics_decimation" value="$(arg cbf_diagnostics_decimation)"/>
+        <param name="publish_viz_topics" value="$(arg launch_rviz)"/>
+  </node>
+
+  <!-- 5.5. Grasp: physically close near the cube width, weld for reliable Gazebo
+       carrying, then hold the fingers at the cube width so the grasp still looks
+       natural instead of visually crushing through the cube. -->
+  <arg name="grasp_enabled" default="true"/>
+  <node name="gripper_grasp_pp" pkg="vision_processing" type="gripper_grasp_node_pp.py"
+        output="screen" if="$(arg grasp_enabled)">
+        <param name="cube_model" value="red_cube"/>
+        <param name="robot_model" value="xarm7"/>
+        <param name="tcp_frame" value="panda_TCP"/>
+        <param name="gripper_ns" value="/franka_gripper"/>
+        <param name="grasp_width" value="0.04"/>
+        <param name="grasp_force" value="40.0"/>
+        <param name="contact_weld_finger" value="0.024"/>
+        <param name="hold_after_weld" value="true"/>
+        <param name="hold_width" value="0.04"/>
+        <param name="open_width" value="0.08"/>
+        <param name="release_z_clearance" value="0.10"/>
+  </node>
+
+  <!-- 6. RViz: visualize /vision/merged_cloud + /planner/nominal_trajectory. -->
+  <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find vision_processing)/config/cbf_config.rviz"
+        if="$(arg launch_rviz)"/>
+</launch>

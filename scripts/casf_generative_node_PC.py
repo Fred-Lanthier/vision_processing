@@ -215,7 +215,7 @@ class CASFGenerativeNode:
         # CBF protected links. Default = fork feeding rig (incl. fork_tip). For the
         # pick-and-place gripper (no fork) pass ~cbf_link_names WITHOUT fork_tip.
         default_link_names = [
-            'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
+            'panda_link2','panda_link3','panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
             'panda_hand', 'fork_tip',
         ]
         link_names = list(rospy.get_param("~cbf_link_names", default_link_names))
@@ -371,6 +371,21 @@ class CASFGenerativeNode:
         self.ensembler_buffer_size = max(1, int(rospy.get_param("~ensembler_buffer_size", 3)))
         self.ensembler_decay = float(rospy.get_param("~ensembler_decay", 1.0))
         self.use_temporal_ensembler = _bool_param("~use_temporal_ensembler", False)
+        # Dynamic-scene gate: when enabled, the ensembler blend is applied only
+        # while the CBF reports a moving obstacle closing on the robot
+        # (/cbf_safety/env_hdot = max per-link dynamic-hdot tightening, m/s;
+        # zero for static scenes by deadband design). Supersedes the constant
+        # use_temporal_ensembler flag. The gate holds for ensembler_gate_hold
+        # seconds past the last reading above ensembler_env_hdot_on.
+        self.ensembler_dynamic_gate = _bool_param("~ensembler_dynamic_gate", False)
+        self.ensembler_env_hdot_on = float(rospy.get_param(
+            "~ensembler_env_hdot_on", 0.02))
+        self.ensembler_gate_hold = float(rospy.get_param(
+            "~ensembler_gate_hold", 2.0))
+        self.latest_env_hdot = 0.0
+        self.latest_env_hdot_stamp = 0.0
+        self.dynamic_scene_until = 0.0
+        self.dynamic_scene_active = False
         self.anchor_cartesian_start = _bool_param("~anchor_cartesian_start", False)
         self.log_planner_cartesian_debug = _bool_param("~log_planner_cartesian_debug", False)
         self.fm_noise_seed = int(rospy.get_param("~fm_noise_seed", 7))
@@ -381,6 +396,27 @@ class CASFGenerativeNode:
             "~hold_last_condition_on_loss", True)
         self.condition_hold_max_age = float(rospy.get_param(
             "~condition_hold_max_age", 0.0))
+        # Reference-state conditioning: clamp the conditioning joint state to a
+        # band of +-condition_reference_clamp rad (per joint) around the
+        # trajectory executor's nominal command, so a CBF evasion cannot drag
+        # the FM model's input off the training manifold. The CBF + tracking
+        # feedback absorb the actual deviation. 0.0 = disabled (condition on
+        # the raw measured state, legacy behavior).
+        self.condition_reference_clamp = float(rospy.get_param(
+            "~condition_reference_clamp", 0.0))
+        self.condition_reference_timeout = float(rospy.get_param(
+            "~condition_reference_timeout", 0.5))
+        self.condition_reference_topic = rospy.get_param(
+            "~condition_reference_topic", "/planner/nominal_joint_command")
+        # Points of the merged cloud closer than this to the measured-state
+        # fork surface are treated as fork points and re-posed to the
+        # reference state, keeping the conditioning cloud consistent with the
+        # conditioned joint state.
+        self.condition_fork_match_radius = float(rospy.get_param(
+            "~condition_fork_match_radius", 0.02))
+        self.nominal_ref_q = None
+        self.nominal_ref_stamp = 0.0
+        self.condition_ref_active = False
         self.plan_seq = 0
         self.plan_published = False
         self.is_committed = False
@@ -405,8 +441,14 @@ class CASFGenerativeNode:
         rospy.Subscriber('/perception/persistent_obstacles', PointCloud2, self.obstacle_callback)
         rospy.Subscriber('/vision/merged_cloud', PointCloud2, self.cloud_callback)
         rospy.Subscriber('/cbf_safety/ready', Bool, self.cbf_ready_callback)
+        if self.condition_reference_clamp > 0.0:
+            rospy.Subscriber(self.condition_reference_topic, Float64MultiArray,
+                             self.nominal_ref_callback)
         from std_msgs.msg import Float32
         rospy.Subscriber('/vision/fork_food_distance', Float32, self.dist_callback)
+        if self.ensembler_dynamic_gate:
+            rospy.Subscriber('/cbf_safety/env_hdot', Float32,
+                             self.env_hdot_callback)
         
         self.traj_pub = rospy.Publisher('/planner/nominal_trajectory', JointTrajectory, queue_size=1, latch=False)
         self.fork_pose_traj_pub = rospy.Publisher('/planner/nominal_fork_trajectory', PoseArray, queue_size=1, latch=True)
@@ -634,6 +676,93 @@ class CASFGenerativeNode:
         except Exception as e:
             rospy.logerr_throttle(5, f"Error in joint_callback: {e}")
 
+    def env_hdot_callback(self, msg):
+        self.latest_env_hdot = float(msg.data)
+        self.latest_env_hdot_stamp = rospy.get_time()
+
+    def _update_dynamic_scene_gate(self):
+        """True while a moving obstacle is (or recently was) closing on the
+        robot. A fresh env_hdot reading above the ON threshold arms the gate
+        for ensembler_gate_hold seconds; it re-arms as long as readings stay
+        above threshold, and expires quietly once the scene is static again."""
+        now = rospy.get_time()
+        if (self.latest_env_hdot >= self.ensembler_env_hdot_on
+                and now - self.latest_env_hdot_stamp < 1.0):
+            self.dynamic_scene_until = now + self.ensembler_gate_hold
+        active = now < self.dynamic_scene_until
+        if active != self.dynamic_scene_active:
+            if active:
+                rospy.loginfo(
+                    "🌀 Moving obstacle detected (env_hdot %.3f m/s >= %.3f) "
+                    "— temporal ensembler ON",
+                    self.latest_env_hdot, self.ensembler_env_hdot_on)
+            else:
+                rospy.loginfo(
+                    "Moving obstacle cleared for %.1fs — temporal ensembler OFF",
+                    self.ensembler_gate_hold)
+            self.dynamic_scene_active = active
+        return active
+
+    def nominal_ref_callback(self, msg):
+        try:
+            if len(msg.data) >= 7:
+                self.nominal_ref_q = torch.tensor(
+                    msg.data[:7], dtype=torch.float32, device=self.device)
+                self.nominal_ref_stamp = rospy.get_time()
+        except Exception as e:
+            rospy.logerr_throttle(5, f"Error in nominal_ref_callback: {e}")
+
+    def _conditioning_q(self):
+        """Measured q, clamped to +-condition_reference_clamp (rad, per joint)
+        around the executor's nominal command. Sets self.condition_ref_active
+        when the clamp changed the state, so the cloud path can re-pose the
+        fork points to match."""
+        q_meas = self.current_q
+        self.condition_ref_active = False
+        c = self.condition_reference_clamp
+        if c <= 0.0 or self.nominal_ref_q is None:
+            return q_meas
+        if rospy.get_time() - self.nominal_ref_stamp > self.condition_reference_timeout:
+            rospy.logwarn_throttle(
+                5.0, "Conditioning reference stale; conditioning on measured state.")
+            return q_meas
+        dev = q_meas - self.nominal_ref_q
+        if not bool((dev.abs() > c).any()):
+            return q_meas
+        self.condition_ref_active = True
+        rospy.loginfo_throttle(
+            2.0,
+            "Conditioning on reference state (max joint deviation %.3f rad > clamp %.3f rad).",
+            float(dev.abs().max()), c)
+        return self.nominal_ref_q + torch.clamp(dev, -c, c)
+
+    def _fork_cloud_at(self, q):
+        q_dict = {jn: float(v)
+                  for jn, v in zip(self.joint_names, q.detach().cpu().numpy())}
+        pts = self.mesh_loader.create_point_cloud_fork_tip(q_dict)
+        return torch.from_numpy(pts).float().to(self.device)
+
+    def _repose_fork_points(self, cloud_world, q_ref):
+        """The merged cloud's fork-mesh points sit at the MEASURED joint state;
+        the conditioning state q_ref may differ (clamped toward the nominal).
+        Swap the points near the measured fork surface for a fork sampled at
+        q_ref, so cloud and conditioned state stay consistent as in training."""
+        try:
+            fork_meas = self._fork_cloud_at(self.current_q)
+            if fork_meas.shape[0] == 0:
+                return cloud_world
+            d = torch.cdist(cloud_world, fork_meas)
+            is_fork = d.min(dim=1).values < self.condition_fork_match_radius
+            n_fork = int(is_fork.sum())
+            if n_fork == 0:
+                return cloud_world
+            fork_ref = self.stable_torch_sample(self._fork_cloud_at(q_ref), n_fork)
+            return torch.cat([cloud_world[~is_fork], fork_ref], dim=0)
+        except Exception as e:
+            rospy.logwarn_throttle(
+                5.0, f"Fork repose failed ({e}); using raw merged cloud.")
+            return cloud_world
+
     def obstacle_callback(self, msg):
         # Unpack obstacles for CBF Corrector in ODE
         # PointCloud2 to Numpy (Assume XYZ float32 from create_cloud_xyz32)
@@ -703,8 +832,11 @@ class CASFGenerativeNode:
         # Get precise fork_tip pose directly from the kinematics tree
         base = torch.eye(4, device=self.device).unsqueeze(0)
         
-        # Revert to physical current_q so the Point Cloud (from perception) perfectly aligns with the base pose
-        q_source = self.current_q
+        # Conditioning state: measured q, optionally clamped toward the
+        # nominal reference (condition_reference_clamp > 0) so a CBF evasion
+        # cannot drag the FM input off the training manifold. Cloud/base
+        # alignment is restored by _repose_fork_points below when clamped.
+        q_source = self._conditioning_q()
         q_eval = q_source.clone().unsqueeze(0) # Ensure it is shape [1, 7]
         if q_eval.shape[-1] == 7:
             q_eval = torch.cat([q_eval, torch.zeros((1, 2), device=self.device)], dim=-1)
@@ -742,7 +874,10 @@ class CASFGenerativeNode:
         # /vision/merged_cloud from condition_pcd_from_perception.py already contains
         # the current fork mesh and target in world frame, matching the training
         # Merged_Fork preprocessing. Do not append a second canonical local fork.
-        pcd_merged_centered = self.latest_cloud_gpu - pos_fork
+        cloud_world = self.latest_cloud_gpu
+        if self.condition_ref_active and self.merged_cloud_contains_fork:
+            cloud_world = self._repose_fork_points(cloud_world, q_source)
+        pcd_merged_centered = cloud_world - pos_fork
         if not self.merged_cloud_contains_fork:
             pcd_merged_centered = torch.cat([pcd_merged_centered, self.fork_pts_local], dim=0)
         
@@ -771,6 +906,8 @@ class CASFGenerativeNode:
             if A is not None and not (self.check_finite_debug and torch.isnan(A).any()):
                 # Check for Commit Mode
                 use_ensembler = self.use_temporal_ensembler
+                if self.ensembler_dynamic_gate:
+                    use_ensembler = self._update_dynamic_scene_gate()
                 if self.fork_food_distance < self.commit_distance:
                     rospy.loginfo(f"🔒 COMMIT MODE (d={self.fork_food_distance*1000:.1f}mm) — executing final strike open-loop")
                     self.is_committed = True
@@ -1182,9 +1319,11 @@ class CASFGenerativeNode:
         A_world_np = A_world.squeeze(0).detach().cpu().numpy()
         raw_traj_np = A_world_np.copy()
         
+        # Always feed the buffer (tagged with the point-cloud capture time) so
+        # the dynamic-scene gate can switch the blend on mid-run and only ever
+        # mixes recent predictions; stale ones age out of the horizon window.
+        self.ensembler.add_prediction(A_world_np, t_capture)
         if use_ensembler:
-            # We add the prediction tagged with the time the point cloud was captured
-            self.ensembler.add_prediction(A_world_np, t_capture)
             # We evaluate the ensembled trajectory at the CURRENT time
             smoothed_traj_np = self.ensembler.get_ensembled_trajectory(
                 num_steps=A_world_np.shape[0],

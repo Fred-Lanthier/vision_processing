@@ -1,0 +1,20 @@
+{
+  "n_instances": 2000,
+  "n_multi_active": 1074,
+  "skipped": 0,
+  "metric": "task",
+  "seed": 0,
+  "nit_deployed": 6,
+  "dykstra_dist_median_at_nit_pct": 0.041134856763056005,
+  "dykstra_dist_p90_at_nit_pct": 23.528626546515472,
+  "pocs_dist_median_asymptotic_pct": 7.293481335714588,
+  "pocs_dist_p90_asymptotic_pct": 33.737568527977594,
+  "residual_median_at_nit": 8.4680734709075e-07,
+  "residual_p99_at_nit": 0.26305964350859334,
+  "warm_episodes": 300,
+  "warm_cycles": 50,
+  "cold_dist_p90_last_cycle_pct": 3.665259528044208,
+  "warm_lambda_dist_p90_cycle3_pct": 3.243770954842155e-13,
+  "warm_lambda_dist_p90_last_cycle_pct": 3.991696868455922e-13,
+  "warm_naive_z_dist_median_last_cycle_pct": 16.698329034807365
+}

@@ -170,7 +170,35 @@ def decode_9d_to_se3_gpu(traj_9d, eps=1e-6):
     T[:, :3, 1] = b2
     T[:, :3, 2] = b3
     T[:, :3, 3] = pos
-    
+
+    return T
+
+
+def decode_9d_to_se3_np(traj_9d, eps=1e-6):
+    """Numpy Gram-Schmidt decode: [N,9] -> [N,4,4]. Same math as the GPU
+    version but on the CPU, for the trajectory-build path.
+
+    The decode is a per-row 3x3 orthonormalization: trivial arithmetic with
+    NO reason to touch the GPU. Doing it on the GPU per waypoint (batch-1 in a
+    loop, one .cpu() sync each) cost ~5 ms idle but 200+ ms under GPU
+    contention, because every sync queued behind the 100 Hz CBF + the FM net
+    sharing the device -- it was the dominant term in trajectory_build and the
+    source of its worst-case spikes coupling into the CBF tail. Numpy is
+    bit-close (~5e-6 vs the GPU result, float noise) and immune to GPU load
+    (~0.09 ms regardless), so this stays off the contended device entirely.
+    """
+    traj = np.asarray(traj_9d, dtype=np.float64)
+    pos, c1, c2 = traj[:, :3], traj[:, 3:6], traj[:, 6:9]
+    b1 = c1 / np.maximum(np.linalg.norm(c1, axis=1, keepdims=True), eps)
+    b2 = c2 - np.sum(b1 * c2, axis=1, keepdims=True) * b1
+    b2 = b2 / np.maximum(np.linalg.norm(b2, axis=1, keepdims=True), eps)
+    b3 = np.cross(b1, b2)
+    N = traj.shape[0]
+    T = np.tile(np.eye(4), (N, 1, 1))
+    T[:, :3, 0] = b1
+    T[:, :3, 1] = b2
+    T[:, :3, 2] = b3
+    T[:, :3, 3] = pos
     return T
 
 class CASFGenerativeNode:
@@ -318,7 +346,21 @@ class CASFGenerativeNode:
         self.current_gripper_open = 1.0
         self.gripper_open_threshold = float(rospy.get_param("~gripper_open_threshold", 0.03))
         self.commanded_q = None
-        self.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
+        # Trajectory-anchor source. In a DYNAMIC/effort Gazebo sim the measured
+        # /joint_states lag the command, and re-anchoring the published nominal at
+        # the lagging measured state each replan makes the IK wind the redundant
+        # wrist (the flailing seen on xArm7). ~anchor_from_commanded=true anchors
+        # the nominal at the last COMMANDED joint position instead, decoupling the
+        # plan from physical tracking lag (in a KINEMATIC sim measured==commanded,
+        # so it is a no-op). Default False keeps the panda behaviour unchanged.
+        self.anchor_from_commanded = bool(rospy.get_param("~anchor_from_commanded", False))
+        self.commanded_joint_topic = str(rospy.get_param(
+            "~commanded_joint_topic", "/joint_group_position_controller/command"))
+        # Arm joint names for /joint_states lookup and trajectory messages.
+        # Default = panda; the xArm7 cross-embodiment launch passes xarm7_joint1..7.
+        self.joint_names = list(rospy.get_param("~arm_joint_names", [
+            'panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
+            'panda_joint5', 'panda_joint6', 'panda_joint7']))
         self.obstacle_pts_gpu = None
         self.obs_horizon = cfg.get('obs_horizon', 2)
         self.obs_queue = collections.deque(maxlen=self.obs_horizon)
@@ -415,7 +457,7 @@ class CASFGenerativeNode:
 
         # 5. Subscribers & Publishers
         rospy.Subscriber('/joint_states', JointState, self.joint_callback)
-        rospy.Subscriber('/joint_group_position_controller/command', Float64MultiArray, self.command_callback)
+        rospy.Subscriber(self.commanded_joint_topic, Float64MultiArray, self.command_callback)
         rospy.Subscriber('/perception/persistent_obstacles', PointCloud2, self.obstacle_callback)
         rospy.Subscriber('/vision/merged_cloud', PointCloud2, self.cloud_callback)
         rospy.Subscriber('/cbf_safety/ready', Bool, self.cbf_ready_callback)
@@ -441,31 +483,58 @@ class CASFGenerativeNode:
     def _setup_fm_compile(self):
         """Compile + CUDA-graph the FM velocity net.
 
-        The planner runs at ~8 Hz but each replan does N_PRED forward passes
+        The planner runs at ~3-8 Hz but each replan does N_PRED forward passes
         through velocity_net (55-85 ms total, batch-1 launch-overhead bound).
-        That burst monopolizes the GPU the 150 Hz CBF loop shares, inflating
-        its red-point preprocess to 40-52 ms. reduce-overhead mode captures
-        each forward as a CUDA graph (graph trees), collapsing per-kernel
-        launch overhead so the burst drops toward ~15-20 ms and stops
-        colliding with the safety loop. Math is unchanged (same fp32 graph).
+        That burst monopolizes the GPU the 100 Hz CBF loop shares (separate
+        PROCESS = separate CUDA context, so the CBF's priority stream cannot
+        preempt it), inflating the CBF's command readback tail to 27-74 ms.
+        reduce-overhead mode captures each forward as a CUDA graph (graph
+        trees), collapsing per-kernel launch overhead so the burst drops
+        toward ~15-20 ms and stops head-of-line-blocking the safety loop.
+        Math is unchanged (same fp32 graph).
 
-        Compilation + capture are forced now via a warmup so the first live
-        replan does not stall. Any failure falls back to the eager net.
+        THREADING: the capture and the replay must run in the SAME thread --
+        reduce-overhead's CUDA-graph state is thread-local, and mismatched
+        threads trip `_is_key_in_tls` on the first live replan (this is why
+        the flag was historically forced off). control_loop runs in a
+        rospy.Timer thread, NOT this __init__ (main) thread, so the warmup is
+        DEFERRED to the first control_loop tick via _warmup_fm_compile(). Here
+        we only install the wrapper (torch.compile is lazy: nothing is traced
+        or captured until the first call, which now happens in the timer
+        thread). Any failure there falls back to the eager net.
         """
         self._velocity_net_eager = self.fm_agent.velocity_net
+        self._fm_needs_warmup = False
         if not self.fm_use_torch_compile:
             rospy.loginfo("FM torch.compile disabled (~fm_use_torch_compile=false).")
             return
         if self.device.type != "cuda":
             rospy.loginfo("FM torch.compile skipped: planner not on CUDA.")
             return
+        # Wrap only; the trace+capture happens on first call in the timer
+        # thread (see _warmup_fm_compile). Installing the wrapper here is
+        # thread-agnostic -- torch.compile records no CUDA-graph state until
+        # invoked.
+        self.fm_agent.velocity_net = torch.compile(
+            self.fm_agent.velocity_net, mode="reduce-overhead")
+        self._fm_needs_warmup = True
+        rospy.loginfo(
+            "FM torch.compile (reduce-overhead) installed; warmup deferred to "
+            "the first planner tick (timer thread) so capture == replay "
+            "thread.")
+
+    def _warmup_fm_compile(self):
+        """Trace+capture the compiled velocity_net IN THE TIMER THREAD.
+
+        Called once from control_loop so the CUDA-graph capture happens in the
+        same thread that will replay it. Uses prediction-shaped dummy inputs;
+        shapes MUST match the live call (B=1, pred_horizon, action_dim) or the
+        graph re-records on the first real replan. On any failure, reverts to
+        the eager net (correctness over speed) and never retries.
+        """
+        self._fm_needs_warmup = False
         try:
             t0 = time.perf_counter()
-            self.fm_agent.velocity_net = torch.compile(
-                self.fm_agent.velocity_net, mode="reduce-overhead")
-            # Warm up with prediction-shaped dummy inputs. Shapes MUST match the
-            # live call (B=1, pred_horizon, action_dim) or the graph re-records
-            # on the first real replan.
             B, H = 1, self.pred_horizon
             dt_pred = 1.0 / max(self.n_pred, 1)
             dummy_obs = {
@@ -482,10 +551,12 @@ class CASFGenerativeNode:
                         A = A + v * dt_pred
             torch.cuda.synchronize()
             rospy.loginfo(
-                "✅ FM velocity_net compiled (reduce-overhead) + warmed up in %.1fs",
-                time.perf_counter() - t0)
+                "✅ FM velocity_net compiled (reduce-overhead) + warmed up in "
+                "%.1fs (timer thread)", time.perf_counter() - t0)
         except Exception as e:
-            rospy.logwarn("FM torch.compile failed (%s); using eager velocity_net.", e)
+            rospy.logwarn(
+                "FM torch.compile warmup failed (%s); using eager velocity_net.",
+                e)
             self.fm_agent.velocity_net = self._velocity_net_eager
 
     def cbf_ready_callback(self, msg):
@@ -700,8 +771,18 @@ class CASFGenerativeNode:
             rospy.logerr_throttle(5.0, f"Error unpacking merged cloud: {e}")
 
     def control_loop(self, event):
+        # First tick only: trace+capture the compiled FM net HERE, in the
+        # timer thread, so the CUDA-graph capture thread matches every future
+        # replay thread (see _setup_fm_compile). This tick just warms (a
+        # multi-second one-time compile) and returns; the planner publishes
+        # nothing yet and the CBF holds, so the stall is harmless. Subsequent
+        # ticks plan normally against the ~15-20 ms compiled burst.
+        if self._fm_needs_warmup:
+            self._warmup_fm_compile()
+            return
+
         t_capture = rospy.get_time()
-        
+
         if self.single_shot and self.plan_published:
             return
             
@@ -723,6 +804,14 @@ class CASFGenerativeNode:
         
         # Revert to physical current_q so the Point Cloud (from perception) perfectly aligns with the base pose
         q_source = self.current_q
+        # Trajectory anchor (see __init__): physical q_source by default; the last
+        # commanded q when ~anchor_from_commanded is set and available. Only the
+        # published nominal's IK seed/start uses this — conditioning below stays on
+        # the physical q_source so the model input matches the perception cloud.
+        q_anchor = q_source
+        if self.anchor_from_commanded and self.commanded_q is not None \
+                and self.commanded_q.shape == q_source.shape:
+            q_anchor = self.commanded_q
         q_eval = q_source.clone().unsqueeze(0) # Ensure it is shape [1, 7]
         if q_eval.shape[-1] == 7:
             q_eval = torch.cat([q_eval, torch.zeros((1, 2), device=self.device)], dim=-1)
@@ -801,7 +890,7 @@ class CASFGenerativeNode:
                     self.is_committed = True
                     use_ensembler = False
 
-                self.publish_joint_trajectory(A, pos_fork, q_source, t_capture, use_ensembler=use_ensembler)
+                self.publish_joint_trajectory(A, pos_fork, q_anchor, t_capture, use_ensembler=use_ensembler)
                 self.plan_published = True
                 
                 if self.single_shot:
@@ -1266,23 +1355,20 @@ class CASFGenerativeNode:
         num_interp_points = smoothed_traj_np.shape[0]
         interpolated_traj_np = smoothed_traj_np
 
-        # Re-normalize rotation columns after averaging
-        for t in range(num_interp_points):
-            col1 = interpolated_traj_np[t, 3:6]
-            col2 = interpolated_traj_np[t, 6:9]
-            col1 = col1 / (np.linalg.norm(col1) + 1e-8)
-            col2 = col2 - np.dot(col2, col1) * col1
-            col2 = col2 / (np.linalg.norm(col2) + 1e-8)
-            interpolated_traj_np[t, 3:6] = col1
-            interpolated_traj_np[t, 6:9] = col2
-        
+        # Decode all waypoints to SE(3) in ONE batched numpy Gram-Schmidt
+        # (decode_9d_to_se3_np): it both orthonormalizes the columns and
+        # builds the 4x4, so the old per-row column re-normalization loop is
+        # redundant and gone. The previous code called the GPU decoder
+        # per-waypoint in a Python loop (batch-1, one .cpu() sync each) --
+        # ~5 ms idle but 200+ ms under GPU contention, the dominant cost in
+        # trajectory_build. Numpy is off-device and immune to that load.
+        pos_fork_np = pos_fork.detach().cpu().numpy()
+        se3_all = decode_9d_to_se3_np(interpolated_traj_np[:, :9])
+
         se3_fork_list = []
         se3_tcp_list = []
         for i in range(num_interp_points):
-            se3 = decode_9d_to_se3_gpu(
-                torch.from_numpy(interpolated_traj_np[i, :9]).to(self.device).unsqueeze(0)
-            )[0].cpu().numpy()
-            
+            se3 = se3_all[i]
             # Guard : vérifier que R est orthogonale (det ≈ 1 et trace entre -1.0 et 3.0)
             R_mat = se3[:3, :3]
             det = np.linalg.det(R_mat)
@@ -1291,7 +1377,7 @@ class CASFGenerativeNode:
                 # Fallback : rotation identité, position du waypoint
                 se3[:3, :3] = np.eye(3)
                 if not np.isfinite(se3[:3, 3]).all():
-                    se3[:3, 3] = pos_fork.cpu().numpy()
+                    se3[:3, 3] = pos_fork_np
             se3_fork_list.append(se3)
             se3_tcp_list.append(self.fork_se3_to_tcp_se3(se3))
 
@@ -1343,8 +1429,9 @@ class CASFGenerativeNode:
             diff = (diff + np.pi) % (2 * np.pi) - np.pi
             q_traj[i] = prev + diff
 
-        # Publish the measured current joints as waypoint 0 so every nominal
-        # trajectory starts continuously without warping the Cartesian FM path.
+        # Publish the anchor joints (measured current, or commanded when
+        # ~anchor_from_commanded) as waypoint 0 so every nominal trajectory starts
+        # continuously without warping the Cartesian FM path.
         q_traj[0][:7] = q_init[:7]
 
         first_joint_err = np.linalg.norm(q_traj[0][:7] - q_init[:7])
@@ -1426,7 +1513,7 @@ class CASFGenerativeNode:
         msg.header.seq = self.plan_seq
         msg.header.stamp = rospy.Time.now()
         msg.header.frame_id = "world"
-        msg.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
+        msg.joint_names = list(self.joint_names)
         time_stamps, retime_stats = self._retime_joint_trajectory(q_traj)
         
         for i in range(len(q_traj)):

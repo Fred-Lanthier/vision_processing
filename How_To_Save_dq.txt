@@ -23,13 +23,35 @@ rosbag record --lz4 -O runPP1.bag -e \
     '/cbf_safety/diagnostics(_layout)?$|/joint_states$|/perception/persistent_obstacles$|/pipeline/timing/.*'
 
 
-rosbag record --lz4 -O runPP102.bag -e '/cbf_safety/diagnostics(_layout)?$|/joint_states$|/planner/nominal_joint_velocity$|/planner/
-  nominal_joint_command$|/planner/nominal_trajectory$|/joint_group_velocity_controller/command$|/perception/persistent_obstacles$|/perception/
-  cleaned_obstacles$|/pipeline/timing/.*'
+PP launch, best-known configuration (reflex certified + unbiased hard-min h;
+dykstra QP + certified reflex mode are already the launch defaults). gui/rviz
+off: gzclient+rviz CPU load was starving the CBF loop (runPP1004: 23 Hz
+effective vs cbf_total p50 9.5 ms). For analysis runs add
+cbf_diagnostics_decimation:=1 (denser dq_final samples, small CPU cost):
+
+roslaunch vision_processing green_cube_feeding_casf_pp.launch enable_cbf_reflex:=true cbf_barrier_value_mode:=hard gui:=false launch_rviz:=false
+
+Full PP recording (one line). Adds vs the old list:
+  /cbf_safety/pre_reflex_command  = dq_final at FULL rate (the decimated
+                                    diagnostics alias it; use this for
+                                    measured-vs-commanded plots)
+  /cbf_reflex/status              = [alpha, h_pred_min, n_brake, state_age,
+                                    L_emp, horizon] -> attributes any
+                                    command-vs-final gap to the reflex brake
+                                    (horizon = the reflex's own MEASURED
+                                    decision period, no longer a parameter)
+  /cbf_safety/reflex_state        = per-link h/env/grad snapshot (offline
+                                    reflex replay)
+  /planner/raw_nominal_trajectory = router input (which segments the
+                                    via-point layer spliced)
+(topics that don't exist in a given config, e.g. pre_reflex with the reflex
+disabled, simply record nothing — the regex is safe either way)
+
+rosbag record --lz4 -O runPP1013.bag -e '/cbf_safety/diagnostics(_layout)?$|/cbf_safety/pre_reflex_command$|/cbf_safety/reflex_state$|/cbf_reflex/status$|/joint_states$|/planner/nominal_joint_velocity$|/planner/nominal_joint_command$|/planner/(raw_)?nominal_trajectory$|/joint_group_velocity_controller/command$|/perception/persistent_obstacles$|/perception/cleaned_obstacles$|/pipeline/timing/.*'
   
 When it is done, run :
 
-python3 scripts/plot_cbf_diagnostics.py runPP102.bag --csv for the plots of one bag
+python3 scripts/plot_cbf_diagnostics.py runPP1013.bag --csv for the plots of one bag
 
 For comparison : 
 

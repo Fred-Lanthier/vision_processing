@@ -288,10 +288,13 @@ class AnalyticalBernsteinSoftmin:
     The RDF implementation in this repository uses the local normalization
 
         u = (p_l - centroid) / scale,  t = (clamp(u) + 1) / 2,
-        f = scale * (P(t) + ||u - clamp(u)||).
+        f = scale * sqrt(P(t)^2 + ||u - clamp(u)||^2)  outside (P >= 0),
+        f = scale * P(t)                               inside.
 
-    The residual term is included below, so both values and gradients match the
-    existing ``BernsteinCore`` outside its polynomial box as well as inside it.
+    The out-of-domain extension is a guaranteed lower bound on the true
+    distance whose gradient stays outward-oriented (monotone in the
+    excursion); values and gradients match the existing ``BernsteinCore``
+    outside its polynomial box as well as inside it.
     Polynomial orders may differ between links; equal-order links are evaluated
     together using the groups already constructed by ``BernsteinCore``.
     """
@@ -546,9 +549,19 @@ class AnalyticalBernsteinSoftmin:
         polynomial, gradient_t = tensor_product_bernstein_value_gradient(
             t, weights, binomial, lower_binomial)
 
-        # f = scale*(P + ||residual||), normalized=(p_l-c)/scale.
-        # The outer/inner scale factors cancel in df/dp_l.  Clamp contributes
-        # only on interior coordinates; the residual contributes outside.
+        # f = scale * sqrt(P^2 + ||residual||^2) outside the box (P >= 0),
+        # f = scale * P inside (residual == 0), normalized=(p_l-c)/scale.
+        # Guaranteed LOWER bound on the true distance: every link surface
+        # point s lies in the clamp cube, and on each clamped axis
+        # |p_j - s_j| = |c_j - s_j| + |res_j|, hence
+        # d_true^2 >= P^2 + ||res||^2 (matches BernsteinCore). This bound is
+        # monotone increasing in the excursion, so the gradient keeps the
+        # physical outward direction everywhere (required by the CBF and the
+        # null-space clearance drive); it also joins nabla P smoothly at the
+        # domain boundary. P < 0 at the clamped point (clamp-margin shell)
+        # falls back to P + ||res|| to preserve the penetration sign. The
+        # outer/inner scale factors cancel in df/dp_l. Clamp contributes only
+        # on interior coordinates; the residual contributes outside.
         interior = ((normalized >= lower) & (normalized <= upper)).to(
             dtype=local_points.dtype)
         polynomial_gradient_local = 0.5 * gradient_t * interior
@@ -559,8 +572,36 @@ class AnalyticalBernsteinSoftmin:
             residual / residual_norm[..., None].clamp_min(tiny),
             torch.zeros_like(residual),
         )
-        sdf = (polynomial + residual_norm) * scales[..., 0]
-        return sdf, polynomial_gradient_local + residual_gradient_local
+        outside = residual_norm > 0.0
+        positive = polynomial >= 0.0
+        pythagorean = torch.sqrt(
+            polynomial.clamp_min(0.0).square() + residual_norm.square())
+        value = torch.where(
+            outside,
+            torch.where(positive, pythagorean, polynomial + residual_norm),
+            polynomial,
+        )
+        # Gradient of the active branch:
+        #   sqrt branch:  (P * dP + res) / value  (all components outward;
+        #                 -> dP smoothly as res -> 0)
+        #   shell branch: dP + res_unit           (P < 0 continuation)
+        #   inside:       dP
+        safe_value = pythagorean.clamp_min(tiny)
+        sqrt_gradient = (
+            polynomial.clamp_min(0.0)[..., None] * polynomial_gradient_local
+            + residual
+        ) / safe_value[..., None]
+        gradient_local = torch.where(
+            (outside & positive)[..., None],
+            sqrt_gradient,
+            torch.where(
+                outside[..., None],
+                polynomial_gradient_local + residual_gradient_local,
+                polynomial_gradient_local,
+            ),
+        )
+        sdf = value * scales[..., 0]
+        return sdf, gradient_local
 
     def _evaluate_grasp_sdf(
         self,

@@ -1,0 +1,188 @@
+<?xml version="1.0"?>
+<!-- PICK-AND-PLACE Gazebo environment, xArm7 variant (cross-embodiment).
+     Same scene as pickplace_simulation.launch (table, red cube, brown box,
+     static/wrist cameras, obstacles), but the robot is an xArm7 with the
+     FRANKA HAND welded on the flange (urdf/xarm7_pickplace.xacro): the FM
+     policy end-effector, conditioning cloud and /franka_gripper interface are
+     identical to the panda sim; only the arm embodiment changes.
+
+     Differences from the panda sim, all forced by dropping FrankaHWSim:
+       - controllers come from simple_controllers_xarm.yaml (self-contained,
+         incl. the FrankaGripperSim gripper + DefaultRobotHWSim PID gains);
+       - joint_state_controller publishes /joint_states directly (arm+fingers),
+         so there is no franka_state_controller / joint_state_publisher merge;
+       - the arm homes to the SAME world TCP pose as the panda start
+         ((0.615, 0, 0.35), straight down), solved for the xArm7 kinematics.
+     The Gazebo model is named `xarm7`: pass robot_model:=xarm7 to
+     gripper_grasp_node_pp and expect it in expected_models below. -->
+<launch>
+  <arg name="arm_id" default="panda"/>
+  <arg name="paused" default="true"/>
+  <arg name="gui" default="true"/>
+  <!-- Pick-and-place uses the CBF velocity-controller path by default. -->
+  <arg name="use_direct_group_position_controller" default="false"/>
+  <arg name="use_direct_group_velocity_controller" default="true"/>
+  <!-- arm_effort_mode=true (default): load the DefaultRobotHWSim arm PID gains ->
+       effort-driven arm with real contact physics. false: no pid_gains -> kinematic
+       SetPosition arm (perfectly stiff, no collisions). A/B toggle for debugging. -->
+  <arg name="arm_effort_mode" default="true"/>
+  <arg name="launch_sam3_server" default="true"/>
+  <arg name="obstacle_enabled" default="true"/>
+  <arg name="obstacle_shape" default="cylinder"/>
+  <arg name="obstacle_x" default="0.535"/>
+  <arg name="obstacle_y" default="-0.190"/>
+  <arg name="obstacle_yaw" default="-0.160"/>
+  <arg name="obstacle_radius" default="0.040"/>
+  <arg name="obstacle_height" default="0.180"/>
+  <arg name="obstacle_prism_size_x" default="0.100"/>
+  <arg name="obstacle_prism_size_y" default="0.060"/>
+  <arg name="obstacle_prism_height" default="0.360"/>
+  <arg name="obstacle_gazebo_z"
+       default="$(eval 0.75 + 0.5 * (float(arg('obstacle_prism_height')) if arg('obstacle_shape') == 'prism' else float(arg('obstacle_height'))))"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find vision_processing)/worlds/feeding.world"/>
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="use_sim_time" value="true"/>
+  </include>
+
+  <!-- Table (top at z=0.75); robot base sits on it at world (0,0,0.75). -->
+  <param name="table_description"
+         textfile="$(find vision_processing)/urdf/table.urdf"/>
+  <node name="spawn_table" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -model table -param table_description
+              -x 0.3 -y 0.0 -z 0.0"/>
+
+  <!-- Red pick cube: ManiSkill base (0.56,-0.035,0.02) -> world (0.56,-0.035,0.77). -->
+  <param name="red_cube_description"
+         textfile="$(find vision_processing)/urdf/red_cube.urdf"/>
+  <node name="spawn_red_cube" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -model red_cube -param red_cube_description
+              -x 0.56 -y -0.035 -z 0.77"/>
+
+  <!-- Brown place box: fixed training shelf position, see pickplace_simulation.launch. -->
+  <param name="brown_box_description"
+         textfile="$(find vision_processing)/urdf/brown_box.urdf"/>
+  <node name="spawn_brown_box" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -model brown_box -param brown_box_description
+              -x 0.515 -y -0.35 -z 0.755"/>
+
+  <!-- Static CBF test obstacle: Gazebo pose is table-frame xy, plus table-top z=0.75. -->
+  <param name="pp_cylinder_obstacle_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/pp_cylinder_obstacle.xacro
+                  radius:=$(arg obstacle_radius)
+                  height:=$(arg obstacle_height)"/>
+  <node name="spawn_pp_cbf_cylinder" pkg="gazebo_ros" type="spawn_model"
+        if="$(eval arg('obstacle_enabled') and arg('obstacle_shape') == 'cylinder')"
+        args="-urdf -model pp_cbf_cylinder -param pp_cylinder_obstacle_description
+              -x $(arg obstacle_x) -y $(arg obstacle_y)
+              -z $(arg obstacle_gazebo_z)
+              -Y $(arg obstacle_yaw)"/>
+
+  <param name="pp_prism_obstacle_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/pp_prism_obstacle.xacro
+                  size_x:=$(arg obstacle_prism_size_x)
+                  size_y:=$(arg obstacle_prism_size_y)
+                  height:=$(arg obstacle_prism_height)"/>
+  <node name="spawn_pp_cbf_prism" pkg="gazebo_ros" type="spawn_model"
+        if="$(eval arg('obstacle_enabled') and arg('obstacle_shape') == 'prism')"
+        args="-urdf -model pp_cbf_prism -param pp_prism_obstacle_description
+              -x $(arg obstacle_x) -y $(arg obstacle_y)
+              -z $(arg obstacle_gazebo_z)
+              -Y $(arg obstacle_yaw)"/>
+
+  <param name="pp_crescent_obstacle_description"
+         command="$(find xacro)/xacro $(find vision_processing)/urdf/pp_crescent_obstacle.xacro
+                  height:=$(arg obstacle_height)"/>
+  <node name="spawn_pp_cbf_crescent" pkg="gazebo_ros" type="spawn_model"
+        if="$(eval arg('obstacle_enabled') and arg('obstacle_shape') == 'crescent')"
+        args="-urdf -model pp_cbf_crescent -param pp_crescent_obstacle_description
+              -x $(arg obstacle_x) -y $(arg obstacle_y)
+              -z $(arg obstacle_gazebo_z)
+              -Y $(arg obstacle_yaw)"/>
+
+  <!-- xArm7 + welded Franka hand + cameras. Homed to the SAME world TCP pose
+       as the panda ManiSkill lower start ((0.615, 0, 0.35), z down), solved
+       with fast_ik on this URDF. Fingers open. -->
+  <!-- gen_xarm7_pickplace_urdf.sh = xacro + strip the finger <mimic> tag, which
+       under DefaultRobotHWSim would block FrankaGripperSim from claiming
+       panda_finger_joint2 (fingers stay limp). FrankaGripperSim couples the
+       fingers in software, so removing the URDF mimic makes them driven/close.
+       Gazebo-only; the planner/CBF load the xacro directly (mimic harmless there). -->
+  <param name="robot_description"
+         command="$(find vision_processing)/scripts/gen_xarm7_pickplace_urdf.sh arm_id:=$(arg arm_id)"/>
+
+  <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+        args="-param robot_description
+              -urdf
+              -model xarm7
+              -z 0.75
+              -J xarm7_joint1 0.0
+              -J xarm7_joint2 0.525248
+              -J xarm7_joint3 0.0
+              -J xarm7_joint4 2.034011
+              -J xarm7_joint5 0.0
+              -J xarm7_joint6 1.508763
+              -J xarm7_joint7 0.0
+              -J panda_finger_joint1 0.04
+              -J panda_finger_joint2 0.04"/>
+
+  <!-- Self-contained controller config (incl. franka_gripper sim + PID gains);
+       no franka_hw_sim.yaml / franka_gazebo sim_controllers.yaml here. -->
+  <rosparam file="$(find vision_processing)/config/simple_controllers_xarm.yaml"
+            command="load"/>
+  <!-- Arm effort PID gains: loaded only in effort mode. Omitting them leaves the
+       PositionJointInterface arm on kinematic SetPosition tracking. -->
+  <rosparam if="$(arg arm_effort_mode)"
+            file="$(find vision_processing)/config/xarm7_gazebo_pid_gains.yaml"
+            command="load"/>
+
+  <!-- franka_gripper = FrankaGripperSim: serves the grasp/move actions on the
+       welded panda hand. joint_state_controller replaces the panda's
+       franka_state_controller + joint_state_publisher merge: it publishes ALL
+       transmission joints (arm + fingers) straight to /joint_states. -->
+  <node name="controller_spawner_direct_position" pkg="controller_manager" type="spawner"
+        if="$(arg use_direct_group_position_controller)"
+        respawn="false" output="screen"
+        args="joint_state_controller joint_group_position_controller franka_gripper"/>
+  <node name="controller_spawner_direct_velocity" pkg="controller_manager" type="spawner"
+        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))"
+        respawn="false" output="screen"
+        args="joint_state_controller joint_group_velocity_controller franka_gripper"/>
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"
+        respawn="true" output="screen"/>
+
+  <node name="franka_state_camera_reader"
+        pkg="vision_processing" type="franka_state_camera_reader"
+        respawn="true" output="screen"/>
+
+  <!-- Unpause physics once all models + the velocity controller exist. -->
+  <node name="unpause_after_velocity_controller_hold"
+        pkg="vision_processing" type="unpause_after_controller_hold.py"
+        output="screen"
+        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))">
+    <param name="controller_name" value="joint_group_velocity_controller"/>
+    <param name="command_topic" value="/joint_group_velocity_controller/command"/>
+    <param name="command_type" value="group_velocity"/>
+    <rosparam param="expected_models">[table, red_cube, brown_box, xarm7]</rosparam>
+    <param name="publish_repeats" value="20"/>
+    <param name="publish_period" value="0.05"/>
+  </node>
+  <node name="unpause_after_group_controller_hold"
+        pkg="vision_processing" type="unpause_after_controller_hold.py"
+        output="screen"
+        if="$(arg use_direct_group_position_controller)">
+    <param name="controller_name" value="joint_group_position_controller"/>
+    <param name="command_topic" value="/joint_group_position_controller/command"/>
+    <param name="command_type" value="group_position"/>
+    <rosparam param="expected_models">[table, red_cube, brown_box, xarm7]</rosparam>
+    <rosparam param="homing_position">[0.0, 0.525248, 0.0, 2.034011, 0.0, 1.508763, 0.0]</rosparam>
+    <param name="publish_repeats" value="20"/>
+    <param name="publish_period" value="0.05"/>
+  </node>
+
+  <node name="sam3_server" pkg="vision_processing" type="sam3_server.py"
+        respawn="true" output="screen" if="$(arg launch_sam3_server)"/>
+</launch>

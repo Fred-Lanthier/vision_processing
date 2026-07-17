@@ -1,0 +1,430 @@
+<?xml version="1.0"?>
+<!-- xArm7 for the PICK-AND-PLACE Gazebo system, with the FRANKA HAND welded on
+     the flange (cross-embodiment experiment: same end-effector as training, so
+     the FM policy conditioning cloud, the gripper-width cue and the grasp/weld
+     chain stay byte-identical; only the arm changes).
+
+     - Arm links/joints are renamed xarm7_link1..7 / xarm7_joint1..7. The link
+       names MUST match the Bernstein SDF weight files
+       (SDF_Bernstein_Basis/panda_test/Models/xarm7_link*_w.pt).
+     - panda_hand is attached to the xarm7_link7 flange by a fixed joint;
+       panda_TCP = panda_hand + 0.1034 z, identical to panda_pickplace.xacro.
+     - Gazebo control uses the DEFAULT gazebo_ros_control HW sim (NOT
+       franka_gazebo/FrankaHWSim, which requires a Franka arm):
+         * xarm7_joint1..7 -> PositionJointInterface (the
+           vision_processing/JointGroupVelocityController integrates dq -> q
+           and Gazebo's position PID holds against gravity),
+         * panda_finger_joint1/2 -> EffortJointInterface, so
+           franka_gazebo/FrankaGripperSim still serves /franka_gripper actions.
+     - Static + wrist cameras copied verbatim from panda_pickplace.xacro.
+     Sibling of panda_pickplace.xacro; do not use for the feeding system. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="xarm7">
+
+  <!-- The planner/CBF nodes process this file with mappings={'arm_id': 'panda'};
+       the hand subtree keeps its panda_* names so every downstream consumer
+       (policy conditioning, grasp node, SDF weights) is unchanged. -->
+  <xacro:arg name="arm_id" default="panda" />
+
+  <xacro:include filename="$(find franka_description)/robots/common/utils.xacro" />
+  <xacro:include filename="$(find franka_description)/robots/common/franka_hand.xacro" />
+
+  <!-- ================= xArm7 arm (from RDF xarm7_FT_EE.urdf) ================= -->
+  <material name="Black">
+    <color rgba="0.0 0.0 0.0 1.0" />
+  </material>
+  <material name="Red">
+    <color rgba="0.8 0.0 0.0 1.0" />
+  </material>
+  <material name="White">
+    <color rgba="1.0 1.0 1.0 1.0" />
+  </material>
+  <material name="Silver">
+    <color rgba="0.753 0.753 0.753 1.0" />
+  </material>
+
+  <link name="world"/>
+  <joint name="world_joint" type="fixed">
+    <parent link="world"/>
+    <child link="xarm7_link_base"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+  </joint>
+
+  <link name="xarm7_link_base">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.00027569 -0.00002500 0.07259089" />
+      <mass value="1.875" />
+      <inertia ixx="0.00484966" ixy="0.00000285" ixz="0.00002471" iyy="0.00487983" iyz="0.00000243" izz="0.00231210" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/visual/link_base.dae" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/collision/link_base.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <link name="xarm7_link1">
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.00000001 0.00160599 -0.03216111" />
+      <mass value="2.168" />
+      <inertia ixx="0.00626097" ixy="0.0" ixz="-0.00000112" iyy="0.00573739" iyz="0.00031090" izz="0.00308031" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/visual/link1.dae" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/collision/link1.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <link name="xarm7_link2">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.00000447 -0.08442622 0.04721398" />
+      <mass value="2.73" />
+      <inertia ixx="0.01465324" ixy="-0.00000021" ixz="0.00000103" iyy="0.00694666" iyz="0.00443101" izz="0.01056342" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/visual/link2.dae" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/collision/link2.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <link name="xarm7_link3">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.02906440 0.00556162 -0.03120185" />
+      <mass value="1.923" />
+      <inertia ixx="0.00459931" ixy="-0.00001085" ixz="0.00161543" iyy="0.00532435" iyz="0.00013063" izz="0.00352704" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/visual/link3.dae" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/collision/link3.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <link name="xarm7_link4">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.05708279 -0.07189834 0.04205398" />
+      <mass value="2.577" />
+      <inertia ixx="0.01083792" ixy="-0.00335663" ixz="-0.00183695" iyy="0.00826380" iyz="0.00318387" izz="0.01036678" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/visual/link4.dae" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/collision/link4.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <link name="xarm7_link5">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.00016816 0.03090249 -0.08031427" />
+      <mass value="1.413" />
+      <inertia ixx="0.00844774" ixy="0.0" ixz="0.00000002" iyy="0.00761972" iyz="0.00195119" izz="0.00199753" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/visual/link5.dae" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/collision/link5.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <link name="xarm7_link6">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.04616698 0.00947581 0.00846414" />
+      <mass value="1.388" />
+      <inertia ixx="0.00159996" ixy="0.00038970" ixz="-0.00046448" iyy="0.00295668" iyz="-0.00011078" izz="0.00327270" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/visual/link6.dae" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="White" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/collision/link6.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <link name="xarm7_link7">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.00006906 -0.00179820 -0.01774746" />
+      <mass value="0.223" />
+      <inertia ixx="0.00011692" ixy="0.0" ixz="0.0" iyy="0.00009809" iyz="0.00000049" izz="0.00018277" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/visual/link7.dae" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <material name="Silver" />
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://vision_processing/third_party/RDF/collision_avoidance_example/xarm7_urdf/xarm7_1305/collision/link7.stl" />
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+    </collision>
+  </link>
+  <!-- SIM-ONLY effort ceiling (raised from the real 50/50/30/30/30/20/20 Nm to
+       300). DefaultRobotHWSim has no gravity compensation, so the position-PID
+       output must supply gravity torque (~40 Nm at joint2) PLUS tracking torque;
+       the real limits clipped it, so the arm lagged the command and the planner
+       (anchoring at the lagging state) wound the wrist. 300 lets the arm track
+       near-rigidly (approaching the kinematic-sim feel) while staying effort-
+       driven so contacts with static geometry remain physical. Kinematics/IK/CBF
+       ignore effort limits, so this is Gazebo-only. -->
+  <joint name="xarm7_joint1" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.267" />
+    <parent link="xarm7_link_base" />
+    <child link="xarm7_link1" />
+    <axis xyz="0 0 1" />
+    <limit effort="300" lower="-6.283185307179586" upper="6.283185307179586" velocity="3.14" />
+    <dynamics damping="10" friction="1" />
+  </joint>
+  <joint name="xarm7_joint2" type="revolute">
+    <origin rpy="-1.5708 0 0" xyz="0 0 0" />
+    <parent link="xarm7_link1" />
+    <child link="xarm7_link2" />
+    <axis xyz="0 0 1" />
+    <limit effort="300" lower="-2.059" upper="2.0944" velocity="3.14" />
+    <dynamics damping="10" friction="1" />
+  </joint>
+  <joint name="xarm7_joint3" type="revolute">
+    <origin rpy="1.5708 0 0" xyz="0 -0.293 0" />
+    <parent link="xarm7_link2" />
+    <child link="xarm7_link3" />
+    <axis xyz="0 0 1" />
+    <limit effort="300" lower="-6.283185307179586" upper="6.283185307179586" velocity="3.14" />
+    <dynamics damping="5" friction="1" />
+  </joint>
+  <joint name="xarm7_joint4" type="revolute">
+    <origin rpy="1.5708 0 0" xyz="0.0525 0 0" />
+    <parent link="xarm7_link3" />
+    <child link="xarm7_link4" />
+    <axis xyz="0 0 1" />
+    <limit effort="300" lower="-0.19198" upper="3.927" velocity="3.14" />
+    <dynamics damping="5" friction="1" />
+  </joint>
+  <joint name="xarm7_joint5" type="revolute">
+    <origin rpy="1.5708 0 0" xyz="0.0775 -0.3425 0" />
+    <parent link="xarm7_link4" />
+    <child link="xarm7_link5" />
+    <axis xyz="0 0 1" />
+    <limit effort="300" lower="-6.283185307179586" upper="6.283185307179586" velocity="3.14" />
+    <dynamics damping="5" friction="1" />
+  </joint>
+  <joint name="xarm7_joint6" type="revolute">
+    <origin rpy="1.5708 0 0" xyz="0 0 0" />
+    <parent link="xarm7_link5" />
+    <child link="xarm7_link6" />
+    <axis xyz="0 0 1" />
+    <limit effort="300" lower="-1.69297" upper="3.141592653589793" velocity="3.14" />
+    <dynamics damping="2" friction="1" />
+  </joint>
+  <joint name="xarm7_joint7" type="revolute">
+    <origin rpy="-1.5708 0 0" xyz="0.076 0.097 0" />
+    <parent link="xarm7_link6" />
+    <child link="xarm7_link7" />
+    <axis xyz="0 0 1" />
+    <limit effort="300" lower="-6.283185307179586" upper="6.283185307179586" velocity="3.14" />
+    <dynamics damping="2" friction="1" />
+  </joint>
+
+  <!-- ================= Franka hand welded on the flange ================= -->
+  <!-- xarm7_link7's frame sits on the flange surface (the FT/EE bodies of the
+       source URDF mount there at xyz 0). rpy=0: the wrist roll (xarm7_joint7,
+       +-2pi) absorbs any yaw preference of the policy. -->
+  <xacro:franka_hand
+      arm_id="$(arg arm_id)"
+      rpy="0 0 0"
+      connected_to="xarm7_link7"
+      safety_distance="0.03"
+      gazebo="true"
+   />
+
+  <!-- TCP = controlled link for the pick-and-place policy (panda_hand + 0.1034 z). -->
+  <link name="panda_TCP"/>
+  <joint name="panda_TCP_joint" type="fixed">
+    <parent link="panda_hand"/>
+    <child link="panda_TCP"/>
+    <origin xyz="0 0 0.1034" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Keep panda_hand a STANDALONE Gazebo link so gazebo_ros_link_attacher can
+       weld the cube to it (same trick as panda_pickplace.xacro; without it the
+       hand gets lumped into xarm7_link7 and the attacher SEGFAULTS gzserver). -->
+  <gazebo reference="panda_hand_joint">
+    <disableFixedJointLumping>true</disableFixedJointLumping>
+    <preserveFixedJoint>true</preserveFixedJoint>
+  </gazebo>
+
+  <!-- ================= Gazebo ros_control ================= -->
+  <!-- Gravity ON (physically faithful, like the panda under FrankaHWSim). The
+       arm is held by the manufacturer-validated effort-PID gains ported from
+       xarm_ros (third_party/xarm_ros/xarm_controller/config/xarm7/
+       xarm7_controllers.yaml) into simple_controllers_xarm.yaml's
+       gazebo_ros_control:pid_gains block, tuned for these exact link inertias
+       with gravity enabled. The i-term supplies the steady gravity torque
+       (i_clamp must exceed the max static gravity torque, ~40 Nm at joint 2).
+       The arm stays EFFORT-driven so contacts with static geometry remain
+       physical. Hand + fingers keep gravity; the fingers are driven by
+       FrankaGripperSim.
+       (Previous approach disabled arm-link gravity to fake FrankaHWSim's
+       gravity compensation; replaced by real gravity + proven gains.) -->
+
+  <xacro:gazebo-joint joint="xarm7_joint1" transmission="hardware_interface/PositionJointInterface" />
+  <xacro:gazebo-joint joint="xarm7_joint2" transmission="hardware_interface/PositionJointInterface" />
+  <xacro:gazebo-joint joint="xarm7_joint3" transmission="hardware_interface/PositionJointInterface" />
+  <xacro:gazebo-joint joint="xarm7_joint4" transmission="hardware_interface/PositionJointInterface" />
+  <xacro:gazebo-joint joint="xarm7_joint5" transmission="hardware_interface/PositionJointInterface" />
+  <xacro:gazebo-joint joint="xarm7_joint6" transmission="hardware_interface/PositionJointInterface" />
+  <xacro:gazebo-joint joint="xarm7_joint7" transmission="hardware_interface/PositionJointInterface" />
+  <xacro:gazebo-joint joint="$(arg arm_id)_finger_joint1" transmission="hardware_interface/EffortJointInterface" />
+  <xacro:gazebo-joint joint="$(arg arm_id)_finger_joint2" transmission="hardware_interface/EffortJointInterface" />
+  <xacro:gazebo-friction link="$(arg arm_id)_leftfinger" mu="1.13" />
+  <xacro:gazebo-friction link="$(arg arm_id)_rightfinger" mu="1.13" />
+
+  <gazebo>
+    <plugin name="gazebo_ros_control" filename="libgazebo_ros_control.so">
+      <controlPeriod>0.001</controlPeriod>
+      <robotSimType>gazebo_ros_control/DefaultRobotHWSim</robotSimType>
+    </plugin>
+    <self_collide>true</self_collide>
+  </gazebo>
+
+  <!-- ================= Cameras (verbatim from panda_pickplace.xacro) ================= -->
+  <joint name="camera_static_joint" type="fixed">
+    <parent link="world" />
+    <child link="camera_static_link" />
+    <origin xyz="0.9 -0.19 0.62" rpy="0 1.003 3.1416" />
+  </joint>
+
+  <link name="camera_static_link">
+    <visual>
+      <geometry><box size="0.025 0.09 0.02"/></geometry>
+    </visual>
+    <inertial>
+      <mass value="0.1" /><inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4" />
+    </inertial>
+  </link>
+
+  <joint name="camera_static_optical_joint" type="fixed">
+    <parent link="camera_static_link"/><child link="camera_static_optical_frame"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <link name="camera_static_optical_frame"/>
+
+  <joint name="camera_wrist_joint" type="fixed">
+    <parent link="panda_TCP"/>
+    <child link="camera_wrist_link"/>
+    <origin xyz="-0.052 0.035 -0.045" rpy="0 ${-pi/2} 0"/>
+  </joint>
+
+  <link name="camera_wrist_link">
+    <visual>
+      <geometry><box size="0.025 0.09 0.02"/></geometry>
+    </visual>
+    <inertial>
+      <mass value="0.1" /><inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4" />
+    </inertial>
+  </link>
+
+  <joint name="camera_wrist_optical_joint" type="fixed">
+    <parent link="camera_wrist_link"/><child link="camera_wrist_optical_frame"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <link name="camera_wrist_optical_frame"/>
+
+  <gazebo reference="camera_static_link">
+    <material>Gazebo/Red</material>
+    <sensor type="depth" name="camera_static">
+      <update_rate>12.0</update_rate>
+      <camera>
+        <horizontal_fov>0.958</horizontal_fov>
+        <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+        <clip><near>0.1</near><far>10.0</far></clip>
+      </camera>
+      <plugin name="static_camera_controller" filename="libgazebo_ros_openni_kinect.so">
+        <cameraName>camera_static</cameraName>
+        <alwaysOn>true</alwaysOn>
+        <imageTopicName>color/image_raw</imageTopicName>
+        <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>
+        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
+        <frameName>camera_static_optical_frame</frameName>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="camera_wrist_link">
+    <material>Gazebo/Blue</material>
+    <sensor type="depth" name="camera_wrist">
+      <update_rate>12.0</update_rate>
+      <camera>
+        <horizontal_fov>0.973</horizontal_fov>
+        <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+        </image>
+        <clip>
+            <near>0.01</near> <far>10.0</far>
+        </clip>
+      </camera>
+      <plugin name="wrist_camera_controller" filename="libgazebo_ros_openni_kinect.so">
+        <cameraName>camera_wrist</cameraName>
+        <alwaysOn>true</alwaysOn>
+        <imageTopicName>color/image_raw</imageTopicName>
+        <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>
+        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>
+        <frameName>camera_wrist_optical_frame</frameName>
+        <pointCloudCutoff>0.01</pointCloudCutoff>
+        <pointCloudCutoffMax>10.0</pointCloudCutoffMax>
+        <updateRate>12.0</updateRate>
+      </plugin>
+    </sensor>
+  </gazebo>
+</robot>

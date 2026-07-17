@@ -43,6 +43,22 @@ public:
         w.setZero();
         Jt_temp.resize(model.nv);
         Jt_temp.setZero();
+
+        // Joint-limit avoidance (secondary null-space task) + hard clamp.
+        // The redundancy was previously resolved ONLY by "stay near the seed"
+        // (k_null), with no awareness of joint limits: on the xArm7 the
+        // panda-trained TCP trajectory drove joint6 to its 3.14 rad upper limit
+        // (and joint5 wound toward 2*pi), and past saturation the arm flailed.
+        // The panda never nears its limits on this task, so both terms below
+        // stay ~0 for it (limits_aligned && within-margin gated) -> no regression.
+        q_lower = model.lowerPositionLimit;
+        q_upper = model.upperPositionLimit;
+        // Only 1-DoF joints (nq == nv, as for panda/xArm7): otherwise q indices
+        // do not line up with the tangent v, so disable rather than corrupt a
+        // continuous/floating joint.
+        limits_aligned = (model.nq == model.nv);
+        k_limit = 1.0;        // gain of the limit-avoidance push [1/s]
+        limit_margin = 0.25;  // [rad] activation band from each limit; 0 outside
     }
 
     Eigen::VectorXd get_random_q() {
@@ -92,10 +108,18 @@ public:
             const pinocchio::SE3 dMi = oMdes.actInv(data.oMf[ee_frame_id]);
             
             // --- GUARD: Protection contre rotation dégénérée (NaN dans log6) ---
+            // Epsilon on the trace bounds: a numerically perfect orientation
+            // match gives tr = 3.0 +/- 1e-15 and a 180-degree flip tr = -1.0
+            // -/+ 1e-15; the exact bounds made the guard trip on VALID
+            // rotations and silently return the seed. On the xArm7 chain the
+            // near-identity error rotation lands just ABOVE 3.0, freezing
+            // every warm-started solve whose target keeps the current
+            // orientation (constant-orientation pick trajectories).
             Eigen::Matrix3d R_check = dMi.rotation();
             double det = R_check.determinant();
             double tr = R_check.trace();
-            if (!std::isfinite(det) || std::abs(det - 1.0) > 0.1 || tr < -1.0 || tr > 3.0) {
+            if (!std::isfinite(det) || std::abs(det - 1.0) > 0.1 ||
+                tr < -1.0 - 1e-6 || tr > 3.0 + 1e-6) {
                 break; // Retourner q courant au lieu de crasher
             }
             
@@ -125,6 +149,26 @@ public:
             
             // Tâche secondaire en espace nul (maintien de la configuration q_start)
             w.noalias() = -k_null * (q - q_start);
+
+            // + Joint-limit avoidance: a one-sided gradient that is exactly zero
+            // outside a margin of each limit and grows toward it, pushing the
+            // joint back into range. Added to w so it is projected into the
+            // null space below (no effect on Cartesian tracking; it spends the
+            // arm's redundancy). Inert away from limits -> panda unaffected.
+            if (limits_aligned && k_limit > 0.0) {
+                for (int j = 0; j < model.nv; ++j) {
+                    double lo = q_lower(j), hi = q_upper(j);
+                    if (!std::isfinite(lo) || !std::isfinite(hi)) continue;
+                    double range = hi - lo;
+                    if (range < 0.1) continue;  // skip near-fixed joints (fingers)
+                    double m = std::min(limit_margin, 0.5 * range);
+                    if (q(j) > hi - m)
+                        w(j) += -k_limit * (q(j) - (hi - m)) / (m * m);
+                    else if (q(j) < lo + m)
+                        w(j) += -k_limit * (q(j) - (lo + m)) / (m * m);
+                }
+            }
+
             Eigen::Matrix<double, 6, 1> Jw;
             Jw.noalias() = J * w;
             Eigen::Matrix<double, 6, 1> temp = JJt.ldlt().solve(Jw);
@@ -144,6 +188,17 @@ public:
                 break;
             }
             q = q_next;
+
+            // Hard clamp to the URDF position limits so the solution never
+            // COMMANDS past a joint's limit (Gazebo would clamp anyway, and the
+            // resulting command/measured mismatch is what drove the flailing).
+            // Keeps the warm-start feasible for the next iteration too.
+            if (limits_aligned) {
+                for (int j = 0; j < model.nv; ++j) {
+                    if (std::isfinite(q_lower(j)) && std::isfinite(q_upper(j)))
+                        q(j) = std::min(std::max(q(j), q_lower(j)), q_upper(j));
+                }
+            }
         }
         
         pinocchio::forwardKinematics(model, data, q);
@@ -232,12 +287,21 @@ private:
     Eigen::VectorXd v;
     Eigen::VectorXd w;
     Eigen::VectorXd Jt_temp;
+    Eigen::VectorXd q_lower;
+    Eigen::VectorXd q_upper;
+    bool limits_aligned;
+
+public:
+    double k_limit;       // joint-limit-avoidance gain (0 disables the term)
+    double limit_margin;  // [rad] band from each limit where avoidance activates
 };
 
 PYBIND11_MODULE(fast_ik_module, m) {
     py::class_<FastIK>(m, "FastIK")
         .def(py::init<const std::string &, const std::string &>())
         .def_readwrite("k_null", &FastIK::k_null)
+        .def_readwrite("k_limit", &FastIK::k_limit)
+        .def_readwrite("limit_margin", &FastIK::limit_margin)
         .def("get_random_q", &FastIK::get_random_q)
         .def("get_nq", &FastIK::get_nq)
         .def("get_nv", &FastIK::get_nv)

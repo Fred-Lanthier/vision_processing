@@ -12,7 +12,7 @@ import struct
 import xacro
 import tempfile
 import xml.etree.ElementTree as ET
-from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray, Header, String
+from std_msgs.msg import Bool, Float32, Float32MultiArray, Float64MultiArray, Header, String
 from sensor_msgs.msg import JointState, PointCloud2, PointField
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import Point
@@ -83,7 +83,7 @@ DIAG_SCALAR_FIELDS = [
     "repair_applied",   # 1 if post-clamp repair modified the command
     "constr_final",     # constraint value after repair (NaN if repair off)
     "grad_h_norm",      # |grad_h| of the most critical constraint
-    "escape_active",    # 1 while local tangent/normal escape is active
+    "escape_active",    # proportional escape gate [0,1] (0 = off)
     "ema_applied",      # always 0
     "velocity_filter_active",  # always 0
     "vel_source",       # always 1 (position differencing)
@@ -111,6 +111,8 @@ DIAG_SCALAR_FIELDS = [
     "h_food",           # grasped-target group barrier (its own grasp_d_safe);
                         # NaN unless two-group (grasp separate constraint) is on.
                         # The base "h" field is then the robot/fork group barrier.
+    "sampled_margin",   # state-dependent sampled-data QP margin m(dq) [m/s]
+                        # (0 when ~cbf_sampled_data_margin is off)
 ]
 
 
@@ -143,11 +145,16 @@ class CBFSafetyNode:
         else:
             urdf_path = urdf_path_raw
 
+        # Voxelized link meshes for URDFLayer's mesh resolution (matched by
+        # basename). Default = panda; the xArm7 launch passes voxel_128_xarm7
+        # (hand/finger meshes fall back to franka_description either way).
+        voxel_dir = rospy.get_param(
+            '~voxel_dir', pkg_path + '/third_party/RDF/panda_layer/meshes/voxel_128')
         self.robot_layer = URDFLayer(
             urdf_path=urdf_path,
             device=self.device,
             package_dir=pkg_path,
-            voxel_dir=pkg_path + '/third_party/RDF/panda_layer/meshes/voxel_128'
+            voxel_dir=voxel_dir
         )
         self._log_cuda_memory("CBF after URDFLayer")
         
@@ -162,7 +169,7 @@ class CBFSafetyNode:
         # FM trajectory is generated about (fork_tip feeding, panda_TCP pick-place).
         link_names = list(rospy.get_param(
             '~cbf_link_names',
-            ['panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
+            ['panda_link3','panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
              'panda_hand', 'panda_rightfinger', 'panda_leftfinger', 'fork_tip']))
         self.protected_link_names = link_names
         self.controlled_link = str(rospy.get_param('~controlled_link', 'fork_tip'))
@@ -179,6 +186,34 @@ class CBFSafetyNode:
         self.tool_link = link_names[self.fork_link_index]
         self.protected_fk_tree = self.robot_layer.make_fk_subset(link_names)
         weight_handler.add_models(link_names, robot_name='panda')
+        # Optional per-link candidate models (same mechanism as the SDF
+        # visualizer): ~model_override_dir + ~model_override_links swap in
+        # candidate <link>_w.pt files (e.g. the n_func=12 finger retrains in
+        # panda_test/Models/nfunc12_candidate) without touching production.
+        # BernsteinCore below re-groups by n_func, so mixed orders are fine.
+        override_dir = str(rospy.get_param('~model_override_dir', '')).strip()
+        if override_dir:
+            from third_party.SDF_Bernstein_Basis.src.core.assets.load_model_wrapper \
+                import load_link_weight_model
+            override_links = rospy.get_param('~model_override_links', [])
+            if isinstance(override_links, str):
+                override_links = override_links.replace(',', ' ').split()
+            for link in override_links:
+                if link not in link_names:
+                    rospy.logwarn("model override: %s not a protected link, skipped", link)
+                    continue
+                candidate_path = os.path.join(override_dir, f"{link}_w.pt")
+                if not os.path.isfile(candidate_path):
+                    raise FileNotFoundError(
+                        f"model override for {link}: {candidate_path} not found")
+                candidate = load_link_weight_model(
+                    torch.load(candidate_path, map_location=self.device,
+                               weights_only=False),
+                    device=self.device, dtype=torch.float32)
+                setattr(weight_handler, link + weight_handler.model_extension,
+                        candidate)
+                rospy.loginfo("model override: %s <- %s (n_func=%d)",
+                              link, candidate_path, int(candidate.n_func))
         self._log_cuda_memory("CBF after Bernstein weights")
         
         # 3. Création du pont Core
@@ -248,6 +283,44 @@ class CBFSafetyNode:
         self.cbf_kappa = float(rospy.get_param("~cbf_kappa", 2.0))
         self.cbf_recovery_kappa = float(rospy.get_param("~cbf_recovery_kappa", 3.0))
         self.cbf_constraint_margin = float(rospy.get_param("~cbf_constraint_margin", 0.0))
+        # Sampled-data (ZOH) margin: replace the CONSTANT standoff heuristic
+        # with the state-dependent term of the sampled-data CBF condition
+        # (Breeden, Garg & Panagou, IEEE L-CSS 2022) that the certified reflex
+        # already enforces post-hoc. Over one hold of period T the barrier can
+        # dip by c = (L/2)||dq||^2 T^2 below its linear extrapolation, so
+        # keeping h >= 0 across the WHOLE hold (not just at sample instants)
+        # needs  hdot >= -kappa h + m(dq)  with  m(dq) = (L/2)||dq||^2 T [m/s].
+        # The margin is thus EARNED by the certificate, scales with the speed
+        # the QP itself allows (fast slide -> standoff covering its own
+        # curvature dip; at rest -> 0), and makes the QP and the reflex agree
+        # at the boundary instead of the reflex vetoing the QP every tick
+        # (runPP1013: h parked at m_const/kappa = 0.2 mm < dip c, alpha 0.38,
+        # braking 100% of ticks). The quadratic constraint is linearized per
+        # cycle by evaluating ||dq||^2 at max(previous published command,
+        # current nominal) — both slowly varying at 100 Hz.
+        self.cbf_sampled_data_margin = _bool_param("~cbf_sampled_data_margin", False)
+        # L: gradient-Lipschitz bound [m/rad^2], same constant family as the
+        # reflex ~grad_lipschitz (scalar; default matches the launch's 20).
+        self.cbf_sampled_data_L = float(rospy.get_param("~cbf_sampled_data_L", 20.0))
+        # T: hold period [s]; 0 = auto (1/rate_hz). Read the param directly:
+        # self.rate_hz is only set after finalize_cuda_graph() bakes the
+        # coefficient into the graphed control step.
+        self.cbf_sampled_data_T = float(rospy.get_param("~cbf_sampled_data_T", 0.0))
+        # Cap [m/s] against runaway tightening at velocity spikes; at the
+        # 0.7 rad/s clamp with L=20, T=10 ms, m = 0.049 m/s sits below it.
+        self.cbf_sampled_data_margin_max = float(rospy.get_param(
+            "~cbf_sampled_data_margin_max", 0.08))
+        _sd_T = (self.cbf_sampled_data_T if self.cbf_sampled_data_T > 0.0
+                 else 1.0 / max(float(rospy.get_param("~rate_hz", 150.0)), 1e-3))
+        self._sampled_margin_coeff = (
+            0.5 * self.cbf_sampled_data_L * _sd_T
+            if self.cbf_sampled_data_margin else 0.0)
+        if self.cbf_sampled_data_margin:
+            rospy.loginfo(
+                "CBF sampled-data margin ON: m(dq) = %.3f*||dq||^2 m/s "
+                "(L=%.1f, T=%.4f s, cap %.3f m/s)",
+                self._sampled_margin_coeff, self.cbf_sampled_data_L,
+                _sd_T, self.cbf_sampled_data_margin_max)
         self.cbf_recovery_switch_margin = float(rospy.get_param(
             "~cbf_recovery_switch_margin", 0.004))
         self.cbf_solver_mode = str(rospy.get_param(
@@ -490,6 +563,46 @@ class CBFSafetyNode:
         # CUDA graph below.
         self.cbf_constraint_sweeps = max(
             1, int(rospy.get_param("~cbf_constraint_sweeps", 6)))
+        # Inner solver over the active half-spaces (multi_graphed loop).
+        # "pocs" (legacy): cyclic projections converge to SOME feasible dq --
+        # once a projection over-corrects, the excess is never given back, so
+        # with several simultaneously active rows the output deviates more
+        # from the nominal than the QP optimum requires, and depends on row
+        # order. "dykstra": Dykstra's corrected cyclic projections (for
+        # half-spaces equivalent to Hildreth's dual method) -- each row keeps
+        # a correction-memory vector that is added back before its next
+        # projection, which provably converges to the EXACT projection of the
+        # nominal onto the intersection in the W metric (the true QP
+        # solution): minimal deviation, order-independent limit, identical to
+        # pocs whenever <= 1 constraint is active. Same _qp_step projections,
+        # ~2 extra vector ops per row-step (graph-capturable, static shapes).
+        # NOTE the per-step max_correction_speed clamp makes projections
+        # inexact when it engages, so Dykstra's optimality is approximate
+        # during hard-clamped corrections (still safe: feasibility logic and
+        # the final repair are unchanged).
+        # Refs: R. L. Dykstra, "An Algorithm for Restricted Least Squares
+        # Regression," JASA 78(384), 1983; J. P. Boyle, R. L. Dykstra, "A
+        # Method for Finding Projections onto the Intersection of Convex Sets
+        # in Hilbert Spaces," 1986; C. Hildreth, "A Quadratic Programming
+        # Procedure," Naval Res. Logist. Q. 4, 1957.
+        self.cbf_qp_algorithm = str(rospy.get_param(
+            "~cbf_qp_algorithm", "pocs")).strip().lower()
+        if self.cbf_qp_algorithm not in ("pocs", "dykstra"):
+            rospy.logwarn("Unknown ~cbf_qp_algorithm '%s', using 'pocs'",
+                          self.cbf_qp_algorithm)
+            self.cbf_qp_algorithm = "pocs"
+        # Cross-cycle Dykstra warm start: carry the dual multipliers lambda_l
+        # PER LINK IDENTITY across control cycles and rebuild the correction
+        # memories in the CURRENT constraint geometry at the head of each
+        # solve. The physical constellation persists across 100 Hz cycles, so
+        # this accumulates sweeps across cycles: the ill-conditioned tail
+        # (near-parallel gradients, rho -> 1) converges within a few cycles
+        # instead of restarting from scratch (offline prototype:
+        # scripts/solver_study.py -- carrying raw z vectors instead DIVERGES
+        # under scene drift, the lambda form is the correct one). Off by
+        # default until validated in sim; inert diff when false.
+        self.cbf_dykstra_warmstart = bool(rospy.get_param(
+            "~cbf_dykstra_warmstart", False))
         preprocess_max_points = int(rospy.get_param("~preprocess_max_points", 512))
         self.preprocess_max_points = (
             max(self.cbf_graph_points, preprocess_max_points)
@@ -500,14 +613,59 @@ class CBFSafetyNode:
         self.setup_cuda_graph(batch_size=1, n_points=self.cbf_graph_points)
         self._log_cuda_memory("CBF after CUDA graph")
         
-        self.joint_names = [
+        # Arm joint names for /joint_states lookup and command ordering.
+        # Default = panda; the xArm7 cross-embodiment launch passes xarm7_joint1..7.
+        self.joint_names = list(rospy.get_param('~arm_joint_names', [
             'panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
             'panda_joint5', 'panda_joint6', 'panda_joint7'
-        ]
+        ]))
         self.current_q = None
         self.nominal_q = None
         self.target_x = None
         self.obs_points = torch.empty((0, 3), dtype=torch.float32, device=self.device)
+
+        # Soft joint-limit barrier: per-joint velocity damping toward each
+        # limit, dq_i in [kappa*(q_lo+m - q_i), kappa*(q_hi-m - q_i)],
+        # applied to the FINAL commanded velocity (after the safety repair)
+        # in both the graphed and eager paths. On the Panda this doubles as
+        # SINGULARITY avoidance: elbow-straight is q4 at its upper limit and
+        # wrist-aligned is q6 at its lower limit, so braking margin_rad away
+        # from the limits keeps the arm out of both. Once past the margin
+        # band the bound turns positive and pushes back inside, capped at
+        # limit_push [rad/s]. margin 0 = disabled (legacy).
+        self.cbf_joint_limit_margin = float(rospy.get_param(
+            "~cbf_joint_limit_margin", 0.0))
+        self.cbf_joint_limit_kappa = float(rospy.get_param(
+            "~cbf_joint_limit_kappa", 3.0))
+        self.cbf_joint_limit_push = float(rospy.get_param(
+            "~cbf_joint_limit_push", 0.05))
+        lim_lo, lim_hi = [-1e9] * 7, [1e9] * 7
+        if self.cbf_joint_limit_margin > 0.0:
+            try:
+                import xml.etree.ElementTree as _ET
+                _lims = {}
+                for _j in _ET.parse(urdf_path).getroot().iter("joint"):
+                    _l = _j.find("limit")
+                    if _l is not None and "lower" in _l.attrib:
+                        _lims[_j.attrib.get("name", "")] = (
+                            float(_l.attrib["lower"]),
+                            float(_l.attrib["upper"]))
+                lim_lo = [_lims[n][0] for n in self.joint_names]
+                lim_hi = [_lims[n][1] for n in self.joint_names]
+                rospy.loginfo(
+                    "CBF joint-limit barrier: margin %.2f rad, kappa %.1f "
+                    "(lo %s, hi %s)", self.cbf_joint_limit_margin,
+                    self.cbf_joint_limit_kappa,
+                    ["%.2f" % v for v in lim_lo],
+                    ["%.2f" % v for v in lim_hi])
+            except Exception as exc:
+                rospy.logwarn("joint-limit parse failed (%s): "
+                              "limit barrier DISABLED", exc)
+                self.cbf_joint_limit_margin = 0.0
+        self._q_lim_lo = torch.tensor(
+            lim_lo, dtype=torch.float32, device=self.device).view(1, 7)
+        self._q_lim_hi = torch.tensor(
+            lim_hi, dtype=torch.float32, device=self.device).view(1, 7)
 
         self.max_joint_velocity = float(rospy.get_param("~max_joint_velocity", 0.7))
         self.cbf_kp = float(rospy.get_param("~cbf_kp", 10.0))
@@ -583,7 +741,7 @@ class CBFSafetyNode:
         # multimodal-commit failure the temporal ensembler fixes for the FM
         # policy) - a workspace-floor penalty (the table is NOT in the
         # obstacle cloud, so "down" would otherwise look free). Runs beside
-        # the task metric in the ~30 Hz preprocess thread; the 100 Hz graph
+        # the task metric in the preprocess thread; the 100 Hz graph
         # consumes the staged [1,7] joint row exactly as it consumed the +z
         # lift row, so the control-loop cost is unchanged.
         # cbf_escape_lift_gain remains the authority [rad/s]. The committed
@@ -593,9 +751,26 @@ class CBFSafetyNode:
             "~cbf_escape_probe_enabled", False)
         self.cbf_escape_probe_num_dirs = max(4, int(rospy.get_param(
             "~cbf_escape_probe_num_dirs", 16)))
-        self.cbf_escape_probe_radii = [
+        self.cbf_escape_probe_radii = sorted(
             float(v) for v in str(rospy.get_param(
-                "~cbf_escape_probe_radii", "0.05 0.10")).split()]
+                "~cbf_escape_probe_radii", "0.05 0.10")).split())
+        # Probe elevations [deg] toward the obstacle normal. 0 = the legacy
+        # tangent ring. A concave pocket (crescent bite) has its ONLY exit
+        # along +normal (back out through the mouth), which no tangent
+        # direction can reach; extra rings tilted toward +n (plus the pure
+        # retreat +n itself, always appended when any elevation > 0) put that
+        # exit in the candidate set. Outward directions cost nothing in
+        # safety (they increase h), and the 100 Hz consumer keeps their
+        # outward component (it only strips the inward part).
+        self.cbf_escape_probe_elevations = [
+            float(v) for v in str(rospy.get_param(
+                "~cbf_escape_probe_elevations", "0")).split()]
+        # Clearance-GROWTH reward: a corridor (the crescent's vertical groove)
+        # has clear(r_max) ~ clear(r_min) -- riding it never opens clearance;
+        # a genuine exit has clearance increasing with radius. 0 = legacy
+        # (min-over-radii clearance only).
+        self.cbf_escape_probe_growth_weight = float(rospy.get_param(
+            "~cbf_escape_probe_growth_weight", 0.0))
         self.cbf_escape_probe_clearance_cap = float(rospy.get_param(
             "~cbf_escape_probe_clearance_cap", 0.20))
         self.cbf_escape_probe_goal_weight = float(rospy.get_param(
@@ -623,9 +798,45 @@ class CBFSafetyNode:
             "~cbf_escape_probe_tabu_weight", 0.1))
         self.cbf_escape_probe_tabu_ttl = float(rospy.get_param(
             "~cbf_escape_probe_tabu_ttl", 8.0))
+        # Re-entry tabu: the stall tabu never fires on a maneuver that
+        # retreats fine but resolves nothing (runPP1001: retreat -> release
+        # at h_release -> nominal dives back -> re-trigger, an identical
+        # ~1.7 s pump forever, because the re-vote picks the same winner).
+        # If the escape RE-triggers within this window [s] after a release,
+        # the direction of the finished maneuver is tabu'd, so successive
+        # pumps explore different directions (lateral, around the horns)
+        # instead of repeating one. 0 = off (legacy).
+        self.cbf_escape_probe_reentry_window = float(rospy.get_param(
+            "~cbf_escape_probe_reentry_window", 0.0))
+        # Resolution timeout [s]: tabu a committed direction that has been
+        # held this long while the escape is STILL engaged, even if it makes
+        # displacement progress. The stall tabu misses directions that move
+        # but resolve nothing (runPP1002.3ag: "up" climbed a 1.0 m wall to
+        # the kinematic ceiling and parked there 30+ s at h~0, because
+        # climbing counts as progress and the conflict never cleared).
+        # 0 = off.
+        self.cbf_escape_probe_resolve_timeout = float(rospy.get_param(
+            "~cbf_escape_probe_resolve_timeout", 0.0))
+        self._probe_commit_e_t0 = None  # committed-direction hold start
+        self._escape_was_active = False
+        self._escape_release_t = None
+        self._escape_release_e = None
+        # Proportional escape gate EMA time constant [s]: how fast the escape
+        # authority ramps in/out of conflicts (see _escape_trigger_update).
+        self.cbf_escape_gate_tau = float(rospy.get_param(
+            "~cbf_escape_gate_tau", 0.3))
+        self._escape_gate = 0.0
         self._probe_tabu = []          # [(unit dir [3], expiry wall-time)]
         self._probe_commit_t0 = None   # progress-window start (wall-time)
         self._probe_commit_p0 = None   # TCP position at window start
+        # While escape is active, cancel this fraction of the nominal's
+        # INWARD (toward-obstacle) velocity component before the QP. The QP
+        # alone only zeroes net inward motion at the barrier, so an escape
+        # capped at cbf_escape_max_velocity can never out-push a nominal that
+        # keeps demanding into a pocket: the arm pins at h ~ h_trigger
+        # instead of retreating. 0 = legacy (escape fights the full nominal).
+        self.cbf_escape_suppress_nominal = float(rospy.get_param(
+            "~cbf_escape_suppress_nominal", 0.0))
         if self.cbf_escape_probe_enabled and self.cbf_escape_lift_gain <= 0.0:
             rospy.logwarn(
                 "cbf_escape_probe_enabled ignored: needs "
@@ -712,6 +923,38 @@ class CBFSafetyNode:
         self.cbf_cluster_mode = str(rospy.get_param("~cbf_cluster_mode", "local")).lower()
         if self.cbf_cluster_mode not in ("local", "topk"):
             raise ValueError("~cbf_cluster_mode must be 'local' or 'topk'")
+        # Critical-point selection path.
+        #
+        # 'legacy': cdist link-centre prefilter -> chunked eager whole-body SDF
+        #   -> boolean keep_mask (a D2H SYNC: masked indexing must read the
+        #   survivor count to size its output) -> cat -> topk. Three passes
+        #   over the cloud at dynamic shapes, so nothing can be graphed.
+        #
+        # 'graphed': ONE fixed-size CUDA-graph replay does the whole job --
+        #   FK, whole-body SDF, self-filter, top-k, dummy fill. The cloud is
+        #   padded to ~cbf_sdf_graph_points with far dummies, rejects are
+        #   pushed to +inf instead of masked (same trick _prefilter_for_sdf
+        #   already uses), so every shape is static and there is no sync.
+        #   Measured on the RTX 3090 with the deployed 9-link PP model, real
+        #   2000-point cloud: 3.82 -> 0.90 ms median, 6.31 -> 1.15 ms p99.
+        #   Bit-exact vs the eager path over random q and cloud sizes.
+        #
+        # The prefilter it drops was pure waste in PP anyway: the cloud (2000)
+        # never exceeded ~cbf_sdf_prefilter_max_points (4096), so the cdist was
+        # computed and discarded every cycle.
+        self.cbf_selection_mode = str(
+            rospy.get_param("~cbf_selection_mode", "legacy")).lower()
+        if self.cbf_selection_mode not in ("legacy", "graphed"):
+            raise ValueError("~cbf_selection_mode must be 'legacy' or 'graphed'")
+        # Fixed graph width. MUST cover the whole cloud or the broad phase
+        # below has to pick which points survive. Observed clouds: feeding
+        # /perception/persistent_obstacles 2573 max, PP 2000 (1000 obstacle +
+        # 1000 moving sphere), so 4096 covers both with headroom and no
+        # truncation. Cost scales with the padded width, not the real cloud:
+        # 2048 -> 0.68 ms, 4096 -> 0.90 ms, 10000 -> 1.72 ms. Sizing it far
+        # above the real cloud just buys dummy SDF evaluations.
+        self.cbf_sdf_graph_points = max(
+            1, int(rospy.get_param("~cbf_sdf_graph_points", 4096)))
         self.cbf_selection_sticky_points = max(
             0, int(rospy.get_param("~cbf_selection_sticky_points", 0)))
         self.cbf_selection_sticky_radius = float(rospy.get_param(
@@ -750,6 +993,23 @@ class CBFSafetyNode:
         # rotations[K,3,3], full_side[K]) in the world frame.
         self.debug_prism_boxes = None
         self.debug_candidate_points = None   # the candidate pool (~512) the SDF ranks
+
+        # Graphed selection state (see ~cbf_selection_mode). Built lazily on
+        # the first preprocess tick, so capture happens on the preprocess
+        # stream with the rest of the node already constructed.
+        self._sel_graph = None
+        self._sel_static_pts = None
+        self._sel_static_q9 = None
+        self._sel_out_obs = None
+        self._sel_out_min_dist = None
+        self._sel_out_n_real = None
+        # Pinned landing pad for the real selected-point count (see
+        # _preprocess_obstacles_graphed): written by an async D2H, read by the
+        # control thread at adoption, when the pack event guarantees it has
+        # already landed. Never read with .item() from the preprocess thread.
+        self._sel_n_pin = torch.zeros(1, dtype=torch.long).pin_memory()
+        self._sel_graph_failed = False
+        self._sel_broad_phase_hits = 0
         self.debug_sdf_prefilter_counts = None
 
         # --- CUDA stream split: control loop vs preprocess -------------------
@@ -791,6 +1051,12 @@ class CBFSafetyNode:
         self._staged_winv_cpu = None
         self._staged_N_cpu = None
         self._staged_Jz_cpu = None
+        # Monotone counter bumped at every critical-point selection swap.
+        # Appended to /cbf_safety/reflex_state so the reflex node's empirical
+        # Lipschitz monitor can skip gradient pairs straddling a selection
+        # update (a barrier-function change, not curvature). Kept within
+        # float32 exact-integer range for the Float32MultiArray transport.
+        self._selection_generation = 0
         self._adopted_winv_src = None
         self._adopted_N_src = None
         self._adopted_Jz_src = None
@@ -811,6 +1077,7 @@ class CBFSafetyNode:
         self._dq_real_np = np.zeros(7, dtype=np.float32)
         self._joint_staging = None
         self._joint_uploaded_stamp = None
+        self._joint_uploaded_np = None  # CPU copy of the q the solve used (reflex export)
         self._nominal_q_staging = None
         self._nominal_q_uploaded = None
         self._nominal_dq_staging = None
@@ -825,7 +1092,7 @@ class CBFSafetyNode:
         # (39:46 dq_ff, 46:53 dq_fb, 53:60 solver output, 60 repair flag,
         #  61 final constraint, 62 pre-projection constraint, 63 |grad_h|,
         #  64:71 dq_escape).
-        self.transfer_buffer = torch.zeros(79, dtype=torch.float32, device=self.device)
+        self.transfer_buffer = torch.zeros(80, dtype=torch.float32, device=self.device)
         # Hot-path command buffer: dq_final, q_safe, h, constr. Keep diagnostics
         # out of this copy so command publication is not blocked by telemetry.
         self.command_buffer = torch.zeros(16, dtype=torch.float32, device=self.device)
@@ -862,9 +1129,23 @@ class CBFSafetyNode:
         self.safe_cmd_pub = rospy.Publisher('/planner/safe_joint_command', Float64MultiArray, queue_size=1)
         self.ready_pub = rospy.Publisher('/cbf_safety/ready', Bool, queue_size=1, latch=True)
         self.h_pub = rospy.Publisher('/cbf_safety/h_value', Float32MultiArray, queue_size=1)
+        # Barrier-state export for the optional 1 kHz reflex brake layer
+        # (cbf_reflex_node.py). Layout per message:
+        #   [t_solve, n_rows, q0(7), h(n), env_hdot(n), grad_h(n*7 row-major)]
+        # where q0 is the measured q the solve used, so the consumer can
+        # extrapolate h(t) ~= h + grad_h^T (q - q0) between QP solves.
+        self.cbf_reflex_publish = _bool_param("~cbf_reflex_publish", False)
+        self.reflex_state_pub = None
+        if self.cbf_reflex_publish:
+            self.reflex_state_pub = rospy.Publisher(
+                '/cbf_safety/reflex_state', Float32MultiArray, queue_size=1)
         self.contact_event_pub = rospy.Publisher(
             '/cbf_safety/contact_event', Float32MultiArray, queue_size=1, latch=True)
         self.diag_pub = rospy.Publisher('/cbf_safety/diagnostics', Float32MultiArray, queue_size=10)
+        # Estimated environment closing speed (max per-link dynamic-hdot
+        # tightening, m/s; 0 in static scenes by deadband design). Consumed by
+        # the planner's dynamic-scene ensembler gate.
+        self.env_hdot_pub = rospy.Publisher('/cbf_safety/env_hdot', Float32, queue_size=1)
         self.diag_layout_pub = rospy.Publisher('/cbf_safety/diagnostics_layout', String, queue_size=1, latch=True)
         self.diag_layout_pub.publish(String(data=json.dumps({
             "vec_fields": DIAG_VEC_FIELDS,
@@ -902,8 +1183,36 @@ class CBFSafetyNode:
         self.rate_hz = float(rospy.get_param("~rate_hz", 150.0))
         if self.rate_hz <= 0.0:
             raise ValueError("~rate_hz must be > 0")
+        _dt_nom = 1.0 / self.rate_hz
+        self._escape_gate_beta = _dt_nom / (
+            _dt_nom + max(self.cbf_escape_gate_tau, 1e-3))
         self.rate = rospy.Rate(self.rate_hz)
         self.last_time = rospy.get_time()
+        # Decide the selection path ONCE, at startup, so an unsupported config
+        # is a loud line in the log rather than a silent per-tick fallback.
+        if self.cbf_selection_mode == "graphed":
+            unsupported = self._selection_graph_supported()
+            if unsupported:
+                self.cbf_selection_mode = "legacy"
+                rospy.logwarn(
+                    "~cbf_selection_mode:=graphed ignored -- this config is "
+                    "not the policy the graph implements (%s). Using legacy.",
+                    "; ".join(unsupported))
+            else:
+                # Capture HERE, for the same reason finalize_cuda_graph does:
+                # before the timers below start, so no preprocess/control tick
+                # can run concurrently with capture. q is read from the static
+                # buffer on every replay, so capturing at q=0 is fine.
+                try:
+                    self._build_selection_graph(
+                        torch.zeros((1, 9), device=self.device))
+                except Exception as e:
+                    self.cbf_selection_mode = "legacy"
+                    self._sel_graph_failed = True
+                    self._sel_graph = None
+                    rospy.logerr(
+                        "CBF selection graph capture failed (%s) -- using the "
+                        "legacy path.", e)
         rospy.Timer(rospy.Duration(1.0 / self.preprocess_rate_hz),
                     self.preprocess_obstacles)
         if self.publish_viz_topics:
@@ -914,6 +1223,7 @@ class CBFSafetyNode:
             "graph_points=%d active_constraints=%d multi_grad=%s fd_eps=%.1e "
             "h_activate=%.3fm max_inward=%.3fm/s "
             "recovery=%.3fm/s candidate_filter=%s selection=%s cluster=%s "
+            "selection_mode=%s sdf_graph_points=%d "
             "sticky=%d sticky_radius=%.3fm sticky_margin=%.3fm sticky_force=%s "
             "integrate_from_current=%s command_dt=%.3fs passthrough_inactive=%s "
             "yellow=%s debug=%s profile_sync=%s",
@@ -928,6 +1238,8 @@ class CBFSafetyNode:
             self.cbf_candidate_filter,
             self.cbf_selection_metric,
             self.cbf_cluster_mode,
+            self.cbf_selection_mode,
+            self.cbf_sdf_graph_points,
             self.cbf_selection_sticky_points,
             self.cbf_selection_sticky_radius,
             self.cbf_selection_sticky_score_margin,
@@ -1073,7 +1385,8 @@ class CBFSafetyNode:
         # critical row: the repair / residual must re-validate against the
         # bound that was actually enforced, not the weaker static one.
         return torch.where(h > 0.0, outside_bound, inside_bound) \
-            + self.cbf_constraint_margin + self.static_hdot_env_min
+            + self.cbf_constraint_margin + self.static_hdot_env_min \
+            + self.static_sampled_margin
 
     def _constraint_residual(self, h, grad_h, dq):
         gdq = (grad_h * dq).sum(dim=1)
@@ -1086,7 +1399,7 @@ class CBFSafetyNode:
             torch.full_like(h, self.cbf_kappa),
         )
         return (gdq + kappa_eff * h - self.cbf_constraint_margin
-                - self.static_hdot_env_min)
+                - self.static_hdot_env_min - self.static_sampled_margin)
 
     def _diagnostic_active_constraints(self):
         if self.cbf_solver_mode == "multi_graphed":
@@ -1406,11 +1719,18 @@ class CBFSafetyNode:
         # refresh.
         self._task_metric_N = None
         self._task_metric_Jz = None
-        # Escape-trigger scalars [h, |dq_safe-dq_nom|, |grad_h|]: async D2H
-        # into pinned memory, read one cycle late via event query (no sync).
+        # Escape-trigger scalars [h, |dq_safe-dq_nom_cbf|, |grad_h|,
+        # |dq_safe-dq_nom_RAW|]: async D2H into pinned memory, read one cycle
+        # late via event query (no sync). The trigger's base_corrected uses
+        # the RAW-nominal delta [3]: the composed delta [1] goes to ~0 as
+        # soon as the escape makes the command safe, so gating on it made
+        # the trigger reset itself the moment the escape worked (runPP1000:
+        # ~29% duty cycle, 100+ sub-100ms activations, probe commit/tabu
+        # never engaged). Against the raw nominal the delta includes the
+        # escape itself, so the trigger stays latched until h > h_release.
         # Init = far-from-barrier so the escape stays off until real data.
-        self._esc_pin = torch.tensor([1.0, 0.0, 1.0]).pin_memory()
-        self._esc_vals = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+        self._esc_pin = torch.tensor([1.0, 0.0, 1.0, 0.0]).pin_memory()
+        self._esc_vals = np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32)
         self._esc_event = torch.cuda.Event()
         # PER-ROW environment hdot tightening (>= 0) for the time-varying CBF
         # bound: one slot per robot link (+1 grasp row), gathered per QP row
@@ -1428,8 +1748,22 @@ class CBFSafetyNode:
         # re-validate against the same time-varying bound the solver enforced,
         # or the output low-pass can eat the retreat without triggering repair.
         self.static_hdot_env_min = torch.zeros((), device=self.device)
+        # Sampled-data margin m(dq) [m/s], 0-dim: every constraint consumer
+        # (_qp_step, eager POCS bounds, repair/residual) adds it
+        # unconditionally; it stays 0 when ~cbf_sampled_data_margin is off.
+        # Written once per cycle — in-graph for the graphed control step,
+        # eagerly in _run_velocity_cbf_solver otherwise.
+        self.static_sampled_margin = torch.zeros((), device=self.device)
         self.static_h_links = torch.ones(n_hdot_rows, device=self.device)
         self.static_grad_links = torch.zeros((n_hdot_rows, 7), device=self.device)
+        # Reflex export staging: [h_rows | env_hdot_rows | grad_rows(flat)]
+        # for the N robot links only. The food row is deliberately excluded:
+        # braking on the target barrier would fight the intentional grasp
+        # approach. One GPU buffer so the hot path pays 3 device copies plus
+        # a single tiny D2H, and only when ~cbf_reflex_publish is set.
+        self._reflex_n_rows = int(self.bernstein_core.K)
+        self._reflex_gpu = torch.zeros(
+            self._reflex_n_rows * 9, device=self.device)
         self._hdot_zero = torch.zeros((), device=self.device)
         self._hdot_ema = torch.zeros(n_hdot_rows, device=self.device)
         self._hdot_prev_h = None
@@ -1462,7 +1796,7 @@ class CBFSafetyNode:
 
         def _qp_step(h, grad_h, dq_in, h_activate, max_inward_speed,
                      recovery_speed, recovery_depth, max_correction_speed,
-                     hdot_env):
+                     hdot_env, exact_denom=False):
             self.static_h.copy_(h)
             # Tangent-preserving fast CBF:
             # - outside activation: no correction
@@ -1478,7 +1812,8 @@ class CBFSafetyNode:
             # THIS row's clamp(-dh_env/dt - deadband, 0, max) >= 0, gathered
             # from static_hdot_env_links; 0 when cbf_dynamic_hdot is disabled
             # or this link's environment is static.
-            bound = bound + constraint_margin + hdot_env
+            bound = bound + constraint_margin + hdot_env \
+                + self.static_sampled_margin
             gdq = (grad_h * dq_in).sum(dim=-1)
             constr = torch.where(active, gdq - bound, torch.ones_like(gdq))
             self.static_constr.copy_(constr)
@@ -1489,7 +1824,16 @@ class CBFSafetyNode:
             w_grad = grad_h @ self.static_Winv
             denom  = (grad_h * w_grad).sum(dim=-1)
             correction = torch.clamp(bound - gdq, min=0.0)
-            dq_delta = correction.unsqueeze(-1) * w_grad / (denom.unsqueeze(-1) + 1e-4)
+            # Legacy: +1e-4 regularization slightly under-corrects each
+            # projection (POCS re-projects the residual on later sweeps, so
+            # it converges anyway). Dykstra REQUIRES exact projections: the
+            # correction memory re-applies the same step each sweep, so a
+            # regularized (under-shooting) projection freezes short of the
+            # half-space forever. The denom > 1e-8 gate below still routes
+            # degenerate gradients away from the division.
+            denom_reg = (torch.clamp(denom, min=1e-8) if exact_denom
+                         else denom + 1e-4)
+            dq_delta = correction.unsqueeze(-1) * w_grad / denom_reg.unsqueeze(-1)
             if max_correction_speed > 0.0:
                 delta_norm = torch.norm(dq_delta, dim=-1, keepdim=True)
                 scale = torch.clamp(max_correction_speed / (delta_norm + 1e-6), max=1.0)
@@ -1590,6 +1934,20 @@ class CBFSafetyNode:
         K_max = max(1, min(self.cbf_active_constraints, n_robot))
         if self.cbf_solver_mode == "multi_graphed":
             self._last_active_constraints = K_max
+        # Dykstra correction memory: one row per constraint (row 0 = food,
+        # 1..K_max = robot rows), zeroed at the start of every solve. Lives
+        # outside the closure so the CUDA graph captures a stable pointer.
+        use_dykstra = (self.cbf_qp_algorithm == "dykstra")
+        dykstra_z = torch.zeros((K_max + 1, 7), device=self.device)
+        # Warm-start state (see ~cbf_dykstra_warmstart): one multiplier per
+        # ROBOT LINK (topk reshuffles rows every cycle, so row-indexed state
+        # would attach to the wrong physical constraint) + one for the food
+        # group. Zero-then-scatter each cycle: a link that drops out of the
+        # top-K loses its multiplier; only continuously selected constraints
+        # accumulate sweeps.
+        warm_dykstra = use_dykstra and self.cbf_dykstra_warmstart
+        dykstra_lam_links = torch.zeros(max(n_robot, 1), device=self.device)
+        dykstra_lam_food = torch.zeros(1, device=self.device)
 
         def _multi_constraints():
             result = self.analytical_barrier.evaluate(
@@ -1608,20 +1966,81 @@ class CBFSafetyNode:
             if two_group:
                 return (h_vals, g_vals, env_vals, h_links[:, n_robot],
                         g_links[:, n_robot, :],
-                        self.static_hdot_env_links[n_robot:n_robot + 1])
-            return h_vals, g_vals, env_vals, None, None, None
+                        self.static_hdot_env_links[n_robot:n_robot + 1], idx)
+            return h_vals, g_vals, env_vals, None, None, None, idx
 
         def _solve_multi(dq_nom):
-            h_vals, g_vals, env_vals, h_f, g_f, env_f = _multi_constraints()
+            (h_vals, g_vals, env_vals, h_f, g_f, env_f,
+             idx) = _multi_constraints()
             if two_group:
                 self.static_h_food.copy_(torch.clamp(h_f, max=0.25))
             dq = dq_nom
-            for _ in range(constraint_sweeps):
-                if two_group:
-                    dq = _qp_step(h_f, g_f, dq, *food_band, env_f)  # target half-space
-                for k in range(K_max):                              # robot links (last)
-                    dq = _qp_step(h_vals[:, k], g_vals[:, k, :], dq,
-                                  *robot_band, env_vals[k])
+            if use_dykstra:
+                # Dykstra / Hildreth: add back this row's previous correction
+                # before re-projecting, store the new one. Converges to the
+                # exact min-W-norm projection onto the intersection (see
+                # ~cbf_qp_algorithm); reduces to plain POCS when z stays 0,
+                # i.e. whenever <= 1 constraint is active.
+                if warm_dykstra:
+                    # z_l = -lambda_l * W^-1 g_l, rebuilt in the CURRENT
+                    # geometry from the carried per-link multipliers.
+                    wg_rows = g_vals[0] @ self.static_Winv          # [K,7]
+                    lam_rows = dykstra_lam_links.index_select(0, idx[0])
+                    dykstra_z[1:].copy_(-lam_rows.unsqueeze(1) * wg_rows)
+                    if two_group:
+                        dykstra_z[0].copy_(
+                            -dykstra_lam_food * (g_f[0] @ self.static_Winv))
+                    else:
+                        dykstra_z[0].zero_()
+                    # The dual state is TWO things: the memories z_l AND the
+                    # primal they imply, dq = dq_nom + sum_l lambda_l W^-1 g_l
+                    # = dq_nom - sum_l z_l. Injecting z without shifting the
+                    # primal makes the first projection see dq_nom - lambda_l
+                    # W^-1 g_l (the nominal pushed BACKWARDS along grad_h);
+                    # an inactive row then passes that offset straight
+                    # through, and the carried multipliers silently cancel
+                    # whatever pushes toward the barrier -- including the
+                    # clearance drive and the escape. That is the diverging
+                    # "naive z" arm of scripts/solver_study.py.
+                    dq = dq - dykstra_z.sum(dim=0, keepdim=True)
+                else:
+                    dykstra_z.zero_()
+                for _ in range(constraint_sweeps):
+                    if two_group:
+                        dq_tmp = dq + dykstra_z[0]
+                        dq = _qp_step(h_f, g_f, dq_tmp, *food_band, env_f,
+                                      exact_denom=True)
+                        dykstra_z[0].copy_((dq_tmp - dq)[0])
+                    for k in range(K_max):                # robot links (last)
+                        dq_tmp = dq + dykstra_z[k + 1]
+                        dq = _qp_step(h_vals[:, k], g_vals[:, k, :], dq_tmp,
+                                      *robot_band, env_vals[k],
+                                      exact_denom=True)
+                        dykstra_z[k + 1].copy_((dq_tmp - dq)[0])
+                if warm_dykstra:
+                    # lambda_l = -(g_l . z_l) / (g_l . W^-1 g_l) >= 0, stored
+                    # by link identity for the next cycle.
+                    wg_rows = g_vals[0] @ self.static_Winv
+                    denom = (g_vals[0] * wg_rows).sum(dim=-1).clamp(min=1e-8)
+                    lam_new = torch.clamp(
+                        -(g_vals[0] * dykstra_z[1:]).sum(dim=-1) / denom,
+                        min=0.0)
+                    dykstra_lam_links.zero_()
+                    dykstra_lam_links.scatter_(0, idx[0], lam_new)
+                    if two_group:
+                        gf = g_f[0]
+                        wgf = gf @ self.static_Winv
+                        dykstra_lam_food.copy_(torch.clamp(
+                            -(gf * dykstra_z[0]).sum()
+                            / (gf * wgf).sum().clamp(min=1e-8),
+                            min=0.0).reshape(1))
+            else:
+                for _ in range(constraint_sweeps):
+                    if two_group:
+                        dq = _qp_step(h_f, g_f, dq, *food_band, env_f)  # target half-space
+                    for k in range(K_max):                          # robot links (last)
+                        dq = _qp_step(h_vals[:, k], g_vals[:, k, :], dq,
+                                      *robot_band, env_vals[k])
             # Leave static_h / static_grad_h / static_hdot_env_min on the
             # most-critical robot link for the diagnostics / repair (the loop
             # ends on the least-critical row).
@@ -1787,8 +2206,12 @@ class CBFSafetyNode:
                     self.static_dq_nom - normal_speed * normal_dir)
                 if self.cbf_escape_lift_gain > 0.0:
                     lift = self._task_metric_Jz_buf
-                    lift_t = lift - (lift * normal_dir).sum(
-                        dim=1, keepdim=True) * normal_dir
+                    # Strip only the INWARD component: an outward (grad_h-
+                    # aligned) escape row increases h and must survive, or a
+                    # retreat direction voted by the hemisphere probe (the
+                    # only exit from a concave pocket) is deleted right here.
+                    lift_n = (lift * normal_dir).sum(dim=1, keepdim=True)
+                    lift_t = lift - torch.clamp(lift_n, max=0.0) * normal_dir
                     lift_norm = torch.norm(lift_t, dim=1, keepdim=True)
                     ns_frac = (torch.norm(g_prev @ self._task_metric_N_buf,
                                           dim=1, keepdim=True)
@@ -1812,6 +2235,15 @@ class CBFSafetyNode:
                     en = torch.norm(dq_esc, dim=1, keepdim=True)
                     dq_esc = dq_esc * torch.clamp(
                         self.cbf_escape_max_velocity / (en + 1e-6), max=1.0)
+                if self.cbf_escape_suppress_nominal > 0.0:
+                    # Cancel the nominal's inward push AFTER the authority
+                    # clamp: it is a cancellation, not extra escape budget.
+                    # Without it the nominal out-pushes the capped escape and
+                    # the QP pins the arm at h ~ h_trigger instead of letting
+                    # it retreat.
+                    dq_esc = dq_esc - (self.cbf_escape_suppress_nominal
+                                       * torch.clamp(normal_speed, max=0.0)
+                                       * normal_dir)
                 extra = extra + sc[0] * dq_esc
             return extra
 
@@ -1824,6 +2256,17 @@ class CBFSafetyNode:
             dq_nom_cbf = torch.clamp(self.static_dq_nom + extra,
                                      min=-mjv, max=mjv)
             self.static_dq_nom_cbf.copy_(dq_nom_cbf)
+            # Sampled-data margin m(dq) = (L/2) T ||dq||^2, linearized at the
+            # max of the previous published command (dq_safe_work still holds
+            # last cycle's final value here) and the current nominal. Runs
+            # IN-GRAPH: pure tensor ops on persistent buffers, no sync.
+            if self.cbf_sampled_data_margin:
+                v2 = torch.maximum(
+                    (self.dq_safe_work * self.dq_safe_work).sum(),
+                    (dq_nom_cbf * dq_nom_cbf).sum())
+                self.static_sampled_margin.copy_(torch.clamp(
+                    self._sampled_margin_coeff * v2,
+                    max=self.cbf_sampled_data_margin_max))
             # Solve (writes static_h / static_grad_h / static_constr fresh).
             dq = _solve(dq_nom_cbf)
             self.static_dq_safe.copy_(dq)
@@ -1904,6 +2347,9 @@ class CBFSafetyNode:
                 min=-mjv, max=mjv)
             self.dq_safe_work.copy_(torch.where(
                 needs_repair, dq_repaired, self.dq_safe_work))
+            # Joint-limit barrier LAST so nothing downstream re-opens it;
+            # the recomputed final_constr below reports the clamped command.
+            self._joint_limit_clamp_(self.dq_safe_work)
             final_constr = self._constraint_residual(
                 h_final, grad_h, self.dq_safe_work)
             self.static_constr.copy_(torch.where(
@@ -1946,7 +2392,7 @@ class CBFSafetyNode:
                     self.static_hdot_env_links, self._hdot_ema,
                     self._graph_dq_filtered, self.dq_safe_work,
                     self.q_safe_work, self.last_q_safe,
-                    self.static_dq_escape_out):
+                    self.static_dq_escape_out, self.static_sampled_margin):
             buf.zero_()
         self.static_h.fill_(1.0)
         self.static_h_links.fill_(1.0)
@@ -2128,7 +2574,7 @@ class CBFSafetyNode:
         inside_bound = self.cbf_recovery_speed * torch.clamp(
             (-h_det) / recovery_depth, min=0.0, max=1.0)
         bounds = torch.where(h_det > 0.0, outside_bound, inside_bound)
-        bounds = bounds + self.cbf_constraint_margin
+        bounds = bounds + self.cbf_constraint_margin + self.static_sampled_margin
 
         # Fixed-iteration on-device POCS for the 7-variable, K-row QP.  Tensor
         # conditions replace Python scalar reads, so there is no intermediate
@@ -2277,14 +2723,22 @@ class CBFSafetyNode:
     def _update_task_metric(self, current_q):
         """Refresh static_Winv (+ null-space projector / lift row) from the
         controlled-link Jacobian at the current q, via one batched
-        finite-difference FK. Runs in the PREPROCESS timer thread (~30 Hz), NOT
-        the 100 Hz control loop: putting it in the control path cost ~25 ms of
+        finite-difference FK. Runs in the PREPROCESS timer thread, NOT the
+        100 Hz control loop: putting it in the control path cost ~25 ms of
         GPU contention per cycle (runPP14: cbf_ms p50 4.8 -> 29.8 ms). The
         metric is a slowly-varying preconditioner, so <=33 ms staleness
         (<0.025 rad of joint motion) is irrelevant; the control thread only
         reads the buffers. All linear algebra is numpy on the 8 downloaded
         poses -- cuSolver on 7x7/6x6 is ~13x slower than numpy and adds sync
-        points."""
+        points.
+
+        REFRESH RATE = ~preprocess_rate_hz / ~cbf_task_metric_update_every,
+        because the decimation below counts TICKS, not seconds. Keep that
+        quotient near 30 Hz when retuning either one: the T.cpu() below is a
+        hard D2H sync (the cost the graphed selection was built to remove),
+        and it lands BEFORE the critical_point_selection timer starts, so it
+        is invisible in that stat. 30 Hz tick + every=1, or 100 Hz tick +
+        every=3, both give the ~33 ms staleness this is budgeted for."""
         self._task_metric_cycle += 1
         if (self._task_metric_cycle - 1) % self.cbf_task_metric_update_every:
             return
@@ -2362,12 +2816,22 @@ class CBFSafetyNode:
             if self._probe_commit_t0 is None:
                 self._probe_commit_t0 = now
                 self._probe_commit_p0 = p_tcp.copy()
+            if self._probe_commit_e_t0 is None:
+                self._probe_commit_e_t0 = now
             if (float((p_tcp - self._probe_commit_p0) @ e_prev)
                     >= self.cbf_escape_probe_tabu_min_progress):
                 # Headway: restart the window, requiring CONTINUED motion.
                 self._probe_commit_t0 = now
                 self._probe_commit_p0 = p_tcp.copy()
-            if (now - self._probe_commit_t0
+            # Resolution timeout: a direction that keeps "progressing" but
+            # never clears the conflict (climbing a wall taller than the
+            # reach) is as wedged as a stall -- give another direction a
+            # turn. The stall window below cannot catch it.
+            unresolved = (
+                self.cbf_escape_probe_resolve_timeout > 0.0
+                and now - self._probe_commit_e_t0
+                > self.cbf_escape_probe_resolve_timeout)
+            if (not unresolved and now - self._probe_commit_t0
                     < self.cbf_escape_probe_tabu_timeout):
                 rospy.loginfo_throttle(
                     2.0, "escape probe: committed dir [%.2f %.2f %.2f]",
@@ -2376,15 +2840,19 @@ class CBFSafetyNode:
             self._probe_tabu.append(
                 (e_prev.copy(), now + self.cbf_escape_probe_tabu_ttl))
             rospy.logwarn(
-                "escape probe: dir [%.2f %.2f %.2f] stalled for %.2g s "
-                "-> tabu, re-voting",
+                "escape probe: dir [%.2f %.2f %.2f] %s -> tabu, re-voting",
                 e_prev[0], e_prev[1], e_prev[2],
-                self.cbf_escape_probe_tabu_timeout)
+                ("unresolved after %.2g s"
+                 % self.cbf_escape_probe_resolve_timeout) if unresolved
+                else ("stalled for %.2g s"
+                      % self.cbf_escape_probe_tabu_timeout))
             self._escape_probe_e = None
             self._probe_commit_t0 = None
+            self._probe_commit_e_t0 = None
             e_prev = None
         else:
             self._probe_commit_t0 = None
+            self._probe_commit_e_t0 = None
         fallback = e_prev if e_prev is not None else np.array([0.0, 0.0, 1.0])
         pts = self.obs_points
         if pts is None or int(pts.shape[0]) == 0:
@@ -2407,19 +2875,31 @@ class CBFSafetyNode:
         t2 = np.cross(n, t1)
         K = self.cbf_escape_probe_num_dirs
         th = 2.0 * np.pi * np.arange(K) / K
-        dirs = np.cos(th)[:, None] * t1 + np.sin(th)[:, None] * t2  # [K,3]
-        radii = np.asarray(self.cbf_escape_probe_radii)             # [R]
+        ring = np.cos(th)[:, None] * t1 + np.sin(th)[:, None] * t2  # [K,3]
+        # Hemisphere toward +n: one ring per elevation (0 deg = the legacy
+        # tangent ring) plus the pure retreat +n. In a concave pocket the
+        # only exit is +n; a tangent-only candidate set cannot represent it.
+        elevs = np.deg2rad(np.asarray(self.cbf_escape_probe_elevations))
+        dirs = np.concatenate(
+            [np.cos(e) * ring + np.sin(e) * n[None, :] for e in elevs]
+            + ([n[None, :]] if (elevs > 1e-6).any() else []), axis=0)  # [D,3]
+        radii = np.asarray(self.cbf_escape_probe_radii)             # [R] asc.
         probes = (p_tcp[None, None, :]
-                  + radii[:, None, None] * dirs[None, :, :])        # [R,K,3]
+                  + radii[:, None, None] * dirs[None, :, :])        # [R,D,3]
         with torch.no_grad():
             X = torch.from_numpy(
                 probes.reshape(-1, 3).astype(np.float32)).to(pts.device)
-            clear = torch.cdist(X, pts).min(dim=1).values.view(
-                len(radii), K).min(dim=0).values.cpu().numpy()      # [K]
+            clear_rd = torch.cdist(X, pts).min(dim=1).values.view(
+                len(radii), dirs.shape[0]).cpu().numpy()            # [R,D]
+        cap = self.cbf_escape_probe_clearance_cap
         # Cap the clearance so directions past all obstacles tie, letting the
         # goal/commit terms break the tie instead of "whatever is emptiest".
         score = np.minimum(
-            clear.astype(np.float64), self.cbf_escape_probe_clearance_cap)
+            clear_rd.min(axis=0).astype(np.float64), cap)
+        if len(radii) >= 2 and self.cbf_escape_probe_growth_weight > 0.0:
+            # Corridors keep clearance constant with radius; exits open up.
+            score += self.cbf_escape_probe_growth_weight * np.clip(
+                (clear_rd[-1] - clear_rd[0]).astype(np.float64), -cap, cap)
         # Workspace floor: the table is not an obstacle point, so a downward
         # probe would otherwise look maximally clear.
         below = (probes[..., 2] < self.cbf_escape_probe_min_z).any(axis=0)
@@ -2489,8 +2969,16 @@ class CBFSafetyNode:
         if pack is None or pack[0] == self._adopted_seq or not pack[1].query():
             return
         (seq, _, obs, count, min_dist,
-         winv_cpu, n_cpu, jz_cpu) = pack
+         winv_cpu, n_cpu, jz_cpu, n_real_pin) = pack
         self._adopted_obs = obs
+        if n_real_pin is not None:
+            # Graphed path: swap the fixed graph width for the real count now
+            # that the pack's event has fired (so the async D2H has landed and
+            # this is a pinned-memory read, not a GPU sync). Restores exactly
+            # the legacy semantics -- top-k sorts the +inf rejects last, so
+            # rows [0, count) are the real points and the rest is dummy pad --
+            # which is what the Softmin alpha*log(N) de-bias needs to match.
+            count = min(int(n_real_pin[0]), int(count))
         self._adopted_count = count
         self._adopted_min_dist = min_dist
         if winv_cpu is not None and winv_cpu is not self._adopted_winv_src:
@@ -2516,26 +3004,60 @@ class CBFSafetyNode:
         self.static_q.copy_(current_q)
         self.static_obs.copy_(local_obs)
         self.static_dq_nom.copy_(dq_nom)
+        # Sampled-data margin, eager twin of the in-graph update in
+        # _control_step (dq_safe_work still holds last cycle's final command
+        # at solver entry).
+        if self.cbf_sampled_data_margin:
+            v2 = torch.maximum(
+                (self.dq_safe_work * self.dq_safe_work).sum(),
+                (dq_nom * dq_nom).sum())
+            self.static_sampled_margin.copy_(torch.clamp(
+                self._sampled_margin_coeff * v2,
+                max=self.cbf_sampled_data_margin_max))
         if self.cbf_solver_mode in ("fast_tangent", "multi_graphed"):
             self.graph.replay()
             return self.static_dq_safe.detach()
         return self.solve_multicbf_projection(
             current_q, local_obs, dq_nom).detach()
 
-    def _queue_escape_state(self, dq_nom_cbf, dq_out=None):
+    def _joint_limit_clamp_(self, dq):
+        """In-place soft joint-limit velocity barrier on the final command
+        (reads self.static_q; pure tensor ops, CUDA-graph safe). Bounds:
+        dq_i <= kappa*(q_hi - margin - q_i)  (floored at -limit_push)
+        dq_i >= kappa*(q_lo + margin - q_i)  (capped  at +limit_push)
+        i.e. per-joint braking into the margin band and a small bounded
+        push back out of it. On the Panda the band doubles as singularity
+        avoidance (q4 upper = elbow straight, q6 lower = wrist aligned)."""
+        if self.cbf_joint_limit_margin <= 0.0:
+            return dq
+        k = self.cbf_joint_limit_kappa
+        m = self.cbf_joint_limit_margin
+        b_hi = torch.clamp(k * (self._q_lim_hi - m - self.static_q),
+                           min=-self.cbf_joint_limit_push)
+        b_lo = torch.clamp(k * (self._q_lim_lo + m - self.static_q),
+                           max=self.cbf_joint_limit_push)
+        dq.copy_(torch.minimum(torch.maximum(dq, b_lo), b_hi))
+        return dq
+
+    def _queue_escape_state(self, dq_nom_cbf, dq_out=None, dq_nom_raw=None):
         """Enqueue an async D2H copy of the escape-trigger scalars (h,
-        |dq_safe - dq_nom|, |grad_h|) into pinned memory after the solve.
-        _compute_escape_velocity reads them NEXT cycle if the copy has
-        completed (event query, never blocks). The old synchronous .cpu()
-        here drained the contended GPU queue every 100 Hz cycle."""
+        |dq_safe - dq_nom_cbf|, |grad_h|, |dq_safe - dq_nom_raw|) into pinned
+        memory after the solve. _compute_escape_velocity reads them NEXT
+        cycle if the copy has completed (event query, never blocks). The old
+        synchronous .cpu() here drained the contended GPU queue every 100 Hz
+        cycle. dq_nom_raw = the pre-escape nominal; the trigger latches on
+        that delta (see _esc_pin comment)."""
         if not self.cbf_escape_enabled:
             return
         if dq_out is None:
             dq_out = self.dq_safe_work
+        if dq_nom_raw is None:
+            dq_nom_raw = dq_nom_cbf
         vals = torch.stack((
             self.static_h.detach().view(-1)[0],
             torch.norm(dq_out - dq_nom_cbf),
             torch.norm(self.static_grad_h.detach()),
+            torch.norm(dq_out - dq_nom_raw),
         ))
         self._esc_pin.copy_(vals, non_blocking=True)
         self._esc_event.record()
@@ -2581,12 +3103,26 @@ class CBFSafetyNode:
         self._hdot_prev_q.copy_(q_now)
 
     def _escape_trigger_update(self):
-        """CPU-only escape trigger: hysteresis counters on the pinned async
-        readback of (h, |dq_safe-dq_nom|, |grad_h|). Shared by the eager and
-        graphed control steps. Returns (escape_active, h_bias)."""
+        """CPU-only PROPORTIONAL escape gate on the pinned async readback of
+        (h, |dq_safe-dq_nom_cbf|, |grad_h|). Shared by the eager and graphed
+        control steps. Returns (gate in [0,1], h_bias).
+
+        History: the original binary trigger FLICKERED (the composed-nominal
+        delta drops to ~0 the moment the escape works -> instant reset,
+        runPP1000), which accidentally pulse-width-modulated the escape into
+        a gentle average push -- smooth, but too weak for a concave pocket.
+        The latch that replaced it (raw-nominal delta) had unbounded memory
+        and counted the null-space clearance as conflict: runPP1002 latched
+        30 s at full authority, wrestling the nominal (wiggle, h < 0). This
+        gate makes the duty-cycling EXPLICIT and smooth: an h-proximity ramp
+        gated by conflict, EMA-filtered. The same feedback (conflict vanishes
+        as the escape succeeds) now settles the gate at a partial-authority
+        equilibrium instead of chattering full-on/full-off; magnitudes ramp
+        continuously, so no command steps."""
         if not self.cbf_escape_enabled:
             self._cbf_escape_active_cycles = 0
-            return False, 0.0
+            self._escape_gate = 0.0
+            return 0.0, 0.0
         h_bias = 0.0
         if (self.cbf_solver_mode in ("fast_tangent", "multi_graphed")
                 and not self._barrier_value_hard):
@@ -2596,33 +3132,69 @@ class CBFSafetyNode:
             self._esc_vals = self._esc_pin.numpy().copy()
         h_escape = float(self._esc_vals[0]) + (
             h_bias if self.cbf_escape_use_bias_corrected_h else 0.0)
+        # Composed-nominal delta: the self-regulation feedback (goes to ~0
+        # while the escape fully absorbs the conflict).
         base_delta = float(self._esc_vals[1])
         grad_norm_value = float(self._esc_vals[2])
 
-        near_barrier = h_escape < self.cbf_escape_h_trigger
-        release_barrier = h_escape > self.cbf_escape_h_release
-        base_corrected = base_delta > self.cbf_escape_min_cbf_delta
-        if near_barrier and (base_corrected or h_escape < 0.0):
-            self._cbf_escape_active_cycles += 1
-        elif release_barrier or not base_corrected:
-            self._cbf_escape_active_cycles = 0
-        else:
-            self._cbf_escape_active_cycles = max(
-                0, self._cbf_escape_active_cycles - 1)
+        # Proximity ramp: 1 below h_trigger, 0 above h_release, linear
+        # between -- replaces the binary near/release hysteresis.
+        span = max(self.cbf_escape_h_release - self.cbf_escape_h_trigger,
+                   1e-6)
+        ramp = min(max(
+            (self.cbf_escape_h_release - h_escape) / span, 0.0), 1.0)
+        conflict = (base_delta > self.cbf_escape_min_cbf_delta
+                    or h_escape < 0.0)
+        target = ramp if (conflict and grad_norm_value > 1e-7) else 0.0
+        gate = self._escape_gate + self._escape_gate_beta * (
+            target - self._escape_gate)
+        self._escape_gate = gate
 
-        escape_active = (
-            self._cbf_escape_active_cycles >= self.cbf_escape_activation_cycles
-            and grad_norm_value > 1e-7
-        )
-        return escape_active, h_bias
+        # Discrete activity for the probe commit/tabu bookkeeping only:
+        # Schmitt thresholds so the equilibrium gate doesn't flap it.
+        if self._escape_was_active:
+            escape_active = gate > 0.25
+        else:
+            escape_active = gate > 0.60
+        self._cbf_escape_active_cycles = (
+            self._cbf_escape_active_cycles + 1 if escape_active else 0)
+        if self.cbf_escape_probe_reentry_window > 0.0:
+            now = time.time()
+            if self._escape_was_active and not escape_active:
+                # Maneuver ended (usually h > h_release): remember what it
+                # tried. List append/read is GIL-safe vs the preprocess
+                # thread, same as _escape_probe_e itself.
+                self._escape_release_t = now
+                self._escape_release_e = (
+                    None if self._escape_probe_e is None
+                    else self._escape_probe_e.copy())
+            elif (escape_active and not self._escape_was_active
+                    and self._escape_release_e is not None
+                    and now - (self._escape_release_t or 0.0)
+                    < self.cbf_escape_probe_reentry_window):
+                # Re-trigger right after a release: that direction escaped
+                # but resolved nothing -- tabu it so the next vote explores.
+                self._probe_tabu.append(
+                    (self._escape_release_e,
+                     now + self.cbf_escape_probe_tabu_ttl))
+                rospy.logwarn(
+                    "escape probe: re-entry %.2gs after release -> tabu dir "
+                    "[%.2f %.2f %.2f], exploring",
+                    now - self._escape_release_t,
+                    self._escape_release_e[0], self._escape_release_e[1],
+                    self._escape_release_e[2])
+                self._escape_release_e = None
+                self._escape_probe_e = None  # force a fresh vote
+        self._escape_was_active = escape_active
+        return gate, h_bias
 
     def _compute_escape_velocity(self, dq_nom_base):
         """Escape decision from the PREVIOUS cycle's solve state (one 10 ms
-        cycle stale -- the trigger is hysteresis/counter based, so this is
-        equivalent in behavior but allows a single graph replay per cycle and
-        no mid-loop sync)."""
-        escape_active, h_bias = self._escape_trigger_update()
-        if not escape_active:
+        cycle stale -- the gate is EMA-filtered, so this is equivalent in
+        behavior but allows a single graph replay per cycle and no mid-loop
+        sync). The whole composed escape scales by the proportional gate."""
+        gate, h_bias = self._escape_trigger_update()
+        if gate < 0.01:
             return self.zero_dq, False
 
         grad_h = self.static_grad_h.detach()
@@ -2641,8 +3213,10 @@ class CBFSafetyNode:
             # the null-space fraction of grad_h vanishes, i.e. exactly when the
             # constraint is TCP-borne and the clearance drive can do nothing.
             lift = self._task_metric_Jz
-            lift_t = lift - (lift * normal_dir).sum(
-                dim=1, keepdim=True) * normal_dir
+            # Keep the outward component (see the graphed twin): retreat
+            # directions from the hemisphere probe must survive projection.
+            lift_n = (lift * normal_dir).sum(dim=1, keepdim=True)
+            lift_t = lift - torch.clamp(lift_n, max=0.0) * normal_dir
             lift_norm = torch.norm(lift_t, dim=1, keepdim=True)
             lift_gate = torch.ones_like(lift_norm)
             if self._task_metric_N is not None:
@@ -2682,7 +3256,14 @@ class CBFSafetyNode:
             )
             dq_escape = dq_escape * escape_scale
 
-        return dq_escape, True
+        if self.cbf_escape_suppress_nominal > 0.0:
+            # Post-clamp cancellation of the nominal's inward push (see the
+            # graphed twin in _control_extra).
+            dq_escape = dq_escape - (self.cbf_escape_suppress_nominal
+                                     * torch.clamp(normal_speed, max=0.0)
+                                     * normal_dir)
+
+        return gate * dq_escape, True
 
     def _nominal_vel_cb(self, msg):
         if len(msg.data) < 7:
@@ -3025,6 +3606,7 @@ class CBFSafetyNode:
         if n > 0:
             self.selected_obs_stamp = rospy.get_time()
         self.selected_count = n
+        self._selection_generation = (self._selection_generation + 1) % (1 << 24)
 
     def _clear_or_hold_obstacles(self):
         if (
@@ -3049,6 +3631,215 @@ class CBFSafetyNode:
         self.debug_link_centers = None
         self.debug_prism_boxes = None
         self.debug_candidate_points = None   # the candidate pool (~512) the SDF ranks
+
+    # ── graphed critical-point selection (~cbf_selection_mode:=graphed) ────
+
+    def _selection_graph_supported(self):
+        """The graphed path implements exactly ONE selection policy.
+
+        It fuses the 'sdf' candidate filter with the 'sdf' + 'topk' selection:
+        rank the cloud by whole-body SDF, drop self-hits and anything past
+        cbf_sdf_candidate_max_dist, keep the k lowest. Any config whose
+        selection differs (fork_mesh/fork_sdf scoring, 'local' Euclidean
+        clustering, stickiness memory, the grasp split budget) is NOT this
+        policy, so it stays on the legacy path rather than being silently
+        approximated. Reported once at startup.
+        """
+        why = []
+        if self.cbf_candidate_filter != "sdf":
+            why.append("candidate_filter=%s (need sdf)" % self.cbf_candidate_filter)
+        if self.cbf_selection_metric != "sdf":
+            why.append("selection_metric=%s (need sdf)" % self.cbf_selection_metric)
+        if self.cbf_cluster_mode != "topk":
+            why.append("cluster_mode=%s (need topk)" % self.cbf_cluster_mode)
+        if self.cbf_selection_sticky_points > 0:
+            why.append("selection stickiness is on")
+        if self.cbf_grasp_enabled and self.cbf_grasp_separate_constraint \
+                and self.cbf_grasp_obstacle_points > 0:
+            why.append("grasp split-select is on")
+        # NOTE: soft barrier value is supported. The graph emits a fixed k rows
+        # padded with far dummies, so selected_count is k rather than the real
+        # count; that is inert for the barrier (a dummy at 100 m contributes
+        # exp(-100/alpha) = 0 to the Softmin, so the VALUE is unchanged), but
+        # soft mode's alpha*log(N) de-bias reads the count and log(k) would
+        # over-correct when the pool is mostly dummies (runPP1010: 44% were).
+        # Resolved without a sync: the graph emits n_real, an async D2H lands
+        # it in a pinned buffer, and adoption reads it once the pack event has
+        # fired. See _preprocess_obstacles_graphed / _adopt_preprocess_results.
+        return why
+
+    def _build_selection_graph(self, q9):
+        """Capture FK + whole-body SDF + self-filter + top-k as one graph.
+
+        Called once from __init__ (before the timers start), not lazily: see
+        the call site.
+
+        FK is captured INSIDE the graph on purpose: link_poses depends on q,
+        and _native_forward_kinematics_subset allocates fresh tensors per
+        call, so passing a dict in from outside would freeze stale pointers
+        and filter the cloud against where the arm USED to be. Capturing it
+        keeps the replay live in q (verified: replaying after restaging q
+        changes the selection, and matches the eager path bit-exactly).
+        """
+        n = self.cbf_sdf_graph_points
+        self._sel_static_pts = torch.full((n, 3), 100.0, dtype=torch.float32,
+                                          device=self.device)
+        self._sel_static_q9 = q9.detach().clone()
+        # MUST be an attribute, not a local. A CUDA graph records raw device
+        # pointers: any tensor allocated OUTSIDE the capture and referenced
+        # inside it must outlive the graph, or the allocator hands its block
+        # to someone else and every replay reads that stranger's bytes. As a
+        # local this dangled onto _sel_static_q9's memory, so the dummy pad
+        # came back as q instead of (100,100,100) -- invisible whenever the
+        # selection was full (torch.where never picks the dummy branch), and
+        # a phantom obstacle at the robot's own joint values the moment fewer
+        # than k points were valid. Tensors created INSIDE the capture are
+        # fine: they live in the graph's private pool.
+        self._sel_dummy_row = torch.full((1, 3), 100.0, device=self.device)
+
+        def _select():
+            link_poses = self.robot_layer._native_forward_kinematics_subset(
+                self._sel_static_q9, self.protected_fk_tree)
+            _, sdf_per_link = self.bernstein_core.get_whole_body_sdf_batch(
+                self._sel_static_pts, self.eye4, self._sel_static_q9,
+                return_per_link=True, link_poses=link_poses)
+            sdf_body = sdf_per_link[0, :5, :].min(dim=0).values
+            sdf_all = sdf_per_link[0].min(dim=0).values
+            sdf_self_filter = (sdf_all if self.cbf_sdf_self_filter_all_links
+                               else sdf_body)
+            # Same keep rule as _whole_body_sdf_candidates, expressed as a
+            # score instead of a boolean mask: rejects go to +inf so top-k
+            # can never pick them, and every shape stays static. This is what
+            # removes the mask-index sync.
+            valid = (
+                (sdf_all <= self.cbf_sdf_candidate_max_dist)
+                & (sdf_self_filter > self.cbf_sdf_self_filter_margin)
+            )
+            score = torch.where(valid, sdf_all,
+                                torch.full_like(sdf_all, float('inf')))
+            # sorted=True (default) => scores ascend and the +inf rejects sort
+            # LAST, so the real points land in rows [0, n_real) and the dummy
+            # pad in [n_real, k): exactly the legacy _copy_fixed_obstacles
+            # layout, which is what lets selected_count keep its meaning.
+            sc, idx = torch.topk(score, k=self.cbf_graph_points, largest=False)
+            sel = self._sel_static_pts[idx]
+            finite = torch.isfinite(sc)
+            # Fewer than k valid points: the tail of the top-k holds rejects.
+            # Overwrite those with the far dummy, matching the legacy
+            # _copy_fixed_obstacles pad (and keeping pct_dummy_selection
+            # meaningful) instead of admitting a self-hit as an obstacle.
+            obs = torch.where(finite.unsqueeze(1), sel, self._sel_dummy_row)
+            n_real = finite.sum()
+
+            # min distance from the TOOL to the candidate pool, over the same
+            # valid set the legacy path uses (not just the selected k), kept
+            # on-device: a .item() here would sync the preprocess thread.
+            T_tool = link_poses.get(self.tool_link)
+            x_now = T_tool[:, :3, 3]
+            dist = torch.norm(self._sel_static_pts - x_now, dim=1)
+            min_dist = torch.where(
+                valid, dist, torch.full_like(dist, float('inf'))).min()
+            return obs, min_dist, n_real
+
+        # Warm up on a side stream (allocator + any lazy init must not be
+        # captured), then capture. capture_error_mode="thread_local" matches
+        # finalize_cuda_graph: the default global mode errors if ANY other
+        # thread touches CUDA during capture, and this node has an FM planner
+        # and a control loop alongside it.
+        s = torch.cuda.Stream(device=self.device)
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                _select()
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize(self.device)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, capture_error_mode="thread_local"):
+            (self._sel_out_obs, self._sel_out_min_dist,
+             self._sel_out_n_real) = _select()
+        self._sel_graph = g
+        rospy.loginfo(
+            "CBF selection: graphed path ready (width=%d pts, k=%d, "
+            "max_dist=%.3f, self_margin=%.3f)",
+            self.cbf_sdf_graph_points, self.cbf_graph_points,
+            self.cbf_sdf_candidate_max_dist, self.cbf_sdf_self_filter_margin)
+
+    def _selection_broad_phase(self, pts, q9, n_keep):
+        """Cloud wider than the graph: keep the n_keep nearest by link centre.
+
+        Only fires when the cloud exceeds ~cbf_sdf_graph_points, which no
+        currently-published cloud does (feeding 2573, PP 2000 vs 4096). It
+        exists so that growing the cloud degrades into a cheap broad phase
+        (~0.16 ms) instead of silently truncating it -- dropping obstacle
+        points is a safety hole, not a slow path. Sync-free: out-of-range
+        goes to +inf, then a fixed-size top-k (no boolean mask).
+        """
+        link_poses = self.robot_layer._native_forward_kinematics_subset(
+            q9, self.protected_fk_tree)
+        centers = [link_poses[n][0, :3, 3] for n in self.protected_link_names
+                   if link_poses.get(n) is not None]
+        if not centers:
+            return pts[:n_keep]
+        centers = torch.stack(centers, dim=0)
+        d = torch.cdist(pts.unsqueeze(0), centers.unsqueeze(0)
+                        ).squeeze(0).min(dim=1).values
+        _, keep = torch.topk(d, k=n_keep, largest=False)
+        return pts[keep]
+
+    def _preprocess_obstacles_graphed(self, pts, q9, t_start):
+        """One fixed-size replay: FK + SDF + self-filter + top-k + dummies."""
+        n_cloud = int(pts.shape[0])
+        if n_cloud > self.cbf_sdf_graph_points:
+            self._sel_broad_phase_hits += 1
+            rospy.logwarn_throttle(
+                10.0,
+                "CBF selection: cloud %d > graph width %d -- broad phase "
+                "engaged (%d ticks). Raise ~cbf_sdf_graph_points to keep the "
+                "whole cloud in the exact path.",
+                n_cloud, self.cbf_sdf_graph_points, self._sel_broad_phase_hits)
+            pts = self._selection_broad_phase(
+                pts, q9, self.cbf_sdf_graph_points)
+            n_cloud = int(pts.shape[0])
+
+        # Stage: pad the tail with far dummies so retired points from a
+        # shorter cloud cannot linger in the buffer as phantom obstacles.
+        self._sel_static_pts.fill_(100.0)
+        self._sel_static_pts[:n_cloud].copy_(pts[:n_cloud])
+        self._sel_static_q9.copy_(q9)
+        self._sel_graph.replay()
+
+        # _copy_fixed_obstacles clones into a fresh tensor, which is what
+        # keeps preprocess_obstacles' pack invariant intact: the control
+        # thread must never hold a ref to the graph's static output, or the
+        # next replay would mutate the selection under a pending adoption.
+        # It sets selected_count = k (the fixed width); the real count lands
+        # asynchronously below and replaces it at adoption.
+        self._copy_fixed_obstacles(self._sel_out_obs)
+        # Real-count readback, the _esc_pin trick: an ASYNC D2H into pinned
+        # memory, never awaited here. A blocking read (.item()) would wait on
+        # the replay behind whatever SAM2/FM has queued on the GPU -- that is
+        # precisely the 38 ms stall this path exists to remove. The copy is
+        # issued on the preprocess stream BEFORE preprocess_obstacles records
+        # _prep_done_event, so the event covers it and the control thread can
+        # read the value at adoption without ever blocking.
+        self._sel_n_pin.copy_(self._sel_out_n_real, non_blocking=True)
+        self.selected_num_inside = n_cloud
+        self.selected_min_obs_dist = self._sel_out_min_dist.clone()
+        # Candidate-pool viz would need the valid mask = a sync. The selected
+        # points still publish; only the yellow "considered but not chosen"
+        # cloud is unavailable on this path.
+        self.selected_pts_yellow = torch.empty((0, 3), dtype=torch.float32,
+                                               device=self.device)
+        self.debug_candidate_points = None
+        self.debug_score_seed = None
+        self.debug_tip_min = None
+
+        if self.profile_sync:
+            torch.cuda.synchronize()
+        self.preprocess_times.append(time.perf_counter() - t_start)
+        self.timing.publish('critical_point_selection',
+                            (time.perf_counter() - t_start) * 1000.0)
 
     def _prefilter_for_sdf(self, pts, q9, link_poses=None):
         """Cheap all-link prefilter before expensive whole-body SDF."""
@@ -3369,12 +4160,20 @@ class CBFSafetyNode:
             self._staged_winv_cpu,
             self._staged_N_cpu,
             self._staged_Jz_cpu,
+            # Graphed path only: selected_count above is the fixed graph width
+            # (dummy pad included). The true count is still in flight in this
+            # pinned buffer; adoption resolves it once the event says it has
+            # landed. None on the legacy path, whose count is already exact.
+            self._sel_n_pin if self.cbf_selection_mode == "graphed" else None,
         )
 
     def _preprocess_obstacles_impl(self):
-        # Task-metric refresh lives here (preprocess thread, ~30 Hz), off the
-        # 100 Hz control path. Before the obstacle early-return so the metric
-        # stays current even while the cloud is empty.
+        # Task-metric refresh lives here (preprocess thread), off the 100 Hz
+        # control path. Before the obstacle early-return so the metric stays
+        # current even while the cloud is empty -- and therefore OUTSIDE the
+        # critical_point_selection timing below, which starts at t_start.
+        # Its own rate is preprocess_rate_hz / cbf_task_metric_update_every;
+        # see _update_task_metric.
         if self.cbf_task_metric_enabled:
             try:
                 self._update_task_metric(self.current_q.detach())
@@ -3402,6 +4201,22 @@ class CBFSafetyNode:
         if pts is None or pts.shape[0] == 0:
             self._clear_or_hold_obstacles()
             return
+
+        if self.cbf_selection_mode == "graphed" and not self._sel_graph_failed:
+            try:
+                with torch.no_grad():
+                    q9_current = torch.cat(
+                        [self.current_q.detach(), self.q_pad2], dim=1)
+                    self._preprocess_obstacles_graphed(pts, q9_current, t_start)
+                return
+            except Exception as e:
+                # Never take the node down over an optimization: fall back to
+                # the legacy path for the rest of the run and say so loudly.
+                self._sel_graph_failed = True
+                self._sel_graph = None
+                rospy.logerr(
+                    "CBF graphed selection failed (%s) -- falling back to the "
+                    "legacy path for the rest of this run.", e)
 
         try:
             with torch.no_grad():
@@ -3774,6 +4589,7 @@ class CBFSafetyNode:
                 self.dq_real_measured = torch.from_numpy(dq_np).to(
                     self.device).unsqueeze(0)
                 self._joint_uploaded_stamp = stamp
+                self._joint_uploaded_np = q_np
             nom_np = self._nominal_q_staging
             if nom_np is not None and nom_np is not self._nominal_q_uploaded:
                 self.nominal_q = torch.from_numpy(nom_np).to(
@@ -3922,13 +4738,17 @@ class CBFSafetyNode:
                         # (runPP102: ~80 us/op, cbf_correction p50 16 ms with
                         # the GPU idle at readback).
                         local_obs = self._adopted_obs
-                        escape_active, esc_h_bias = self._escape_trigger_update()
+                        esc_gate, esc_h_bias = self._escape_trigger_update()
+                        escape_active = esc_gate > 0.01
                         self.static_q.copy_(current_q)
                         self.static_obs.copy_(local_obs)
                         self.static_dq_nom.copy_(dq_nom_torch)
                         self.static_nominal_q.copy_(nominal_q)
                         sn = self._scalar_np
-                        sn[0] = 1.0 if escape_active else 0.0
+                        # Proportional gate: the graph multiplies the whole
+                        # composed escape (incl. suppression) by sc[0], so a
+                        # fractional value ramps the authority smoothly.
+                        sn[0] = esc_gate
                         sn[1] = (dt / (dt + self.cbf_velocity_filter_tau)
                                  if self.cbf_velocity_filter_tau > 0.0 else 0.0)
                         sn[2] = 1.0 / max(dt, 1e-3)
@@ -3940,7 +4760,8 @@ class CBFSafetyNode:
                                                   non_blocking=True)
                         self.graph.replay()
                         self._queue_escape_state(self.static_dq_nom_cbf,
-                                                 dq_out=self.static_dq_safe)
+                                                 dq_out=self.static_dq_safe,
+                                                 dq_nom_raw=self.static_dq_nom)
                         dq_escape = self.static_dq_escape_out
                     elif self.enable_cbf:
                         # (task-metric buffers are refreshed by the preprocess
@@ -3969,7 +4790,9 @@ class CBFSafetyNode:
                         local_obs = self._adopted_obs  # event-complete selection
                         self.dq_safe_work.copy_(self._run_velocity_cbf_solver(
                             current_q, local_obs, dq_nom_cbf))
-                        self._queue_escape_state(dq_nom_cbf)
+                        self._joint_limit_clamp_(self.dq_safe_work)
+                        self._queue_escape_state(dq_nom_cbf,
+                                                 dq_nom_raw=dq_nom_base)
                         self._update_dynamic_hdot(current_q, dt)
                         dq_nom_torch = dq_nom_cbf
                     else:
@@ -4354,6 +5177,32 @@ class CBFSafetyNode:
 
                 pos_msg = Float64MultiArray(data=q_safe_work_cpu)
                 self.safe_cmd_pub.publish(pos_msg)
+
+                if (self.reflex_state_pub is not None and self.enable_cbf
+                        and self._joint_uploaded_np is not None):
+                    # Per-link (h, env_hdot, grad_h) snapshot for the 1 kHz
+                    # reflex brake. The command readback above already drained
+                    # the control stream, so this extra small D2H costs only
+                    # the transfer itself. Rows never touched by the solver
+                    # keep their far init (h=1, grad=0) and stay inert
+                    # downstream (the reflex only acts on h < h_activate).
+                    nr = self._reflex_n_rows
+                    self._reflex_gpu[0:nr].copy_(self.static_h_links[:nr])
+                    self._reflex_gpu[nr:2 * nr].copy_(
+                        self.static_hdot_env_links[:nr])
+                    self._reflex_gpu[2 * nr:].copy_(
+                        self.static_grad_links[:nr].reshape(-1))
+                    reflex_cpu = self._reflex_gpu.cpu().numpy()
+                    # Trailing selection generation (backward-compatible:
+                    # legacy parsers slice exact ranges and ignore it). Read
+                    # without a lock: a swap racing this read misattributes
+                    # at most one monitor pair, which the gate then skips or
+                    # keeps as the legacy behavior did.
+                    self.reflex_state_pub.publish(Float32MultiArray(
+                        data=[current_time, float(nr)]
+                        + self._joint_uploaded_np.tolist()
+                        + reflex_cpu.tolist()
+                        + [float(self._selection_generation)]))
                 t_pub_done = time.perf_counter()
                 self.timing.publish('cbf_correction', (t_cbf_done - t_start) * 1000.0)
                 self.timing.publish('cbf_command', (t_q_cmd_done - t_cbf_done) * 1000.0)
@@ -4421,6 +5270,7 @@ class CBFSafetyNode:
                         self.transfer_buffer[46:53].copy_(dq_fb.squeeze(0))
                         self.transfer_buffer[53:60].copy_(solver_out.squeeze(0))
                         self.transfer_buffer[64:71].copy_(dq_escape.squeeze(0))
+                        self.transfer_buffer[79].copy_(self.static_sampled_margin)
 
                     cpu_buffer = self.transfer_buffer.cpu().numpy()
                     alignment_val = float(cpu_buffer[16])
@@ -4482,6 +5332,14 @@ class CBFSafetyNode:
                 if diag_due and cpu_buffer is not None:
                     nan = float('nan')
                     self.h_pub.publish(Float32MultiArray(data=[h_val]))
+                    env_hdot_val = 0.0
+                    if self.enable_cbf and self.cbf_dynamic_hdot_enabled:
+                        env_links = getattr(self, 'static_hdot_env_links', None)
+                        if env_links is not None:
+                            # Cheap: the transfer_buffer.cpu() above already
+                            # drained the queue this cycle.
+                            env_hdot_val = float(env_links.max().detach().cpu())
+                    self.env_hdot_pub.publish(Float32(data=env_hdot_val))
                     if self.enable_cbf:
                         valid_obs_count = max(0, min(
                             int(self._adopted_count), int(local_obs.shape[0])))
@@ -4518,7 +5376,7 @@ class CBFSafetyNode:
                         float(cpu_buffer[60]) if repair_on else nan,
                         float(cpu_buffer[61]) if repair_on else nan,
                         float(cpu_buffer[63]) if self.enable_cbf else nan,
-                        1.0 if escape_active else 0.0,
+                        float(self._escape_gate),  # proportional gate [0,1]
                         0.0,  # ema_applied
                         1.0 if velocity_filter_active else 0.0,
                         diag_vel_source,
@@ -4543,6 +5401,7 @@ class CBFSafetyNode:
                         h_hard_val,
                         softmin_gap_val,
                         float(cpu_buffer[71]) if self.enable_cbf else nan,  # h_food
+                        float(cpu_buffer[79]) if self.enable_cbf else nan,  # sampled_margin
                     ]
                     self.diag_pub.publish(Float32MultiArray(data=(
                         cpu_buffer[39:46].tolist()                 # dq_ff
