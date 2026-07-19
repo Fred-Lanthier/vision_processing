@@ -72,6 +72,39 @@ measurable, rather than a latency guess.
     h_stop over the entire hold interval; the only excursions occur in the
     two exempt already-below-stop cases, which no brake can prevent.
 
+    UNIFORM EXPONENTIAL CONDITION (~exp_kappa > 0, certified mode only):
+    the certified requirement per row changes from the invariance floor
+    "h_end >= h_stop" to the discrete exponential CBF condition
+        h_end >= (1 - kappa*T) * h_now
+    (Agrawal & Sreenath [1], the sampled analogue of hdot >= -kappa*h),
+    evaluated on the certified lower bounds. This is the SAME condition
+    the QP enforces, checked at the reflex rate with the Lipschitz
+    remainder — and it restores the half of the zeroing-CBF theorem the
+    floor check drops: for h < 0 the condition REQUIRES certified
+    increase (attractivity of the safe set, Xu, Tabuada, Grizzle & Ames,
+    "Robustness of Control Barrier Functions for Safety Critical
+    Control", ADHS 2015), so a QP recovery command passes at the largest
+    certifiable alpha instead of hitting the floor mode's a<=0 dead-end
+    (runPP1022: alpha = 0 for 5 s at h = -0.2 mm while the QP commanded
+    a certified outward recovery). With h < 0 rows the per-row feasible
+    alpha-set is an INTERVAL excluding 0; if the intervals of all rows
+    have no common point, no scalar brake is certifiable and the node
+    publishes zeros (a jointly-recovering direction is the QP's job —
+    see ~cbf_repair_all_rows in the CBF node). Floor semantics (h_stop)
+    are unchanged when ~exp_kappa is 0. Match ~exp_kappa to the QP's
+    cbf_kappa: near the boundary the QP band is tighter than kappa*h, so
+    a fresh QP-certified command always passes.
+
+    ISSf DISTURBANCE CHARGE (~issf_epsilon > 0): certificate assumption
+    (i) — perfect velocity tracking — is replaced by the identified bound
+    ||dq_real - dq_cmd|| <= epsilon (Kolathaya & Ames, "Input-to-State
+    Safety with Control Barrier Functions", IEEE L-CSS 2019, matching the
+    QP's cbf_issf_epsilon). Two charges per row, both proportional to
+    ||g_l||*epsilon: the dead-reckoned drift tail since the last
+    /joint_states sample (position uncertainty of h_now: the ZOH odometry
+    assumed the command was executed) and the disturbance over the coming
+    hold T. 0 = off (legacy: tracking assumed exact).
+
 Scaling toward zero along the QP-certified direction is a pure brake: for
 state-only barriers it cannot create a new violation of any other constraint,
 so no QP, feasibility reasoning, or constraint deconfliction is needed here —
@@ -185,6 +218,51 @@ JOINT_NAMES = [f'panda_joint{i}' for i in range(1, 8)]
 TICK_DECAY = 0.98
 
 
+def certified_alpha_intervals(a, b, c, tol=1e-12):
+    """Largest jointly-certifiable brake scale for rows a + b*al - c*al^2 >= 0.
+
+    The quadratic is concave (c >= 0), so each row's feasible set within
+    [0, 1] is an interval [lo, hi]. Rows with a >= 0 contain al = 0 (full
+    stop certifiable); rows with a < 0 — already below the required decay
+    curve — need a MINIMUM authority lo > 0: only letting their (outward)
+    command act is certifiable, not braking it away. The single published
+    scale must lie in every row's interval.
+
+    Returns (alpha, feasible): alpha = min(hi) over rows, feasible = True
+    iff every row is non-empty and min(hi) >= max(lo) - tol. On conflict
+    (feasible False) no scalar alpha satisfies all certificates and the
+    caller must fall back to a full stop.
+    """
+    a = np.atleast_1d(np.asarray(a, dtype=np.float64))
+    b = np.broadcast_to(np.asarray(b, dtype=np.float64), a.shape)
+    c = np.broadcast_to(np.asarray(c, dtype=np.float64), a.shape)
+    lo = np.zeros_like(a)
+    hi = np.ones_like(a)
+    quad = c > tol
+    # Linear rows: a + b*al >= 0.
+    linm = ~quad
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pos = linm & (b > tol)          # increasing: al >= -a/b
+        lo[pos] = np.maximum(0.0, -a[pos] / b[pos])
+        neg = linm & (b < -tol)         # decreasing: al <= a/(-b)
+        hi[neg] = np.minimum(1.0, a[neg] / (-b[neg]))
+        flat = linm & (np.abs(b) <= tol) & (a < -tol)
+        lo[flat], hi[flat] = 1.0, -1.0  # empty
+        # Quadratic rows: feasible between the roots of c*al^2 - b*al - a.
+        disc = b * b + 4.0 * c * a
+        bad = quad & (disc < 0.0)
+        lo[bad], hi[bad] = 1.0, -1.0    # empty
+        okq = quad & (disc >= 0.0)
+        sq = np.sqrt(np.maximum(disc, 0.0))
+        lo[okq] = np.maximum(0.0, (b[okq] - sq[okq]) / (2.0 * c[okq]))
+        hi[okq] = np.minimum(1.0, (b[okq] + sq[okq]) / (2.0 * c[okq]))
+    if np.any(lo > hi + tol):
+        return 0.0, False
+    alpha = float(np.clip(hi.min(), 0.0, 1.0))
+    feasible = alpha >= float(lo.max()) - tol
+    return (alpha, True) if feasible else (0.0, False)
+
+
 class CbfReflexNode:
     def __init__(self):
         rospy.init_node('cbf_reflex')
@@ -232,6 +310,40 @@ class CbfReflexNode:
         # sdf_gradient_experiments/lipschitz_bound_study.py (one-sided
         # curvature sups of the exact analytic gradient); validate against
         # the empirical estimate published as /cbf_reflex/status[4].
+        # Uniform exponential condition (certified mode; module docstring).
+        # 0 = legacy invariance floor h_end >= h_stop. > 0 = enforce
+        # h_end >= (1 - exp_kappa*T) * h_now per row: same class-K condition
+        # as the QP, so it also certifies RECOVERY (h < 0 demands increase)
+        # instead of freezing on it. Match the QP's cbf_kappa.
+        self.exp_kappa = float(rospy.get_param('~exp_kappa', 0.0))
+        # h < 0 branch of the exp-mode class-K: demanded recovery rate is a
+        # ~recovery_slack fraction of the QP's own SATURATING recovery law
+        # rec_speed*min(-h/rec_depth, 1), NOT exp_kappa*|h|. Extending
+        # kappa*h below zero demands kappa*|h| of certified outward speed -
+        # at kappa 25 and h = -2.2 mm that is 55 mm/s against a QP recovery
+        # stack that delivers ~12 mm/s BY DESIGN (recovery_speed cap), so
+        # the per-row alpha interval goes empty and the reflex vetoes the
+        # very retreat that would fix the violation (runPP1023 v5: grasp-
+        # weld yank drove hand/link4 to -3 mm, then 10 s frozen at -2.2 mm
+        # with the QP commanding certified recovery the whole time). Same
+        # nested-class-K rule as exp_kappa vs the band slope, applied to
+        # the other side of zero: the backstop's demand must be strictly
+        # weaker than what the shaping layer can certify. alpha(h) stays a
+        # valid extended class-K (increasing through 0, saturating), so
+        # invariance AND attractivity are preserved. Match ~recovery_speed
+        # / ~recovery_depth to the QP's cbf_recovery_speed / _depth.
+        self.recovery_speed = float(rospy.get_param('~recovery_speed', 0.05))
+        self.recovery_depth = float(rospy.get_param('~recovery_depth', 0.015))
+        self.recovery_slack = float(rospy.get_param('~recovery_slack', 0.5))
+        # ISSf tracking-disturbance bound [rad/s] (module docstring); match
+        # the QP's cbf_issf_epsilon. 0 = assume exact tracking (legacy).
+        # With ~issf_rho > 0 the bound is speed-dependent, eps(v) = eps0 +
+        # rho * v, evaluated at the speed of the command being certified
+        # (matching the QP's cbf_issf_rho identification): the alpha-
+        # proportional part folds into the linear coefficient b, so braking
+        # earns back disturbance headroom.
+        self.issf_epsilon = float(rospy.get_param('~issf_epsilon', 0.0))
+        self.issf_rho = float(rospy.get_param('~issf_rho', 0.0))
         gl = rospy.get_param('~grad_lipschitz', 2.0)
         if isinstance(gl, str):
             gl = [float(x) for x in gl.replace(',', ' ').split()]
@@ -293,10 +405,12 @@ class CbfReflexNode:
         rospy.loginfo(
             'cbf_reflex ready: %s -> %s at %.0f Hz | mode=%s '
             'grad_lipschitz=%s horizon=measured (per-tick, ~%.1fms) '
-            'h_stop=%.3fm h_activate=%.3fm release_tau=%.3fs',
+            'h_stop=%.3fm h_activate=%.3fm release_tau=%.3fs '
+            'exp_kappa=%.1f issf_eps=%.3f+%.3f*v',
             self.in_topic, self.out_topic, self.rate_hz, self.mode,
             gl_str, 1e3 / self.rate_hz, self.h_stop,
-            self.h_activate, self.release_tau)
+            self.h_activate, self.release_tau,
+            self.exp_kappa, self.issf_epsilon, self.issf_rho)
 
     # ── callbacks (numpy only, atomic single-ref swaps) ────────────────────
 
@@ -385,7 +499,8 @@ class CbfReflexNode:
         p = (q - q0) + (self._odom - odom_q)
         if self.mode == 'certified':
             return self._alpha_certified(
-                dq, now, t_solve, p, h, env, G, age)
+                dq, now, t_solve, p, h, env, G, age,
+                meas_gap=max(now - _t_q, 0.0))
 
         h_now = h + G @ p
         hdot = G @ dq - env
@@ -406,14 +521,17 @@ class CbfReflexNode:
         alpha = float(np.clip(alphas.min(), 0.0, 1.0))
         return alpha, min_pred, int(viol.sum()), age
 
-    def _alpha_certified(self, dq, now, t_solve, p, h, env, G, age):
+    def _alpha_certified(self, dq, now, t_solve, p, h, env, G, age,
+                         meas_gap=0.0):
         """Sampled-data CBF certificate (module docstring, [2]).
 
         Solves, per inward-commanded row, the largest alpha in [0, 1] with
             a + b*alpha - c*alpha^2 >= 0
         i.e. the Lipschitz-remainder lower bound on h at the end of the
-        horizon stays >= h_stop; concavity along the straight ZOH segment
-        makes the endpoint check sufficient for the whole interval.
+        horizon stays >= h_stop (floor mode) or >= (1 - exp_kappa*T)*h_now
+        (uniform exponential mode, ~exp_kappa); concavity along the
+        straight ZOH segment makes the endpoint check sufficient for the
+        whole interval.
         """
         # L: scalar, or one constant per row (per-link curvature). A vector
         # whose length does not match the received rows falls back to its
@@ -433,8 +551,71 @@ class CbfReflexNode:
         Gdq = G @ dq
         # Certified CURRENT value: measured drift with its remainder bound.
         h_now = h + Gp - 0.5 * L * p2
-        a = h_now - env * (t_elapsed + T) - self.h_stop
         b = (Gdq - L * pdq) * T
+        if self.issf_epsilon > 0.0 or self.issf_rho > 0.0:
+            # ISSf charges (module docstring): the dead-reckoned drift tail
+            # is position uncertainty of h_now (the ZOH odometry assumed
+            # exact tracking over the unmeasured gap); the hold charge is
+            # the disturbance's worst h-decay over the coming horizon. The
+            # constant (eps0) parts and the past-gap charge do not scale
+            # with alpha (history and floor disturbance are not braked);
+            # the rho part of the FUTURE hold scales with the commanded
+            # speed alpha*||dq|| and therefore folds into b.
+            g_norm = np.linalg.norm(G, axis=1)
+            dq_norm = float(np.linalg.norm(dq))
+            # The gap charge is HISTORY: it must be priced at the velocity
+            # that was actually APPLIED over the unmeasured tail (already
+            # alpha-scaled; ~0 when parked), never at the candidate command
+            # being certified now. Charging eps(||dq_cand||) here made the
+            # parked state infeasible on its own history (runPP1023 v3:
+            # alpha=0 lock at h=+4 mm with the arm stationary).
+            dq_applied_norm = float(np.linalg.norm(self._dq_applied))
+            eps_gap = self.issf_epsilon + self.issf_rho * dq_applied_norm
+            h_now = h_now - g_norm * eps_gap * meas_gap
+            issf_T = g_norm * self.issf_epsilon * T
+            b = b - g_norm * self.issf_rho * dq_norm * T
+        else:
+            issf_T = 0.0
+
+        if self.exp_kappa > 0.0:
+            # Uniform exponential condition h_end >= h_now - alpha_K(h_now)*T
+            # on the certified bounds: allows decay at exp_kappa*h when
+            # h_now > 0, REQUIRES certified increase when h_now < 0
+            # (attractivity — a recovery command passes at the largest
+            # certifiable alpha; a full stop is no longer certifiable).
+            # The h<0 demand follows the slack-scaled QP recovery law (see
+            # ~recovery_slack): saturating extended class-K, feasible by
+            # construction against the QP's own recovery commands.
+            rec_demand = (self.recovery_slack * self.recovery_speed
+                          * np.minimum(np.maximum(-h_now, 0.0)
+                                       / max(self.recovery_depth, 1e-6),
+                                       1.0))
+            allow = np.where(h_now >= 0.0,
+                             self.exp_kappa * h_now, -rec_demand)
+            a = allow * T - env * (t_elapsed + T) - issf_T
+            active = h_now < self.h_activate
+            if not np.any(active):
+                return 1.0, float('inf'), 0, age
+            a_a, b_a, c_a = a[active], b[active], c[active]
+            end_full = a_a + b_a - c_a    # certificate margin at alpha = 1
+            min_pred = float(end_full.min())
+            if np.all(end_full >= 0.0):
+                return 1.0, min_pred, 0, age
+            alpha, feasible = certified_alpha_intervals(a_a, b_a, c_a)
+            if not feasible:
+                # Per-row feasible alpha-intervals have no common point: a
+                # scalar brake cannot serve rows demanding authority and
+                # rows demanding a stop at once. Safest reachable action is
+                # a full stop; a jointly-recovering DIRECTION is the QP's
+                # job (cbf_repair_all_rows).
+                rospy.logwarn_throttle(
+                    1.0, 'cbf_reflex: conflicting per-row certificates '
+                         '(no scalar alpha feasible), commanding stop')
+                alpha = 0.0
+            n_brake = int(np.sum(end_full < 0.0))
+            return alpha, min_pred, n_brake, age
+
+        a = h_now - env * (t_elapsed + T) - issf_T - self.h_stop
         # Unlike the linear mode, OUTWARD-commanded rows are braked too when
         # their endpoint certificate fails (under curvature, motion along
         # +grad can still lower true h; the root formula is valid for any

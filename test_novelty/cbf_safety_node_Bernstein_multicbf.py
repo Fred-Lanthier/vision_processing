@@ -312,15 +312,88 @@ class CBFSafetyNode:
             "~cbf_sampled_data_margin_max", 0.08))
         _sd_T = (self.cbf_sampled_data_T if self.cbf_sampled_data_T > 0.0
                  else 1.0 / max(float(rospy.get_param("~rate_hz", 150.0)), 1e-3))
+        self._sampled_margin_T = _sd_T
         self._sampled_margin_coeff = (
             0.5 * self.cbf_sampled_data_L * _sd_T
             if self.cbf_sampled_data_margin else 0.0)
+        # Linearization point of the margin's ||dq||^2 (and of the speed-
+        # dependent ISSf bound below). "command" (legacy) = max(previous
+        # published command, current nominal). That point is wrong twice
+        # (runPP1023): the published command includes the repair, so a
+        # repair episode self-inflates the margin to its cap (0.1*0.898^2 =
+        # 0.081 -> bound infeasible -> worst_final_constraint -0.0455 while
+        # h was +5 mm and RISING), and at a parked local minimum the
+        # NOMINAL keeps pushing 0.46 rad/s while the arm executes 0.06, so
+        # the standoff charges for a dip along a path never travelled
+        # (~60x overcharge in v^2). "executed" = min(command-based value,
+        # (||dq_measured|| + vel_headroom)^2): the dip is a property of the
+        # EXECUTED ZOH segment, the executed speed is measured, and the
+        # headroom is the identified per-hold speed INCREASE bound
+        # (braking cannot deepen the dip; accel-only p95 per >=33 ms:
+        # 0.075-0.138 rad/s over runPP1022/23). min() of two valid upper
+        # bounds is a valid upper bound, and it breaks the repair->margin
+        # feedback loop structurally.
+        self.cbf_sampled_data_linearization = str(rospy.get_param(
+            "~cbf_sampled_data_linearization", "command")).strip().lower()
+        if self.cbf_sampled_data_linearization not in ("command", "executed"):
+            rospy.logwarn("~cbf_sampled_data_linearization must be 'command' "
+                          "or 'executed'; using 'command'")
+            self.cbf_sampled_data_linearization = "command"
+        self.cbf_sampled_data_vel_headroom = float(rospy.get_param(
+            "~cbf_sampled_data_vel_headroom", 0.15))
+        # Per-link gradient-Lipschitz constants for the margin, in
+        # cbf_link_names order (same family as the reflex ~grad_lipschitz;
+        # sdf_gradient_experiments/lipschitz_bound_study.py). The margin
+        # row for link l then uses (L_l/2)*T*v^2 instead of the global
+        # worst case: arm links carry L ~ 1.4-10 vs the global 20, so
+        # their standoff halves for free. multi_graphed rows only; empty
+        # string = scalar ~cbf_sampled_data_L everywhere (legacy).
+        _ll = str(rospy.get_param("~cbf_sampled_data_L_links", "")).strip()
+        self.cbf_sampled_data_L_links = (
+            [float(x) for x in _ll.replace(",", " ").split()] if _ll else None)
         if self.cbf_sampled_data_margin:
             rospy.loginfo(
                 "CBF sampled-data margin ON: m(dq) = %.3f*||dq||^2 m/s "
                 "(L=%.1f, T=%.4f s, cap %.3f m/s)",
                 self._sampled_margin_coeff, self.cbf_sampled_data_L,
                 _sd_T, self.cbf_sampled_data_margin_max)
+        # ISSf (input-to-state safety) tracking-error margin, per QP row.
+        # The plant executes dq = u + d, not the command u (velocity-
+        # controller lag, output low-pass memory, reflex alpha-scaling), so
+        # a constraint certified on u says nothing about the true flow. With
+        # an identified matched-disturbance bound ||d|| <= epsilon [rad/s],
+        # tightening every row to
+        #   grad_h_i . u >= bound_i + ||grad_h_i|| * epsilon
+        # makes the TRUE velocity satisfy grad_h_i . (u + d) >= bound_i
+        # (Kolathaya & Ames, "Input-to-State Safety with Control Barrier
+        # Functions", IEEE L-CSS 2019). Without it the certificate silently
+        # assumes perfect tracking: runPP1022 dipped to h = -1.1 mm while
+        # the QP commanded OUTWARD every cycle (cmd_hdot +0.02 vs measured
+        # -0.02). epsilon is identified from the logged mismatch
+        # ||dq_real - dq_published|| (dedup + ZOH-averaged command:
+        # runPP1022 rms 0.034, p99 0.12, dip-window p95 0.16). Standoff
+        # cost |grad_h| eps / kappa (~7 mm at eps 0.15, |g| 0.22, kappa 5).
+        # 0 = off (legacy bound, bit-identical). No new diagnostic needed:
+        # the margin reconstructs offline as eps * grad_h_norm (logged).
+        self.cbf_issf_epsilon = float(rospy.get_param(
+            "~cbf_issf_epsilon", 0.0))
+        # Speed-dependent disturbance bound eps(v) = eps0 + rho * v, with v
+        # the SAME executed-envelope linearization speed as the sampled
+        # margin. Identified from the tracking mismatch binned by measured
+        # speed (runPP1022/23 p95 envelope: ~0.04 parked, 0.06 at 0.1,
+        # 0.09 at 0.25, 0.16+ at 0.5 -> eps0 = 0.05, rho = 0.35). All
+        # margins then shrink to their identified floor at rest — the
+        # parked standoff stays certified but near-minimal — and grow with
+        # actual activity. rho = 0 reproduces the constant-eps ISSf bound.
+        self.cbf_issf_rho = float(rospy.get_param("~cbf_issf_rho", 0.0))
+        self._issf_on = (self.cbf_issf_epsilon > 0.0
+                         or self.cbf_issf_rho > 0.0)
+        if self._issf_on:
+            rospy.loginfo(
+                "CBF ISSf margin ON: bound += ||grad_h_row|| * (%.3f + "
+                "%.3f * v) rad/s (linearization: %s)",
+                self.cbf_issf_epsilon, self.cbf_issf_rho,
+                self.cbf_sampled_data_linearization)
         self.cbf_recovery_switch_margin = float(rospy.get_param(
             "~cbf_recovery_switch_margin", 0.004))
         self.cbf_solver_mode = str(rospy.get_param(
@@ -377,6 +450,46 @@ class CBFSafetyNode:
         # enters/exits the container vertically) is trusted instead.
         self.cbf_repair_grad_min = float(rospy.get_param(
             "~cbf_repair_grad_min", 0.1))
+        # Repair scope. The final-constraint repair re-validates the POST-
+        # low-pass command; "critical" (legacy, False) projects it onto the
+        # min-h row's half-space only. That is wrong whenever SEVERAL rows
+        # are active with opposing gradients: runPP1022 parked pinched
+        # between link4/link5 (cos(g4,g5) = -0.30, both h ~ -0.1 mm); the
+        # filter pulled the command off the feasible set, the repair fixed
+        # link4 to residual ~0 and thereby pushed INTO link5 (-0.028 m/s
+        # violated every cycle), and the reflex rightly vetoed the result
+        # (alpha = 0, arm frozen at h = -0.2 mm) even though a direction
+        # improving BOTH rows existed (bisector: +0.037 m/s at |dq| 0.3).
+        # True = re-run the Dykstra sweeps over ALL K solve rows (h/grad/
+        # env frozen from this cycle's evaluate, exported by _solve_multi;
+        # pure fixed-shape in-graph vector ops). multi_graphed + graphed
+        # control step only; other paths warn and keep the legacy repair.
+        self.cbf_repair_all_rows = _bool_param("~cbf_repair_all_rows", False)
+        # Sweep count for the all-rows repair, decoupled from the solve's
+        # cbf_constraint_sweeps. 0 = use cbf_constraint_sweeps (legacy).
+        # Each sweep is K tiny [7]-vector ops inside the CUDA graph, so a
+        # high count is essentially free; runPP1023 v6's constant -0.003
+        # residual was the geometric tail of only 6 sweeps over task-
+        # metric-skewed opposing rows, re-paid every cycle.
+        self.cbf_repair_sweeps = int(rospy.get_param("~cbf_repair_sweeps", 0))
+        # Inner algorithm of the all-rows repair. "dykstra" (default) =
+        # correction-memory sweeps converging to the EXACT min-W-norm
+        # projection onto the row intersection (same algorithm family the
+        # solve validated in scripts/solver_study.py; smallest deviation
+        # from the near-optimal post-filter command, order-independent).
+        # Dykstra REQUIRES exact per-row projections, so under it the
+        # grad-min gate is BINARY (a row with ||g|| < cbf_repair_grad_min
+        # is excluded outright): damping the step instead parks the fixed
+        # point at gate*projection, permanently short of the half-space —
+        # the runPP1023 v6 -0.0012 block. "pocs" = plain under-relaxed
+        # cyclic projections, which tolerate the legacy damped ramp
+        # (feasibility only, possible outward over-correction).
+        self.cbf_repair_qp_algorithm = str(rospy.get_param(
+            "~cbf_repair_qp_algorithm", "dykstra")).strip().lower()
+        if self.cbf_repair_qp_algorithm not in ("dykstra", "pocs"):
+            rospy.logwarn("~cbf_repair_qp_algorithm must be 'dykstra' or "
+                          "'pocs'; using 'dykstra'")
+            self.cbf_repair_qp_algorithm = "dykstra"
         # Metric for the QP min-norm projection. "identity" is the Euclidean
         # joint-space projection (legacy: dq_delta ∝ grad_h, so the correction
         # lands on whichever joint has the largest moment arm on the barrier,
@@ -1384,9 +1497,14 @@ class CBFSafetyNode:
         # Same time-varying tightening the graphed solve applied to the
         # critical row: the repair / residual must re-validate against the
         # bound that was actually enforced, not the weaker static one.
-        return torch.where(h > 0.0, outside_bound, inside_bound) \
+        bound = torch.where(h > 0.0, outside_bound, inside_bound) \
             + self.cbf_constraint_margin + self.static_hdot_env_min \
             + self.static_sampled_margin
+        if self._issf_on:
+            # ISSf tightening of the critical row (see ~cbf_issf_epsilon).
+            bound = bound + self.static_issf_eps * torch.norm(
+                self.static_grad_h, dim=1)
+        return bound
 
     def _constraint_residual(self, h, grad_h, dq):
         gdq = (grad_h * dq).sum(dim=1)
@@ -1398,8 +1516,11 @@ class CBFSafetyNode:
             torch.full_like(h, self.cbf_recovery_kappa),
             torch.full_like(h, self.cbf_kappa),
         )
-        return (gdq + kappa_eff * h - self.cbf_constraint_margin
-                - self.static_hdot_env_min - self.static_sampled_margin)
+        res = (gdq + kappa_eff * h - self.cbf_constraint_margin
+               - self.static_hdot_env_min - self.static_sampled_margin)
+        if self._issf_on:
+            res = res - self.static_issf_eps * torch.norm(grad_h, dim=1)
+        return res
 
     def _diagnostic_active_constraints(self):
         if self.cbf_solver_mode == "multi_graphed":
@@ -1752,8 +1873,19 @@ class CBFSafetyNode:
         # (_qp_step, eager POCS bounds, repair/residual) adds it
         # unconditionally; it stays 0 when ~cbf_sampled_data_margin is off.
         # Written once per cycle — in-graph for the graphed control step,
-        # eagerly in _run_velocity_cbf_solver otherwise.
+        # eagerly in _run_velocity_cbf_solver otherwise. With per-link L
+        # (~cbf_sampled_data_L_links) this buffer is the CRITICAL ROW's
+        # margin (exported by _solve_multi like static_hdot_env_min, so the
+        # repair/residual re-validate the enforced bound); the scalar-L
+        # value used by the food row / single-row paths lives in
+        # static_sampled_scalar, and the linearized v^2 in static_v2_lin.
         self.static_sampled_margin = torch.zeros((), device=self.device)
+        self.static_sampled_scalar = torch.zeros((), device=self.device)
+        self.static_v2_lin = torch.zeros((), device=self.device)
+        # ISSf eps(v) [rad/s], 0-dim, initialized at the floor so paths
+        # that never refresh it still charge eps0.
+        self.static_issf_eps = torch.full(
+            (), self.cbf_issf_epsilon, device=self.device)
         self.static_h_links = torch.ones(n_hdot_rows, device=self.device)
         self.static_grad_links = torch.zeros((n_hdot_rows, 7), device=self.device)
         # Reflex export staging: [h_rows | env_hdot_rows | grad_rows(flat)]
@@ -1776,6 +1908,7 @@ class CBFSafetyNode:
 
         # Capture scalars as Python floats so the CUDA graph bakes in the params.
         constraint_margin = self.cbf_constraint_margin
+        issf_on = self._issf_on
         # Per-group band/recovery constants, baked at capture. The fork+robot set
         # and the grasped-target set are passed explicitly to _qp_step so each
         # half-space brakes/recovers with its own authority.
@@ -1796,7 +1929,7 @@ class CBFSafetyNode:
 
         def _qp_step(h, grad_h, dq_in, h_activate, max_inward_speed,
                      recovery_speed, recovery_depth, max_correction_speed,
-                     hdot_env, exact_denom=False):
+                     hdot_env, exact_denom=False, sampled_margin=None):
             self.static_h.copy_(h)
             # Tangent-preserving fast CBF:
             # - outside activation: no correction
@@ -1813,7 +1946,13 @@ class CBFSafetyNode:
             # from static_hdot_env_links; 0 when cbf_dynamic_hdot is disabled
             # or this link's environment is static.
             bound = bound + constraint_margin + hdot_env \
-                + self.static_sampled_margin
+                + (self.static_sampled_scalar if sampled_margin is None
+                   else sampled_margin)
+            if issf_on:
+                # ISSf: certify the row for the TRUE velocity u + d,
+                # ||d|| <= eps(v) (see ~cbf_issf_epsilon / ~cbf_issf_rho).
+                bound = bound + self.static_issf_eps * torch.norm(
+                    grad_h, dim=-1)
             gdq = (grad_h * dq_in).sum(dim=-1)
             constr = torch.where(active, gdq - bound, torch.ones_like(gdq))
             self.static_constr.copy_(constr)
@@ -1948,6 +2087,37 @@ class CBFSafetyNode:
         warm_dykstra = use_dykstra and self.cbf_dykstra_warmstart
         dykstra_lam_links = torch.zeros(max(n_robot, 1), device=self.device)
         dykstra_lam_food = torch.zeros(1, device=self.device)
+        # Row export for the all-rows final repair (~cbf_repair_all_rows):
+        # h / grad / env of every robot solve row, frozen from this cycle's
+        # evaluate, so the repair can re-project the post-filter command
+        # onto the SAME constraint set the solve enforced. Persistent self
+        # buffers: the repair closure lives in finalize_cuda_graph and both
+        # sides are captured in the same CUDA graph.
+        self._repair_K = K_max
+        self.static_repair_h = torch.zeros((K_max,), device=self.device)
+        self.static_repair_g = torch.zeros((K_max, 7), device=self.device)
+        self.static_repair_env = torch.zeros((K_max,), device=self.device)
+        self.static_repair_sampled = torch.zeros((K_max,), device=self.device)
+        self._repair_dykstra_z = torch.zeros((K_max, 7), device=self.device)
+        # Per-row sampled-margin coefficients 0.5 * L_l * T, gathered by link
+        # identity in _solve_multi (~cbf_sampled_data_L_links). Uniform
+        # scalar-L values when unset/malformed (legacy behavior).
+        _coeffs = [self._sampled_margin_coeff] * n_robot
+        self._sampled_per_row_L = False
+        if (self.cbf_sampled_data_margin
+                and self.cbf_sampled_data_L_links is not None):
+            if len(self.cbf_sampled_data_L_links) == n_robot:
+                _coeffs = [0.5 * l * self._sampled_margin_T
+                           for l in self.cbf_sampled_data_L_links]
+                self._sampled_per_row_L = True
+            else:
+                rospy.logwarn(
+                    "cbf_sampled_data_L_links has %d values but %d protected "
+                    "links; falling back to scalar L=%.1f",
+                    len(self.cbf_sampled_data_L_links), n_robot,
+                    self.cbf_sampled_data_L)
+        self._sampled_coeff_links = torch.tensor(
+            _coeffs, dtype=torch.float32, device=self.device)
 
         def _multi_constraints():
             result = self.analytical_barrier.evaluate(
@@ -1972,6 +2142,21 @@ class CBFSafetyNode:
         def _solve_multi(dq_nom):
             (h_vals, g_vals, env_vals, h_f, g_f, env_f,
              idx) = _multi_constraints()
+            # Per-row sampled margin: (L_link/2)*T*v_lin^2, gathered by the
+            # same link identity as env_vals. Falls back to the scalar-L
+            # value (broadcast view) when per-link L is unset.
+            if self._sampled_per_row_L:
+                sampled_rows = torch.clamp(
+                    self._sampled_coeff_links.index_select(0, idx[0])
+                    * self.static_v2_lin,
+                    max=self.cbf_sampled_data_margin_max)
+            else:
+                sampled_rows = self.static_sampled_scalar.expand(K_max)
+            if self.cbf_repair_all_rows:
+                self.static_repair_h.copy_(h_vals[0])
+                self.static_repair_g.copy_(g_vals[0])
+                self.static_repair_env.copy_(env_vals)
+                self.static_repair_sampled.copy_(sampled_rows)
             if two_group:
                 self.static_h_food.copy_(torch.clamp(h_f, max=0.25))
             dq = dq_nom
@@ -2015,7 +2200,8 @@ class CBFSafetyNode:
                         dq_tmp = dq + dykstra_z[k + 1]
                         dq = _qp_step(h_vals[:, k], g_vals[:, k, :], dq_tmp,
                                       *robot_band, env_vals[k],
-                                      exact_denom=True)
+                                      exact_denom=True,
+                                      sampled_margin=sampled_rows[k])
                         dykstra_z[k + 1].copy_((dq_tmp - dq)[0])
                 if warm_dykstra:
                     # lambda_l = -(g_l . z_l) / (g_l . W^-1 g_l) >= 0, stored
@@ -2040,7 +2226,8 @@ class CBFSafetyNode:
                         dq = _qp_step(h_f, g_f, dq, *food_band, env_f)  # target half-space
                     for k in range(K_max):                          # robot links (last)
                         dq = _qp_step(h_vals[:, k], g_vals[:, k, :], dq,
-                                      *robot_band, env_vals[k])
+                                      *robot_band, env_vals[k],
+                                      sampled_margin=sampled_rows[k])
             # Leave static_h / static_grad_h / static_hdot_env_min on the
             # most-critical robot link for the diagnostics / repair (the loop
             # ends on the least-critical row).
@@ -2050,6 +2237,10 @@ class CBFSafetyNode:
                 g_vals.gather(1, min_k[:, None, None].expand(-1, 1, 7)).squeeze(1))
             self.static_hdot_env_min.copy_(
                 env_vals.index_select(0, min_k).squeeze(0))
+            if self._sampled_per_row_L:
+                # Critical row's margin for the repair/residual bound.
+                self.static_sampled_margin.copy_(
+                    sampled_rows.index_select(0, min_k).squeeze(0))
             return dq
 
         def _solve(dq_nom):
@@ -2124,6 +2315,18 @@ class CBFSafetyNode:
                 "mode with cbf_command_dt>0, final-constraint repair, no "
                 "monitor-only / position-controller mode); falling back to "
                 "the eager control step.")
+        # All-rows repair needs the exported multi_graphed solve rows AND the
+        # graphed control step (the eager control loop keeps its legacy
+        # single-row repair). Decided here, baked into the capture below.
+        self._repair_all_rows_active = (
+            self.cbf_repair_all_rows
+            and self.cbf_solver_mode == "multi_graphed"
+            and self._graph_control_step)
+        if self.cbf_repair_all_rows and not self._repair_all_rows_active:
+            rospy.logwarn(
+                "cbf_repair_all_rows requested but unavailable (needs "
+                "cbf_solver_mode multi_graphed + graphed control step); "
+                "keeping the legacy critical-row repair.")
 
         if not self._graph_control_step:
             def _warmup():
@@ -2161,7 +2364,8 @@ class CBFSafetyNode:
         self.static_dq_nom_cbf = torch.zeros((1, 7), device=dev)
         self.static_dq_escape_out = torch.zeros((1, 7), device=dev)
         # Per-cycle scalars: [0] escape flag, [1] velocity-filter gamma,
-        # [2] 1/dt, [3] dynamic-hdot gamma, [4] escape h bias.
+        # [2] 1/dt, [3] dynamic-hdot gamma, [4] escape h bias,
+        # [5] measured joint speed ||dq_real|| (executed linearization).
         self.static_scalars = torch.zeros(8, device=dev)
         self._scalar_pin = torch.zeros(8, dtype=torch.float32).pin_memory()
         self._scalar_np = self._scalar_pin.numpy()
@@ -2256,17 +2460,44 @@ class CBFSafetyNode:
             dq_nom_cbf = torch.clamp(self.static_dq_nom + extra,
                                      min=-mjv, max=mjv)
             self.static_dq_nom_cbf.copy_(dq_nom_cbf)
-            # Sampled-data margin m(dq) = (L/2) T ||dq||^2, linearized at the
-            # max of the previous published command (dq_safe_work still holds
-            # last cycle's final value here) and the current nominal. Runs
-            # IN-GRAPH: pure tensor ops on persistent buffers, no sync.
-            if self.cbf_sampled_data_margin:
+            # Sampled-data margin m(dq) = (L/2) T ||dq||^2 and ISSf eps(v).
+            # Linearization v^2: legacy "command" = max(previous published
+            # command (dq_safe_work still holds last cycle's final value
+            # here), current nominal); "executed" additionally caps it by
+            # (||dq_measured|| + headroom)^2 — min of two valid upper
+            # bounds, breaking the repair->margin feedback loop (see
+            # ~cbf_sampled_data_linearization). Runs IN-GRAPH: pure tensor
+            # ops on persistent buffers, no sync. sc[5] = ||dq_real||
+            # staged per cycle by the control loop.
+            if self.cbf_sampled_data_margin or self._issf_on:
                 v2 = torch.maximum(
                     (self.dq_safe_work * self.dq_safe_work).sum(),
                     (dq_nom_cbf * dq_nom_cbf).sum())
-                self.static_sampled_margin.copy_(torch.clamp(
-                    self._sampled_margin_coeff * v2,
-                    max=self.cbf_sampled_data_margin_max))
+                if self.cbf_sampled_data_linearization == "executed":
+                    v_exec = sc[5] + self.cbf_sampled_data_vel_headroom
+                    v2 = torch.minimum(v2, v_exec * v_exec)
+                self.static_v2_lin.copy_(v2)
+                if self.cbf_sampled_data_margin:
+                    m_scalar = torch.clamp(
+                        self._sampled_margin_coeff * v2,
+                        max=self.cbf_sampled_data_margin_max)
+                    self.static_sampled_scalar.copy_(m_scalar)
+                    # Critical-row export default; _solve_multi overwrites
+                    # it with the per-row value when per-link L is active.
+                    self.static_sampled_margin.copy_(m_scalar)
+                if self._issf_on:
+                    # eps(v) at the MEASURED speed (executed mode): the
+                    # bound was identified by binning the mismatch against
+                    # the measured speed of the same interval, so ε(v_meas)
+                    # IS the identified relationship; the headroom belongs
+                    # only to the curvature-dip term above (a future speed
+                    # increase steepens the path, but the disturbance
+                    # statistics already contain within-hold acceleration).
+                    v_issf = (sc[5] if self.cbf_sampled_data_linearization
+                              == "executed" else torch.sqrt(v2))
+                    self.static_issf_eps.copy_(
+                        self.cbf_issf_epsilon
+                        + self.cbf_issf_rho * v_issf)
             # Solve (writes static_h / static_grad_h / static_constr fresh).
             dq = _solve(dq_nom_cbf)
             self.static_dq_safe.copy_(dq)
@@ -2307,19 +2538,92 @@ class CBFSafetyNode:
             final_constr = self._constraint_residual(
                 h_final, grad_h, self.dq_safe_work)
             final_active = h_final <= self.cbf_h_activate
-            needs_repair = (
-                final_active
-                & (final_constr < 0.0)
-                & (grad_norm_sq.squeeze(1) > 1e-8)
-            ).view(-1, 1)
-            repair_step = torch.where(
-                final_active,
-                (-final_constr).clamp(min=0.0),
-                torch.zeros_like(final_constr),
-            ).view(-1, 1)
-            w_grad_final = grad_h @ self.static_Winv
-            w_denom_final = (grad_h * w_grad_final).sum(dim=1, keepdim=True)
-            repair_delta = repair_step * w_grad_final / (w_denom_final + 1e-6)
+            if self._repair_all_rows_active:
+                # All-rows repair (~cbf_repair_all_rows): Dykstra sweeps of
+                # exact projections onto EVERY exported solve row (gradients
+                # frozen from this cycle's evaluate), so the post-filter
+                # command returns to the intersection the solve certified.
+                # The critical-row projection alone can push INTO a second
+                # active row when gradients oppose (runPP1022: link4/link5,
+                # cos = -0.30 -> alpha=0 reflex freeze at h = -0.2 mm).
+                rg = self.static_repair_g                       # [K,7]
+                rh = self.static_repair_h                       # [K]
+                r_out = -self.cbf_max_inward_speed * torch.clamp(
+                    rh / max(self.cbf_h_activate, 1e-6), min=0.0, max=1.0)
+                r_in = self.cbf_recovery_speed * torch.clamp(
+                    (-rh) / max(self.cbf_recovery_depth, 1e-6),
+                    min=0.0, max=1.0)
+                r_bound = torch.where(rh > 0.0, r_out, r_in) \
+                    + self.cbf_constraint_margin + self.static_repair_env \
+                    + self.static_repair_sampled
+                r_gnorm = torch.norm(rg, dim=1)
+                if self._issf_on:
+                    r_bound = r_bound + self.static_issf_eps * r_gnorm
+                # Degenerate-gradient gate. Dykstra needs exact projections,
+                # so its gate is a binary row exclusion at grad_min; the
+                # POCS branch keeps the legacy damped ramp (converges, just
+                # slower on half-trusted rows).
+                repair_dykstra = (self.cbf_repair_qp_algorithm == "dykstra")
+                if self.cbf_repair_grad_min > 0.0:
+                    if repair_dykstra:
+                        r_gate = (r_gnorm
+                                  >= self.cbf_repair_grad_min).float()
+                    else:
+                        r_gate = torch.clamp(
+                            (r_gnorm - self.cbf_repair_grad_min)
+                            / (2.0 * self.cbf_repair_grad_min + 1e-9),
+                            min=0.0, max=1.0)
+                else:
+                    r_gate = torch.ones_like(r_gnorm)
+                r_scale = (rh <= self.cbf_h_activate).float() * r_gate
+                dq_before = self.dq_safe_work.view(-1)
+                needs_repair = (
+                    ((rg @ dq_before) < r_bound - 1e-9)
+                    & (rh <= self.cbf_h_activate)
+                    & (r_gnorm > 1e-4)).any().view(1, 1)
+                w_rg = rg @ self.static_Winv                    # [K,7]
+                r_denom = torch.clamp((rg * w_rg).sum(dim=1), min=1e-8)
+                dq_r = dq_before
+                n_sweeps = (self.cbf_repair_sweeps
+                            if self.cbf_repair_sweeps > 0
+                            else self.cbf_constraint_sweeps)
+                if repair_dykstra:
+                    # Dykstra: exact projections (binary gate above) +
+                    # correction memory -> min-W-norm point of the
+                    # intersection (~cbf_repair_qp_algorithm).
+                    self._repair_dykstra_z.zero_()
+                    for _s in range(n_sweeps):
+                        for k in range(self._repair_K):
+                            dq_tmp = dq_r + self._repair_dykstra_z[k]
+                            corr = torch.clamp(
+                                r_bound[k] - (rg[k] * dq_tmp).sum(),
+                                min=0.0)
+                            dq_r = dq_tmp + (r_scale[k] * corr
+                                             / r_denom[k]) * w_rg[k]
+                            self._repair_dykstra_z[k].copy_(dq_tmp - dq_r)
+                else:
+                    # POCS: plain cyclic projections, damped-ramp-tolerant.
+                    for _s in range(n_sweeps):
+                        for k in range(self._repair_K):
+                            corr = torch.clamp(
+                                r_bound[k] - (rg[k] * dq_r).sum(), min=0.0)
+                            dq_r = dq_r + (r_scale[k] * corr
+                                           / r_denom[k]) * w_rg[k]
+                repair_delta = (dq_r - dq_before).view(1, 7)
+            else:
+                needs_repair = (
+                    final_active
+                    & (final_constr < 0.0)
+                    & (grad_norm_sq.squeeze(1) > 1e-8)
+                ).view(-1, 1)
+                repair_step = torch.where(
+                    final_active,
+                    (-final_constr).clamp(min=0.0),
+                    torch.zeros_like(final_constr),
+                ).view(-1, 1)
+                w_grad_final = grad_h @ self.static_Winv
+                w_denom_final = (grad_h * w_grad_final).sum(dim=1, keepdim=True)
+                repair_delta = repair_step * w_grad_final / (w_denom_final + 1e-6)
             if (self.cbf_max_correction_speed > 0.0
                     or self.cbf_recovery_max_correction_speed > 0.0):
                 rd_norm = torch.norm(repair_delta, dim=1, keepdim=True)
@@ -2336,7 +2640,8 @@ class CBFSafetyNode:
                         repair_limit)
                 repair_delta = repair_delta * torch.clamp(
                     repair_limit / (rd_norm + 1e-9), max=1.0)
-            if self.cbf_repair_grad_min > 0.0:
+            if not self._repair_all_rows_active \
+                    and self.cbf_repair_grad_min > 0.0:
                 grad_norm = torch.sqrt(grad_norm_sq)
                 grad_gate = torch.clamp(
                     (grad_norm - self.cbf_repair_grad_min)
@@ -2575,6 +2880,8 @@ class CBFSafetyNode:
             (-h_det) / recovery_depth, min=0.0, max=1.0)
         bounds = torch.where(h_det > 0.0, outside_bound, inside_bound)
         bounds = bounds + self.cbf_constraint_margin + self.static_sampled_margin
+        if self._issf_on:
+            bounds = bounds + self.static_issf_eps * G.norm(dim=-1)
 
         # Fixed-iteration on-device POCS for the 7-variable, K-row QP.  Tensor
         # conditions replace Python scalar reads, so there is no intermediate
@@ -3004,16 +3311,32 @@ class CBFSafetyNode:
         self.static_q.copy_(current_q)
         self.static_obs.copy_(local_obs)
         self.static_dq_nom.copy_(dq_nom)
-        # Sampled-data margin, eager twin of the in-graph update in
-        # _control_step (dq_safe_work still holds last cycle's final command
-        # at solver entry).
-        if self.cbf_sampled_data_margin:
+        # Sampled-data margin + ISSf eps(v), eager twin of the in-graph
+        # update in _control_step (dq_safe_work still holds last cycle's
+        # final command at solver entry).
+        if self.cbf_sampled_data_margin or self._issf_on:
             v2 = torch.maximum(
                 (self.dq_safe_work * self.dq_safe_work).sum(),
                 (dq_nom * dq_nom).sum())
-            self.static_sampled_margin.copy_(torch.clamp(
-                self._sampled_margin_coeff * v2,
-                max=self.cbf_sampled_data_margin_max))
+            if self.cbf_sampled_data_linearization == "executed":
+                v_exec = (torch.norm(self.dq_real_measured)
+                          + self.cbf_sampled_data_vel_headroom)
+                v2 = torch.minimum(v2, v_exec * v_exec)
+            self.static_v2_lin.copy_(v2)
+            if self.cbf_sampled_data_margin:
+                m_scalar = torch.clamp(
+                    self._sampled_margin_coeff * v2,
+                    max=self.cbf_sampled_data_margin_max)
+                self.static_sampled_scalar.copy_(m_scalar)
+                self.static_sampled_margin.copy_(m_scalar)
+            if self._issf_on:
+                # eps(v) at the measured speed in executed mode (see the
+                # in-graph twin for the identification argument).
+                v_issf = (torch.norm(self.dq_real_measured)
+                          if self.cbf_sampled_data_linearization == "executed"
+                          else torch.sqrt(v2))
+                self.static_issf_eps.copy_(
+                    self.cbf_issf_epsilon + self.cbf_issf_rho * v_issf)
         if self.cbf_solver_mode in ("fast_tangent", "multi_graphed"):
             self.graph.replay()
             return self.static_dq_safe.detach()
@@ -4756,6 +5079,10 @@ class CBFSafetyNode:
                         sn[4] = (esc_h_bias
                                  if self.cbf_escape_use_bias_corrected_h
                                  else 0.0)
+                        # Measured joint speed for the executed-velocity
+                        # margin linearization (EMA'd FD from joint_callback;
+                        # atomic numpy ref grab, callback rebinds).
+                        sn[5] = float(np.linalg.norm(self._dq_real_np))
                         self.static_scalars.copy_(self._scalar_pin,
                                                   non_blocking=True)
                         self.graph.replay()

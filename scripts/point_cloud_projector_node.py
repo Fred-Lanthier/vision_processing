@@ -272,12 +272,29 @@ class PointCloudProjectorNode:
         msg.data = points.tobytes()
         return msg
 
-    def deproject_to_3d(self, mask, depth_img, max_points=None):
+    def deproject_to_3d(self, mask, z, max_points=None, crop_to_mask=False):
+        """mask -> camera-frame points. ``z`` is the depth in METRES float32
+        (converted ONCE per frame in sync_cb; it used to be re-converted
+        full-frame inside every call, twice per frame).
+
+        crop_to_mask: restrict all per-pixel work to the mask's bounding
+        box. For a target mask covering ~1% of the frame this removes ~99%
+        of the boolean/nonzero work; output is bit-identical (row-major
+        order inside the bbox equals the full-frame order restricted to the
+        mask, so even the sampling RNG draws the same points).
+        """
         if self.fx is None:
             return None
-        z = depth_img.astype(np.float32)
-        if depth_img.dtype != np.float32:
-            z /= 1000.0
+        v0 = u0 = 0
+        if crop_to_mask:
+            rows = np.flatnonzero(mask.any(axis=1))
+            if rows.size == 0:
+                return None
+            cols = np.flatnonzero(mask.any(axis=0))
+            v0, v1 = int(rows[0]), int(rows[-1]) + 1
+            u0, u1 = int(cols[0]), int(cols[-1]) + 1
+            mask = mask[v0:v1, u0:u1]
+            z = z[v0:v1, u0:u1]
         valid = (mask > 0) & (z > 0.01) & (z < 3.0) & np.isfinite(z)
         n_valid = int(np.count_nonzero(valid))
         if n_valid < 10:
@@ -288,8 +305,8 @@ class PointCloudProjectorNode:
             v_idx = v_idx[idx]
             u_idx = u_idx[idx]
         z_val = z[v_idx, u_idx]
-        x = (u_idx - self.cx) * z_val / self.fx
-        y = (v_idx - self.cy) * z_val / self.fy
+        x = (u_idx + u0 - self.cx) * z_val / self.fx
+        y = (v_idx + v0 - self.cy) * z_val / self.fy
         return np.stack([x, y, z_val], axis=-1).astype(np.float32, copy=False)
 
     def lookup_world_transform(self, stamp):
@@ -389,6 +406,12 @@ class PointCloudProjectorNode:
             depth_cv[self.fork_filter.pixel_mask] = 0
         # ──────────────────────────────────────────────────────────────────────
 
+        # Depth -> metres float32 ONCE per frame (was re-converted full-frame
+        # inside every deproject_to_3d call: 2x per frame).
+        z_m = depth_cv.astype(np.float32)
+        if depth_cv.dtype != np.float32:
+            z_m /= 1000.0
+
         t_stage = time.perf_counter()
         world_tf = self.lookup_world_transform(stamp)
         stages["tf"] = self._elapsed_ms(time.perf_counter(), t_stage)
@@ -403,7 +426,8 @@ class PointCloudProjectorNode:
         if tracking_active:
             self._last_valid_target_mask = mask_cv.copy()
             target_pts_cam = self.deproject_to_3d(
-                mask_cv, depth_cv, max_points=self.max_target_points
+                mask_cv, z_m, max_points=self.max_target_points,
+                crop_to_mask=True
             )
             if target_pts_cam is not None:
                 target_w = self.transform_to_world(target_pts_cam, world_tf)
@@ -424,17 +448,25 @@ class PointCloudProjectorNode:
         # 2. OBSTACLES — pixels outside SAM2 mask.
         # When tracking is lost, fall back to the last valid mask so the target
         # region is not reclassified as an obstacle and the CBF does not block approach.
-        mask_for_obs = mask_cv if tracking_active else self._last_valid_target_mask
-        if mask_for_obs is not None:
-            obs_mask = np.ones_like(mask_cv) * 255
-            obs_mask[mask_for_obs > 0] = 0
-        else:
-            obs_mask = np.ones_like(mask_cv) * 255
-
+        # Skipped entirely when nothing subscribes to the obstacle topic: the
+        # PP launch runs two projector instances whose obstacle outputs are
+        # unused (the CBF cloud is synthetic there), yet this full-frame pass
+        # dominated the 'projection' timing stat (p95 ~19 ms). Subscriber-
+        # gated, so the feeding pipeline (perception_processing subscribes)
+        # is byte-identical.
         t_stage = time.perf_counter()
-        obs_pre_sample = max(self.max_points, int(self.max_points * self.obstacle_sample_multiplier))
-        obs_pts_cam = self.deproject_to_3d(obs_mask, depth_cv, max_points=obs_pre_sample)
-        obs_in = 0 if obs_pts_cam is None else len(obs_pts_cam)
+        obs_pts_cam = None
+        obs_in = 0
+        if self.pub_obs.get_num_connections() > 0:
+            mask_for_obs = mask_cv if tracking_active else self._last_valid_target_mask
+            if mask_for_obs is not None:
+                obs_mask = np.ones_like(mask_cv) * 255
+                obs_mask[mask_for_obs > 0] = 0
+            else:
+                obs_mask = np.ones_like(mask_cv) * 255
+            obs_pre_sample = max(self.max_points, int(self.max_points * self.obstacle_sample_multiplier))
+            obs_pts_cam = self.deproject_to_3d(obs_mask, z_m, max_points=obs_pre_sample)
+            obs_in = 0 if obs_pts_cam is None else len(obs_pts_cam)
         stages["obs_deproj"] = self._elapsed_ms(time.perf_counter(), t_stage)
 
         # ── STRATEGY B: 3D fork backup (SDF shell or capsule) ─────────────────

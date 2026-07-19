@@ -14,7 +14,7 @@
      -> joint_group_velocity_controller. The PP obstacle stage uses a static
      cylinder cloud, leaving the feeding launch and shared perception code alone. -->
 <launch>
-  <arg name="gui" default="false"/>
+  <arg name="gui" default="true"/>
   <arg name="launch_sam3_server" default="true"/>
   <arg name="launch_rviz" default="false"/>
   <arg name="execute" default="true"/>
@@ -222,13 +222,84 @@
        rest, i.e. earned, not a constant fudge. Logged per cycle as the
        'sampled_margin' diagnostics scalar (figure: sampled_margin.*). -->
   <arg name="cbf_sampled_data_margin" default="true"/>
+  <!-- ISSf tracking-error margin (Kolathaya & Ames, IEEE L-CSS 2019): the
+       plant executes dq = u + d, not the command (velocity-controller lag,
+       output low-pass memory, reflex scaling), so every QP row is tightened
+       by ||grad_h_row|| * epsilon to certify the TRUE flow. runPP1022 is the
+       failure this closes: h dipped to -1.1 mm while the QP commanded
+       OUTWARD every cycle (cmd_hdot +0.02 vs measured -0.02) - the dip was
+       entirely unmodeled actuation mismatch. epsilon is the PROJECTED
+       disturbance bound: the certificate only ever consumes grad_h . d, so
+       the identified quantity is |cmd_hdot - real_hdot| / ||grad_h||, i.e.
+       the mismatch measured ALONG the constraint direction, straight from
+       the diagnostics log. runPP1023 v3: inward p95 0.011-0.018, p99 0.021
+       rad/s, speed-INDEPENDENT (the tracking error is mostly filter lag
+       along the tangential command direction; its grad_h component is
+       small). 0.025 covers the p99 of every speed bin. The earlier
+       norm-based eps(v) = 0.05 + 0.35v bounded the same quantity through
+       Cauchy-Schwarz (worst case: error perfectly anti-aligned with
+       grad_h) and over-charged 3-7x -> the 3.5 mm parked floor. rho stays
+       available (eps(v) = eps0 + rho*v at the measured speed) but the
+       identified projection needs no speed term. eps0=rho=0 = off. -->
+  <arg name="cbf_issf_epsilon" default="0.025"/>
+  <arg name="cbf_issf_rho" default="0.0"/>
+  <!-- Linearization point of the margin/eps speed: "executed" =
+       min(command-based v^2, (||dq_measured|| + headroom)^2). Fixes the two
+       runPP1023 artifacts: the repair->margin feedback loop (published
+       command 0.898 rad/s self-inflated the margin to its 0.08 cap ->
+       worst_final_constraint -0.0455 while h was +5 mm and RISING) and the
+       parked overcharge (margin linearized at the 0.46 rad/s NOMINAL while
+       the arm executed 0.06 -> parked 6.8 mm out). headroom = identified
+       per-hold speed INCREASE bound (accel-only p95 per >=33 ms:
+       0.075-0.138 across runPP1022/23; braking cannot deepen the dip).
+       "command" = legacy self-referential linearization. -->
+  <arg name="cbf_sampled_data_linearization" default="executed"/>
+  <arg name="cbf_sampled_data_vel_headroom" default="0.15"/>
+  <!-- Per-link L for the sampled margin rows (cbf_link_names order, same
+       constants as the reflex vector): arm links carry L 1.4-10 vs the
+       global worst case 20, halving their standoff for free. -->
+  <arg name="cbf_sampled_data_L_links" default="1.4 8.7 4.7 9.6 21.8 32.0 19.7 5 5"/>
+  <!-- Final repair over ALL solve rows, not the min-h row alone. runPP1022
+       tail: arm pinched between link4/link5 (cos(g4,g5) = -0.30, both
+       h ~ -0.1 mm); the critical-row repair fixed link4 exactly and thereby
+       pushed INTO link5 (-0.028 m/s violated every cycle) and the reflex
+       rightly vetoed everything (alpha = 0 freeze) although a direction
+       improving BOTH rows existed. All-rows repair re-runs the Dykstra
+       sweeps on the post-filter command (in-graph, multi_graphed only). -->
+  <arg name="cbf_repair_all_rows" default="true"/>
+  <!-- Repair iterations, decoupled from the solve's 6. runPP1023 v6: the
+       repair left a CONSTANT -0.003 residual through the 13 s graze (and
+       -0.0012 on the small-gradient block) - the iterative tail of 6
+       sweeps over task-metric-skewed opposing rows, re-paid every cycle.
+       24 POCS sweeps of K tiny vector ops are sub-ms inside the graph and
+       drive the tail below 1e-4. -->
+  <arg name="cbf_repair_sweeps" default="24"/>
+  <!-- Repair inner algorithm: dykstra = exact min-W-norm projection onto
+       the row intersection (validated family, solver_study.py; smallest
+       deviation from the near-optimal command). Requires exact per-row
+       projections, so the grad-min gate is BINARY under it (row in/out at
+       cbf_repair_grad_min) instead of the damped ramp that froze the
+       Dykstra fixed point at gate*projection (runPP1023 v6). -->
+  <arg name="cbf_repair_qp_algorithm" default="dykstra"/>
+  <!-- dykstra = exact min-W-norm repair (solver_study.py-validated family;
+       requires exact projections, so the grad-min gate is a binary row
+       exclusion). pocs = feasibility-only fallback tolerating the damped
+       gate ramp. -->
   <arg name="cbf_recovery_switch_margin" default="0.015"/>
   <arg name="cbf_enforce_final_constraint" default="true"/>
   <arg name="cbf_command_dt" default="0.05"/>
   <arg name="cbf_direct_position_mode" default="integrated"/>
   <arg name="cbf_position_correction_dt" default="0.02"/>
   <arg name="cbf_max_command_lead" default="0.05"/>
-  <arg name="cbf_h_activate" default="0.08"/>
+  <!-- TIGHTNESS: the active outside bound is the band
+       -max_inward_speed * h / h_activate, so its slope [1/s] sets the
+       equilibrium floor h* = (margins)/slope. The old 0.3/0.08 = 3.75 1/s
+       multiplied the (honest, identified) margins into a 6.7 mm min_h and
+       a slow asymptotic approach that reads as APF padding (runPP1023 v2).
+       0.5/0.04 = 12.5 1/s parks the SAME certified margins at ~1-2 mm:
+       tightness comes from allowing faster decay near the boundary, not
+       from deleting safety. Keep cbf_reflex_exp_kappa >= this slope. -->
+  <arg name="cbf_h_activate" default="0.04"/>
   <!-- Two-rate reflex brake (see green_cube_feeding_casf.launch): ~1 kHz
        h-extrapolation layer between the 100 Hz CBF-QP and the velocity
        controller. Off by default; inert diff when disabled. -->
@@ -240,6 +311,25 @@
        QP just ages the state, which brakes harder on its own. Standoff is
        bought with cbf_reflex_h_stop (a distance), not a padded horizon. -->
   <arg name="cbf_reflex_h_stop" default="0.0"/>
+  <!-- Must be STRICTLY GREATER than the QP band slope
+       max_inward_speed/h_activate (12.5), with real gap - NOT equal.
+       The QP runs 100% active in this scene and SATURATES its constraint
+       (equality) whenever the nominal pushes at the wall, so its command
+       decays h at exactly slope*h - margins. The reflex re-checks that
+       command with extra remainder charges the QP does not carry (drift
+       correction L*p.dq, unmeasured-gap ISSf charge, per-tick curvature):
+       at exp_kappa = slope the certificate is tight-against-tight with
+       ZERO slack and those charges tip every QP-legal command negative -
+       runPP1023 v4 braked 74% of ticks / alpha ~ 0 the whole path, at any
+       grad_lipschitz (L was never the binding term). The gap
+       (exp_kappa - slope)*h + QP margins is the slack budget; full-bag
+       replay: 12.5 -> 43.9% raw braking, 18.75 -> 2.6%, 25 -> 0.1%.
+       Any exp_kappa > 0 yields the same forward-invariance guarantee
+       (zeroing-CBF with class-K alpha(h) = exp_kappa*h); the QP's tighter
+       band remains the shaping layer, the reflex the backstop for
+       commands that escape certification (nested class-K layering, cf.
+       Rosolia/Singletary/Ames multirate control). -->
+  <arg name="cbf_reflex_exp_kappa" default="25.0"/>
   <!-- Reflex extrapolation mode. linear = legacy first-order estimate with
        the frozen gradient. certified = sampled-data CBF bound (Breeden,
        Garg & Panagou, "Control Barrier Functions in Sampled-Data Systems",
@@ -261,6 +351,11 @@
        models below; with production n_func=8 fingers use 850. A scalar
        value is still accepted (legacy global constant). -->
   <!--arg name="cbf_reflex_grad_lipschitz" default="5 35 25 30 85 85 50 5 5"/-->
+  <!-- Per-link vector NOW ACTIVE (was scalar 10; runPP1023 ran an
+       effective scalar 5 and the empirical estimate exceeded it on 40% of
+       near-barrier updates, p95 15.2 / max 43 - certificate assumption
+       (ii) was measurably violated). These are the nfunc12-candidate sups
+       matching the active cbf_model_override_dir below. -->
   <!--arg name="cbf_reflex_grad_lipschitz" default="1.4 8.7 4.7 9.6 21.8 32.0 19.7 5 5"/-->
   <arg name="cbf_reflex_grad_lipschitz" default="10"/>
   <!-- Retrained n_func=12 finger RDFs (validated 2026-07-14: MAE halved to
@@ -269,7 +364,9 @@
   <arg name="cbf_model_override_dir"
        default="$(find vision_processing)/third_party/SDF_Bernstein_Basis/panda_test/Models/nfunc12_candidate"/>
   <arg name="cbf_model_override_links" default="panda_leftfinger panda_rightfinger"/>
-  <arg name="cbf_max_inward_speed" default="0.3"/>
+  <!-- Raised with the h_activate reduction: band slope 0.5/0.04 = 12.5 1/s
+       (see the TIGHTNESS comment at cbf_h_activate). -->
+  <arg name="cbf_max_inward_speed" default="0.5"/>
   <arg name="cbf_recovery_speed" default="0.05"/>
   <arg name="cbf_recovery_depth" default="0.015"/>
   <!-- Raised from 0.3: the task-metric correction has larger joint-space
@@ -332,7 +429,7 @@
   <!-- Escape stack disabled for the thesis-canonical configuration (2026-07-13):
        frontal blockage of the controlled link = assumed safe-stop limitation
        (thesis ch. 4 garanties). q_dot_clear (nullspace clearance) stays ON. -->
-  <arg name="cbf_escape_enabled" default="true"/>
+  <arg name="cbf_escape_enabled" default="false"/>
   <arg name="cbf_escape_h_trigger" default="0.02"/>
   <arg name="cbf_escape_h_release" default="0.12"/>
   <arg name="cbf_escape_lift_gain" default="0.2"/>
@@ -756,6 +853,14 @@
         <param name="cbf_recovery_kappa" value="$(arg cbf_recovery_kappa)"/>
         <param name="cbf_constraint_margin" value="$(arg cbf_constraint_margin)"/>
         <param name="cbf_sampled_data_margin" value="$(arg cbf_sampled_data_margin)"/>
+        <param name="cbf_issf_epsilon" value="$(arg cbf_issf_epsilon)"/>
+        <param name="cbf_issf_rho" value="$(arg cbf_issf_rho)"/>
+        <param name="cbf_sampled_data_linearization" value="$(arg cbf_sampled_data_linearization)"/>
+        <param name="cbf_sampled_data_vel_headroom" value="$(arg cbf_sampled_data_vel_headroom)"/>
+        <param name="cbf_sampled_data_L_links" value="$(arg cbf_sampled_data_L_links)"/>
+        <param name="cbf_repair_all_rows" value="$(arg cbf_repair_all_rows)"/>
+        <param name="cbf_repair_sweeps" value="$(arg cbf_repair_sweeps)"/>
+        <param name="cbf_repair_qp_algorithm" value="$(arg cbf_repair_qp_algorithm)"/>
         <param name="cbf_recovery_switch_margin" value="$(arg cbf_recovery_switch_margin)"/>
         <param name="cbf_enforce_final_constraint" value="$(arg cbf_enforce_final_constraint)"/>
         <param name="cbf_command_dt" value="$(arg cbf_command_dt)"/>
@@ -824,7 +929,15 @@
 
   <!-- 5.2. Reflex brake layer (only with enable_cbf_reflex:=true and execute).
        Alpha-scales the intercepted CBF velocity command at ~1 kHz from the
-       extrapolated per-link barrier state. Pure brake: never steers. -->
+       extrapolated per-link barrier state. Pure brake: never steers.
+       exp_kappa = cbf_kappa switches the certified requirement from the
+       invariance floor h_end >= h_stop to the SAME discrete exponential
+       condition the QP enforces, h_end >= (1 - kappa*T) h_now: for h < 0 it
+       demands certified INCREASE (attractivity half of the zeroing-CBF
+       theorem, Xu et al. ADHS 2015) so a QP recovery command passes instead
+       of the runPP1022 alpha = 0 freeze; h_stop stays 0 - standoff comes
+       only from the certified QP margins, never a tuned floor. issf_epsilon
+       mirrors the QP's disturbance bound into the reflex certificate. -->
   <node name="cbf_reflex" pkg="vision_processing" type="cbf_reflex_node.py"
         output="screen" if="$(eval arg('enable_cbf_reflex') and arg('execute'))">
         <param name="rate_hz" value="$(arg cbf_reflex_rate_hz)"/>
@@ -832,6 +945,16 @@
         <param name="h_activate" value="$(arg cbf_h_activate)"/>
         <param name="mode" value="$(arg cbf_reflex_mode)"/>
         <param name="grad_lipschitz" value="$(arg cbf_reflex_grad_lipschitz)"/>
+        <param name="exp_kappa" value="$(arg cbf_reflex_exp_kappa)"/>
+        <!-- h<0 demand = recovery_slack * the QP's own recovery law (must
+             match the QP's cbf_recovery_speed/_depth; see node docstring:
+             kappa*|h| below zero demands more outward speed than the QP
+             recovery stack delivers and vetoes the retreat). -->
+        <param name="recovery_speed" value="$(arg cbf_recovery_speed)"/>
+        <param name="recovery_depth" value="$(arg cbf_recovery_depth)"/>
+        <param name="recovery_slack" value="0.5"/>
+        <param name="issf_epsilon" value="$(arg cbf_issf_epsilon)"/>
+        <param name="issf_rho" value="$(arg cbf_issf_rho)"/>
         <param name="in_velocity_topic" value="/cbf_safety/pre_reflex_command"/>
         <param name="out_velocity_topic" value="/joint_group_velocity_controller/command"/>
   </node>
