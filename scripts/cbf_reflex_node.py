@@ -384,6 +384,13 @@ class CbfReflexNode:
         # Empirical gradient-Lipschitz estimate from consecutive reflex
         # states (assumption (ii) monitor); updated at the solver rate.
         self._L_emp = 0.0
+        # Monitored-assumption veto: the CBF node's ISSf monitor reports when
+        # the realized plant disturbance exceeded the assumed epsilon on an
+        # active barrier row. The certificate is void for such ticks, so the
+        # reflex brakes fully for a short hold. 0 disables the veto.
+        self.issf_veto_hold = float(
+            rospy.get_param('~issf_veto_hold', 0.05))
+        self._issf_veto_until = 0.0
 
         rospy.Subscriber(self.in_topic, Float64MultiArray,
                          self._cmd_cb, queue_size=1)
@@ -391,6 +398,9 @@ class CbfReflexNode:
                          self._state_cb, queue_size=1)
         rospy.Subscriber('/joint_states', JointState,
                          self._joint_cb, queue_size=1)
+        if self.issf_veto_hold > 0.0:
+            rospy.Subscriber('/cbf_safety/issf_monitor', Float32MultiArray,
+                             self._issf_monitor_cb, queue_size=1)
 
         self.pub = rospy.Publisher(self.out_topic, Float64MultiArray,
                                    queue_size=1)
@@ -466,6 +476,11 @@ class CbfReflexNode:
                             '>> assumed ~grad_lipschitz (same-generation '
                             'pair: real curvature, L set too low?)',
                             self._L_emp)
+
+    def _issf_monitor_cb(self, msg):
+        # [t, eps_proj, ||d||, exceeded, running max] from the CBF node.
+        if len(msg.data) >= 4 and msg.data[3] > 0.5:
+            self._issf_veto_until = rospy.get_time() + self.issf_veto_hold
 
     def _joint_cb(self, msg):
         pos = {nm: p for nm, p in zip(msg.name, msg.position)}
@@ -682,6 +697,27 @@ class CbfReflexNode:
 
             t_tick = time.perf_counter()
             alpha_raw, min_pred, n_brake, age = self._compute_alpha(dq, now)
+            if now < self._issf_veto_until:
+                # The upstream ISSf monitor reported a disturbance beyond the
+                # assumed epsilon on an active row: the certificate this brake
+                # relies on is void, so hold until the monitor clears.
+                # Recovery exemption (same philosophy as _compute_alpha): a
+                # brake must never zero an outward recovery command, or the
+                # veto pins the arm inside the margin it is meant to protect.
+                state = self._state
+                in_recovery = False
+                if state is not None:
+                    h_rows = state[2]
+                    G_rows = state[4]
+                    below = h_rows < 0.0
+                    if np.any(below):
+                        in_recovery = bool(
+                            np.all((G_rows[below] @ dq) >= 0.0))
+                if not in_recovery:
+                    rospy.logwarn_throttle(
+                        1.0, 'cbf_reflex: ISSf disturbance bound exceeded '
+                             'upstream -- monitored-assumption veto (brake).')
+                    alpha_raw = 0.0
             if alpha_raw < self._alpha:
                 self._alpha = alpha_raw          # brake instantly
             else:

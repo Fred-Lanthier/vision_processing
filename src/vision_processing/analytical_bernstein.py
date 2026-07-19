@@ -424,8 +424,17 @@ class AnalyticalBernsteinSoftmin:
         if q_dimension > robot_dof:
             raise ValueError(f"q has {q_dimension} joints but URDF has {robot_dof}")
         if q_dimension < robot_dof:
-            q_full = torch.cat(
-                (q, q.new_zeros((batch, robot_dof - q_dimension))), dim=-1)
+            # Uncontrolled tail (gripper fingers): use the live measured buffer
+            # shared with BernsteinCore when attached, zeros otherwise. Read
+            # through a view so in-place updates reach captured CUDA graphs.
+            missing = robot_dof - q_dimension
+            extra = getattr(self, 'q_extra', None)
+            if (extra is not None and extra.numel() == missing
+                    and extra.device == q.device and extra.dtype == q.dtype):
+                tail = extra.reshape(1, missing).expand(batch, missing)
+            else:
+                tail = q.new_zeros((batch, missing))
+            q_full = torch.cat((q, tail), dim=-1)
         else:
             q_full = q
 

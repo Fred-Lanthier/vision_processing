@@ -14,9 +14,9 @@
      -> joint_group_velocity_controller. The PP obstacle stage uses a static
      cylinder cloud, leaving the feeding launch and shared perception code alone. -->
 <launch>
-  <arg name="gui" default="true"/>
+  <arg name="gui" default="false"/>
   <arg name="launch_sam3_server" default="true"/>
-  <arg name="launch_rviz" default="false"/>
+  <arg name="launch_rviz" default="true"/>
   <arg name="execute" default="true"/>
   <arg name="venv_python" default="/home/flanthier/Github/src/vision_processing/venv_sam3/bin/python3"/>
   <arg name="pytorch_cuda_alloc_conf" default="expandable_segments:True"/>
@@ -258,7 +258,7 @@
   <!-- Per-link L for the sampled margin rows (cbf_link_names order, same
        constants as the reflex vector): arm links carry L 1.4-10 vs the
        global worst case 20, halving their standoff for free. -->
-  <arg name="cbf_sampled_data_L_links" default="1.4 8.7 4.7 9.6 21.8 32.0 19.7 5 5"/>
+  <arg name="cbf_sampled_data_L_links" default="1.0 4.3 4.7 9.6 21.8 32.0 19.7 5 5"/>
   <!-- Final repair over ALL solve rows, not the min-h row alone. runPP1022
        tail: arm pinched between link4/link5 (cos(g4,g5) = -0.30, both
        h ~ -0.1 mm); the critical-row repair fixed link4 exactly and thereby
@@ -356,14 +356,19 @@
        near-barrier updates, p95 15.2 / max 43 - certificate assumption
        (ii) was measurably violated). These are the nfunc12-candidate sups
        matching the active cbf_model_override_dir below. -->
-  <!--arg name="cbf_reflex_grad_lipschitz" default="1.4 8.7 4.7 9.6 21.8 32.0 19.7 5 5"/-->
+  <!--arg name="cbf_reflex_grad_lipschitz" default="1.0 4.3 4.7 9.6 21.8 32.0 19.7 5 5"/-->
   <arg name="cbf_reflex_grad_lipschitz" default="10"/>
   <!-- Retrained n_func=12 finger RDFs (validated 2026-07-14: MAE halved to
        0.61 mm, p95 gradient angle 124->41 deg, negative curvature sup
-       840->508 vs production n_func=8). Empty string = production models. -->
+       840->508 vs production n_func=8). link2/link3 retrained at n_func=12
+       (2026-07-19); with them every protected link runs n=12 and the L
+       vectors above use the refreshed lipschitz_bound_study_nfunc12.json
+       p99s (link2 1.4->1.0, link3 8.7->4.3). Empty string = production
+       models. -->
+
   <arg name="cbf_model_override_dir"
        default="$(find vision_processing)/third_party/SDF_Bernstein_Basis/panda_test/Models/nfunc12_candidate"/>
-  <arg name="cbf_model_override_links" default="panda_leftfinger panda_rightfinger"/>
+  <arg name="cbf_model_override_links" default="panda_link2 panda_link3 panda_leftfinger panda_rightfinger"/>
   <!-- Raised with the h_activate reduction: band slope 0.5/0.04 = 12.5 1/s
        (see the TIGHTNESS comment at cbf_h_activate). -->
   <arg name="cbf_max_inward_speed" default="0.5"/>

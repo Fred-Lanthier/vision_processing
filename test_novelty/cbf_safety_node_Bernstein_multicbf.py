@@ -276,6 +276,18 @@ class CBFSafetyNode:
             d_safe=self.d_safe,
         )
 
+        # Measured gripper tail for whole-body FK. The URDF carries 9 dof
+        # (7 arm + 2 prismatic fingers) but only the arm is controlled; every
+        # padding site used to assume closed fingers (zeros) while the real
+        # gripper opens to 0.04 m per finger. This buffer holds the measured
+        # finger positions, is updated in-place once per control cycle, and is
+        # attached to both evaluators so all FK paths (including inside the
+        # captured CUDA graph) read the live values. Must exist BEFORE
+        # setup_cuda_graph so the capture records views of this memory.
+        self.q_pad2 = torch.zeros((1, 2), device=self.device)
+        self.bernstein_core.q_extra = self.q_pad2
+        self.analytical_barrier.q_extra = self.q_pad2
+
         # kappa: class-K coefficient in the CBF constraint ∇h·dq + κh ≥ 0.
         # High kappa forces hard corrections even when h is slightly positive (safe).
         # With a jumpy gradient, high kappa amplifies oscillation near obstacles.
@@ -732,6 +744,14 @@ class CBFSafetyNode:
             'panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
             'panda_joint5', 'panda_joint6', 'panda_joint7'
         ]))
+        # Uncontrolled gripper joints, in the URDF order that follows the arm
+        # joints. Their measured positions feed the q_pad2 FK tail; missing
+        # names (e.g. on the xArm7) leave the tail at zero, the old behavior.
+        self.finger_joint_names = list(rospy.get_param('~finger_joint_names', [
+            'panda_finger_joint1', 'panda_finger_joint2'
+        ]))
+        self._finger_staging = None
+        self._finger_uploaded = None
         self.current_q = None
         self.nominal_q = None
         self.target_x = None
@@ -1087,7 +1107,8 @@ class CBFSafetyNode:
         self.selected_obstacle_hold_time = float(rospy.get_param("~selected_obstacle_hold_time", 0.5))
 
         self.eye4 = torch.eye(4, device=self.device).unsqueeze(0)
-        self.q_pad2 = torch.zeros((1, 2), device=self.device)
+        # self.q_pad2 created earlier (before setup_cuda_graph) and attached
+        # to the evaluators; it now carries the measured finger positions.
         self.dummy_obs = torch.full((self.cbf_graph_points, 3), 100.0, device=self.device)
         self.zero_dq = torch.zeros((1, 7), device=self.device)
 
@@ -1190,6 +1211,21 @@ class CBFSafetyNode:
         self._dq_real_np = np.zeros(7, dtype=np.float32)
         self._joint_staging = None
         self._joint_uploaded_stamp = None
+        # Stale-data watchdog: a barrier evaluated on frozen inputs certifies
+        # nothing. Timeouts are generous multiples of the nominal rates
+        # (joints ~1 kHz, obstacle cloud ~30 Hz); on staleness the loop
+        # commands a zero-velocity hold instead of solving. `require_obstacles`
+        # also gates /cbf_safety/ready on the first cloud; set it false for
+        # obstacle-free ablations.
+        self.watchdog_enabled = _bool_param("~watchdog_enabled", True)
+        self.watchdog_joint_timeout = float(
+            rospy.get_param("~watchdog_joint_timeout", 0.3))
+        self.watchdog_obstacle_timeout = float(
+            rospy.get_param("~watchdog_obstacle_timeout", 1.0))
+        self.watchdog_require_obstacles = _bool_param(
+            "~watchdog_require_obstacles", True)
+        self.obs_stamp = None
+        self._ready_announced = False
         self._joint_uploaded_np = None  # CPU copy of the q the solve used (reflex export)
         self._nominal_q_staging = None
         self._nominal_q_uploaded = None
@@ -1254,6 +1290,23 @@ class CBFSafetyNode:
                 '/cbf_safety/reflex_state', Float32MultiArray, queue_size=1)
         self.contact_event_pub = rospy.Publisher(
             '/cbf_safety/contact_event', Float32MultiArray, queue_size=1, latch=True)
+        # ISSf assumption monitor: publishes per cycle the realized
+        # disturbance of the kinematic plant (q_dot = u + d) projected on the
+        # active barrier gradients -- the direction cbf_issf_epsilon actually
+        # bounds. [t, eps_proj, ||d||, exceeded, running max]. The reflex
+        # consumes `exceeded` as a monitored-assumption veto; the bags feed
+        # the ch. 5 epsilon-validation panel. Piggybacks on the reflex-state
+        # snapshot, so it requires cbf_reflex_publish.
+        self.issf_monitor_enabled = _bool_param("~issf_monitor_enabled", True)
+        self.issf_monitor_pub = None
+        if self.issf_monitor_enabled and self.cbf_reflex_publish:
+            self.issf_monitor_pub = rospy.Publisher(
+                '/cbf_safety/issf_monitor', Float32MultiArray, queue_size=1)
+            rospy.Subscriber('/cbf_reflex/status', Float32MultiArray,
+                             self._reflex_status_cb, queue_size=1)
+        self._issf_prev_cmd_np = None
+        self._issf_monitor_max = 0.0
+        self._reflex_alpha_seen = 1.0
         self.diag_pub = rospy.Publisher('/cbf_safety/diagnostics', Float32MultiArray, queue_size=10)
         # Estimated environment closing speed (max per-link dynamic-hdot
         # tightening, m/s; 0 in static scenes by deadband design). Consumed by
@@ -1362,7 +1415,9 @@ class CBFSafetyNode:
             self.cbf_passthrough_when_inactive,
             self.publish_yellow_points,
             self.publish_debug_topics, self.profile_sync)
-        self.ready_pub.publish(Bool(data=True))
+        # /cbf_safety/ready is announced from the control loop once verified
+        # joint states (and, unless waived, a first obstacle cloud) have been
+        # received -- not here at the end of initialization.
 
     def _log_cuda_memory(self, label):
         if self.device.type != 'cuda' or not torch.cuda.is_available():
@@ -2657,8 +2712,24 @@ class CBFSafetyNode:
             self._joint_limit_clamp_(self.dq_safe_work)
             final_constr = self._constraint_residual(
                 h_final, grad_h, self.dq_safe_work)
-            self.static_constr.copy_(torch.where(
-                final_active, final_constr, torch.ones_like(final_constr)))
+            if self._repair_all_rows_active:
+                # Worst residual over EVERY exported solve row, evaluated on
+                # the FINAL command (post filter, saturation, repair and
+                # joint-limit clamp). The critical row alone under-reports
+                # multi-contact violations; this makes static_constr (and the
+                # bagged constr diagnostic) the honest certificate residual,
+                # matching what the eager path already reports. Rows outside
+                # the activation band or with degenerate gradients are
+                # certified-inactive (+1).
+                dq_fin = self.dq_safe_work.view(-1)
+                all_res = rg @ dq_fin - r_bound
+                row_live = (rh <= self.cbf_h_activate) & (r_gnorm > 1e-6)
+                worst_all = torch.where(
+                    row_live, all_res, torch.ones_like(all_res)).min()
+                self.static_constr.copy_(worst_all.view(1))
+            else:
+                self.static_constr.copy_(torch.where(
+                    final_active, final_constr, torch.ones_like(final_constr)))
             self.transfer_buffer[60].copy_(needs_repair.float().view(-1)[0])
             self.transfer_buffer[61].copy_(final_constr.view(-1)[0])
             # Integrated-velocity position command + passthrough.
@@ -2922,6 +2993,14 @@ class CBFSafetyNode:
         # loop uploads the latest staged sample once per cycle instead.
         try:
             pos_dict = {n: p for n, p in zip(msg.name, msg.position)}
+            # Fingers first: a gripper-only message must still update them
+            # even though it lacks the arm joints and returns below.
+            if len(self.finger_joint_names) == 2:
+                f1 = pos_dict.get(self.finger_joint_names[0])
+                f2 = pos_dict.get(self.finger_joint_names[1])
+                if f1 is not None and f2 is not None:
+                    self._finger_staging = np.asarray(
+                        [f1, f2], dtype=np.float32)
             q_list = []
             for jn in self.joint_names:
                 if jn in pos_dict:
@@ -3594,11 +3673,19 @@ class CBFSafetyNode:
         self._nominal_dq_staging = np.asarray(msg.data[:7], dtype=np.float32)
         self.nominal_dq_stamp = rospy.get_time()
 
+    def _reflex_status_cb(self, msg):
+        # Latest reflex brake scale: its braking is a certified modification
+        # of the command, not plant disturbance, so the ISSf monitor compares
+        # the measured velocity against alpha * u, not u.
+        if len(msg.data) >= 1:
+            self._reflex_alpha_seen = float(msg.data[0])
+
     def obs_callback(self, msg):
         try:
             points = np.frombuffer(msg.data, dtype=np.float32).reshape(-1, int(msg.point_step/4))
             self.obs_points = torch.from_numpy(points[:, :3].copy()).to(
                 self.device, dtype=torch.float32)
+            self.obs_stamp = rospy.get_time()
         except Exception as e:
             rospy.logerr_throttle(5.0, f"Error unpacking obstacles in CBF: {e}")
 
@@ -4913,6 +5000,13 @@ class CBFSafetyNode:
                     self.device).unsqueeze(0)
                 self._joint_uploaded_stamp = stamp
                 self._joint_uploaded_np = q_np
+            fingers_np = self._finger_staging
+            if fingers_np is not None and fingers_np is not self._finger_uploaded:
+                # In-place copy: the evaluators (and the captured CUDA graph)
+                # hold views of q_pad2, so the new tail is visible everywhere.
+                self.q_pad2.copy_(
+                    torch.from_numpy(fingers_np).view(1, 2))
+                self._finger_uploaded = fingers_np
             nom_np = self._nominal_q_staging
             if nom_np is not None and nom_np is not self._nominal_q_uploaded:
                 self.nominal_q = torch.from_numpy(nom_np).to(
@@ -4923,6 +5017,37 @@ class CBFSafetyNode:
                 self.nominal_dq_ff = torch.from_numpy(ndq_np).to(
                     self.device).unsqueeze(0)
                 self._nominal_dq_uploaded = ndq_np
+
+            # Announce readiness only once verified safety inputs have been
+            # received (joints always; a first obstacle cloud unless waived).
+            if not self._ready_announced:
+                if self._joint_uploaded_stamp is not None and (
+                        self.obs_stamp is not None
+                        or not self.watchdog_require_obstacles):
+                    self.ready_pub.publish(Bool(data=True))
+                    self._ready_announced = True
+
+            # Stale-data watchdog: with a dead publisher upstream the barrier
+            # would keep certifying against a frozen world. Command a zero-
+            # velocity hold instead of solving; the low-level controller's own
+            # command timeout is the hard backstop if this node dies too.
+            if self.watchdog_enabled:
+                stale = None
+                if (self._joint_uploaded_stamp is not None
+                        and current_time - self._joint_uploaded_stamp
+                        > self.watchdog_joint_timeout):
+                    stale = 'joint states'
+                elif (self.obs_stamp is not None
+                        and current_time - self.obs_stamp
+                        > self.watchdog_obstacle_timeout):
+                    stale = 'obstacle cloud'
+                if stale is not None:
+                    rospy.logwarn_throttle(
+                        1.0, "CBF watchdog: %s stale -- commanding safe hold."
+                        % stale)
+                    self._stop_velocity_controller()
+                    self.rate.sleep()
+                    continue
 
             if self.current_q is not None and self.nominal_q is not None:
                 self._adopt_preprocess_results()
@@ -5492,10 +5617,22 @@ class CBFSafetyNode:
                 if self.enable_cbf and self.log_cbf_events:
                     if h_val < 0:
                         rospy.logwarn_throttle(0.5, f"💥 CBF COLLISION: Margin breached! (h = {h_val:.4f} < 0)")
+                    elif constr_val < -1e-3:
+                        # With cbf_repair_all_rows, constr_val is the worst
+                        # residual across ALL active rows on the final
+                        # published command: negative here means at least one
+                        # row left violated after repair and clamping.
+                        rospy.logwarn_throttle(
+                            0.5, f"🛡️ CBF RESIDUAL: worst final row residual "
+                            f"{constr_val:.4f} < 0 (h = {h_val:.4f})")
                     elif constr_val < 0:
                         rospy.loginfo_throttle(0.5, f"🛡️ CBF REACTIVE: Correcting trajectory (h = {h_val:.4f})")
 
                 self.cmd_pub.publish(Float32MultiArray(data=dq_pub_cpu))
+                # ZOH command of this cycle, for the next cycle's ISSf
+                # disturbance monitor.
+                self._issf_prev_cmd_np = np.asarray(
+                    dq_pub_cpu[:7], dtype=np.float64)
                 if self.velocity_cmd_pub is not None:
                     # dq_safe is the actuator command in velocity mode.  Publish
                     # it before diagnostics so telemetry cannot delay control.
@@ -5530,6 +5667,45 @@ class CBFSafetyNode:
                         + self._joint_uploaded_np.tolist()
                         + reflex_cpu.tolist()
                         + [float(self._selection_generation)]))
+
+                    # ISSf assumption monitor (see __init__): realized
+                    # disturbance projected on the active barrier gradients,
+                    # reusing the reflex snapshot already on the CPU.
+                    if (self.issf_monitor_pub is not None
+                            and self._issf_prev_cmd_np is not None):
+                        u_eff = (self._issf_prev_cmd_np
+                                 * self._reflex_alpha_seen)
+                        d_vec = self._dq_real_np.astype(np.float64) - u_eff
+                        h_rows = reflex_cpu[0:nr]
+                        g_rows = reflex_cpu[2 * nr:].reshape(nr, 7)
+                        g_norm = np.linalg.norm(g_rows, axis=1)
+                        act = (h_rows < self.cbf_h_activate) & (g_norm > 1e-6)
+                        eps_proj = float(np.max(
+                            -(g_rows[act] @ d_vec) / g_norm[act])) \
+                            if np.any(act) else 0.0
+                        eps_norm = float(np.linalg.norm(d_vec))
+                        # Exceedance only when the command actually executes
+                        # (reflex not braking): during a brake, servo lag
+                        # guarantees measured != alpha*u and the veto would
+                        # re-trigger itself. The reflex's own certificate
+                        # covers braked ticks. Statistics keep flowing either
+                        # way for the ch. 5 panel.
+                        exceeded = float(
+                            self.cbf_issf_epsilon > 0.0
+                            and self._reflex_alpha_seen > 0.9
+                            and eps_proj > self.cbf_issf_epsilon)
+                        if eps_proj > self._issf_monitor_max:
+                            self._issf_monitor_max = eps_proj
+                        self.issf_monitor_pub.publish(Float32MultiArray(
+                            data=[current_time, eps_proj, eps_norm,
+                                  exceeded, self._issf_monitor_max]))
+                        if exceeded:
+                            rospy.logwarn_throttle(
+                                1.0,
+                                "ISSf monitor: realized disturbance %.3f "
+                                "rad/s exceeds epsilon %.3f on an active "
+                                "row -- reflex will veto.",
+                                eps_proj, self.cbf_issf_epsilon)
                 t_pub_done = time.perf_counter()
                 self.timing.publish('cbf_correction', (t_cbf_done - t_start) * 1000.0)
                 self.timing.publish('cbf_command', (t_q_cmd_done - t_cbf_done) * 1000.0)
