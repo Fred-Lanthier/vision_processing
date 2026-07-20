@@ -47,6 +47,13 @@ find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 
 ## 1. Services et Messages
+add_message_files(
+  FILES
+  RobotObservation.msg
+  CertifiedCbfCommand.msg
+  IssfEpsilonSample.msg
+)
+
 add_service_files(
   FILES
   ProcessImage.srv
@@ -60,11 +67,13 @@ catkin_python_setup()
 ## 3. Génération des messages
 generate_messages(
   DEPENDENCIES
+  geometry_msgs
   sensor_msgs
   std_msgs
 )
 
 catkin_package(
+  INCLUDE_DIRS include
   LIBRARIES vision_processing_controllers
   CATKIN_DEPENDS 
     rospy 
@@ -92,6 +101,7 @@ catkin_package(
 
 ## Inclusions
 include_directories(
+  include
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${PINOCCHIO_INCLUDE_DIRS}
@@ -106,9 +116,13 @@ add_definitions(${PCL_DEFINITIONS})
 ## Direct joint-velocity controller used by the CBF shield.
 add_library(vision_processing_controllers
   src/vision_processing/joint_group_velocity_controller.cpp
+  src/vision_processing/certified_cbf_velocity_controller.cpp
 )
 target_link_libraries(vision_processing_controllers ${catkin_LIBRARIES})
-add_dependencies(vision_processing_controllers ${catkin_EXPORTED_TARGETS})
+add_dependencies(vision_processing_controllers
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+)
 
 ## 4. Module Pybind11 (Fast IK)
 pybind11_add_module(fast_ik_module src/vision_processing/fast_ik.cpp)
@@ -165,6 +179,7 @@ catkin_install_python(PROGRAMS
   scripts/face_detection_mock.py
   scripts/fake_finger_publisher.py
   scripts/unpause_after_controller_hold.py
+  scripts/calibrate_issf_epsilon.py
   scripts/fork_grasp_node.py
   scripts/sam3_server.py
   test_novelty/cbf_safety_node_Bernstein.py
@@ -187,6 +202,10 @@ install(FILES vision_processing_controllers.xml
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
+)
+
 install(TARGETS fast_ik_module
   LIBRARY DESTINATION ${CATKIN_PACKAGE_PYTHON_DESTINATION}
 )
@@ -194,3 +213,12 @@ install(TARGETS fast_ik_module
 install(TARGETS fast_perception_module
   LIBRARY DESTINATION ${CATKIN_PACKAGE_PYTHON_DESTINATION}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(test_certified_cbf_math
+    tests/test_certified_cbf_math.cpp
+  )
+  if(TARGET test_certified_cbf_math)
+    target_include_directories(test_certified_cbf_math PRIVATE include)
+  endif()
+endif()

@@ -17,6 +17,7 @@ from sensor_msgs.msg import JointState, PointCloud2, PointField
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker, MarkerArray
+from vision_processing.msg import CertifiedCbfCommand
 import sensor_msgs.point_cloud2 as pc2
 
 try:
@@ -638,9 +639,11 @@ class CBFSafetyNode:
             "~cbf_direct_feedback_when_reactive", True)
         self.cbf_tracking_feedback_mode = str(rospy.get_param(
             "~cbf_tracking_feedback_mode", "tangent_near")).lower()
-        if self.cbf_tracking_feedback_mode not in ("full", "none", "tangent", "tangent_near"):
+        if self.cbf_tracking_feedback_mode not in (
+                "full", "none", "tangent", "tangent_near", "projection_aware"):
             raise ValueError(
-                "~cbf_tracking_feedback_mode must be 'full', 'none', 'tangent', or 'tangent_near'")
+                "~cbf_tracking_feedback_mode must be 'full', 'none', "
+                "'tangent', 'tangent_near', or 'projection_aware'")
         self.cbf_tangent_feedback_min_speed = float(rospy.get_param(
             "~cbf_tangent_feedback_min_speed", 0.02))
         self.cbf_position_correction_dt = float(rospy.get_param(
@@ -808,6 +811,29 @@ class CBFSafetyNode:
         # Output low-pass on the safe velocity (0 = off). Applied before the
         # final-constraint repair so the smoothed command is re-validated.
         self.cbf_velocity_filter_tau = float(rospy.get_param("~cbf_velocity_filter_tau", 0.0))
+        # Where the output-smoothing memory acts (uses cbf_velocity_filter_tau
+        # as its time constant; inert when tau = 0).
+        #   "output_filter"  = legacy: the solved command is low-passed AFTER
+        #     the projection, which pulls it off the certified half-spaces and
+        #     relies on the final repair to re-project it (documented failure
+        #     mode: the low-pass can eat the retreat without triggering repair).
+        #   "in_projection"  = the SAME exponential memory moved into the
+        #     projection objective: the solver input becomes the blend
+        #     (1-gamma)*previous final command + gamma*nominal. Its
+        #     W-projection is the exact minimizer of
+        #       gamma*||dq-dq_nom||^2_W + (1-gamma)*||dq-dq_prev||^2_W  s.t. rows,
+        #     so smoothing becomes part of the certified solution: identical
+        #     output whenever no constraint is active, and on active rows the
+        #     command stays feasible by construction (no filter-then-repair
+        #     seam, and a recovery bound can no longer be diluted).
+        self.cbf_smoothing_mode = str(rospy.get_param(
+            "~cbf_smoothing_mode", "output_filter")).strip().lower()
+        if self.cbf_smoothing_mode not in ("output_filter", "in_projection"):
+            rospy.logwarn(
+                "~cbf_smoothing_mode must be 'output_filter' or "
+                "'in_projection'; falling back to output_filter (got %r)",
+                self.cbf_smoothing_mode)
+            self.cbf_smoothing_mode = "output_filter"
         self._dq_safe_filtered = None
         self.real_velocity_filter_tau = float(rospy.get_param("~real_velocity_filter_tau", 0.08))
         self.last_nominal_q = None
@@ -1209,6 +1235,7 @@ class CBFSafetyNode:
         self._joint_prev_np = None
         self._joint_prev_stamp = None
         self._dq_real_np = np.zeros(7, dtype=np.float32)
+        self._dq_real_inst_norm = 0.0
         self._joint_staging = None
         self._joint_uploaded_stamp = None
         # Stale-data watchdog: a barrier evaluated on frozen inputs certifies
@@ -1284,6 +1311,18 @@ class CBFSafetyNode:
         # where q0 is the measured q the solve used, so the consumer can
         # extrapolate h(t) ~= h + grad_h^T (q - q0) between QP solves.
         self.cbf_reflex_publish = _bool_param("~cbf_reflex_publish", False)
+        # C++ real-time controller path.  Unlike the legacy pair of
+        # Float64MultiArray + reflex_state topics, this publishes the velocity
+        # and its certificate atomically so a callback can never combine two
+        # different solves.
+        self.certified_command_publish = _bool_param(
+            "~certified_command_publish", False)
+        self.certified_command_pub = None
+        self._certified_command_sequence = 0
+        if self.certified_command_publish:
+            self.certified_command_pub = rospy.Publisher(
+                '/cbf_safety/certified_command', CertifiedCbfCommand,
+                queue_size=1)
         self.reflex_state_pub = None
         if self.cbf_reflex_publish:
             self.reflex_state_pub = rospy.Publisher(
@@ -1299,7 +1338,8 @@ class CBFSafetyNode:
         # snapshot, so it requires cbf_reflex_publish.
         self.issf_monitor_enabled = _bool_param("~issf_monitor_enabled", True)
         self.issf_monitor_pub = None
-        if self.issf_monitor_enabled and self.cbf_reflex_publish:
+        if self.issf_monitor_enabled and (
+                self.cbf_reflex_publish or self.certified_command_publish):
             self.issf_monitor_pub = rospy.Publisher(
                 '/cbf_safety/issf_monitor', Float32MultiArray, queue_size=1)
             rospy.Subscriber('/cbf_reflex/status', Float32MultiArray,
@@ -1739,19 +1779,17 @@ class CBFSafetyNode:
                         sdf_grid, level=level, spacing=spacing)
                     vertices += lower.detach().cpu().numpy()
 
-                    visual_info = self._find_visual_info(link_name)
-                    if visual_info is None:
-                        rospy.logwarn(
-                            "Safety envelope skipped for %s: visual transform not found",
-                            link_name)
-                        continue
-
-                    visual_transform = visual_info['visual_offset'].detach().cpu().numpy()
-                    vertices_h = np.concatenate([
-                        vertices,
-                        np.ones((vertices.shape[0], 1), dtype=vertices.dtype),
-                    ], axis=1)
-                    vertices_link = (vertices_h @ visual_transform.T)[:, :3]
+                    # The isosurface vertices are already in the link/JOINT
+                    # frame: the Bernstein SDF is trained per link in that frame
+                    # (panda_rightfinger.stl bakes in the URDF visual rpy=pi, so
+                    # the pre-flipped geometry lives in the joint frame), and the
+                    # barrier evaluates it at _native_forward_kinematics poses,
+                    # which carry NO visual offset. The marker frame_id is the
+                    # same joint frame tf publishes. Applying visual_offset here
+                    # therefore double-rotated the right finger by 180deg (its
+                    # offset is rpy=pi; the left finger's is identity, so only the
+                    # right one showed the flip). Place the vertices directly.
+                    vertices_link = vertices
 
                     marker = Marker()
                     marker.header.frame_id = link_name
@@ -2436,7 +2474,10 @@ class CBFSafetyNode:
         self._last_q_safe_seeded = False
 
         mjv = self.max_joint_velocity
-        vel_gamma_on = self.cbf_velocity_filter_tau > 0.0
+        smooth_in_proj = (self.cbf_smoothing_mode == "in_projection"
+                          and self.cbf_velocity_filter_tau > 0.0)
+        vel_gamma_on = (self.cbf_velocity_filter_tau > 0.0
+                        and not smooth_in_proj)
 
         def _control_extra():
             """Escape + null-space clearance from the PREVIOUS cycle's
@@ -2554,7 +2595,16 @@ class CBFSafetyNode:
                         self.cbf_issf_epsilon
                         + self.cbf_issf_rho * v_issf)
             # Solve (writes static_h / static_grad_h / static_constr fresh).
-            dq = _solve(dq_nom_cbf)
+            if smooth_in_proj:
+                # dq_safe_work still holds the PREVIOUS cycle's final
+                # published command here: blending it into the solve input
+                # realizes the output smoothing INSIDE the projection
+                # (~cbf_smoothing_mode "in_projection"). sc[1] = gamma_v.
+                dq_solve_in = dq_nom_cbf + (1.0 - sc[1]) * (
+                    self.dq_safe_work - dq_nom_cbf)
+            else:
+                dq_solve_in = dq_nom_cbf
+            dq = _solve(dq_solve_in)
             self.static_dq_safe.copy_(dq)
             self.dq_safe_work.copy_(dq)
             # Dynamic-hdot estimator (identical math to _update_dynamic_hdot,
@@ -3017,6 +3067,17 @@ class CBFSafetyNode:
                     self._dq_real_np = (
                         (1.0 - gamma) * self._dq_real_np + gamma * dq_real_raw
                     ).astype(np.float32)
+                    # Instantaneous FD norm alongside the EMA: the EMA'd
+                    # estimate massively under-reports during fast transients
+                    # (runPP1023 v5 weld yank: 0.002 read vs ~0.1 rad/s true)
+                    # and the executed-speed margin linearization consumed it
+                    # directly. The margin path takes max(EMA, instantaneous),
+                    # capped so a stamp glitch cannot explode the charge;
+                    # duplicated /joint_states samples FD to 0 and fall back
+                    # to the EMA through the max.
+                    self._dq_real_inst_norm = min(
+                        float(np.linalg.norm(dq_real_raw)),
+                        self.max_joint_velocity * 2.6458)  # sqrt(7)
             self._joint_prev_np = q_np
             self._joint_prev_stamp = stamp
             # Single-ref swap = atomic under the GIL.
@@ -3091,6 +3152,34 @@ class CBFSafetyNode:
             return dq_fb
         if mode == "none":
             return torch.zeros_like(dq_fb)
+        if mode == "projection_aware":
+            # DIAGNOSTIC KNOB, NOT the default — do not enable in production.
+            # Idea: remove only the component of the feedback along -grad_h
+            # (which the projection would annul anyway), ramped by the QP's
+            # activation band, keeping cross-track/outward feedback; acts in
+            # the objective only, so it is safety-neutral PER CYCLE. In closed
+            # loop it is not: a controlled same-seed A/B (2026-07-20,
+            # scratchpad/controlled_ab) showed the retained cross-track
+            # feedback compounds with the CBF correction into a runaway climb
+            # (hand +46 cm vs +5 cm for tangent_near) that pins the arm against
+            # an overhead obstacle WITH a barrier violation (min_h -0.10 mm).
+            # tangent_near's forward-only collapse near the boundary is a real
+            # stabilizer, not a removable patch. Kept only for A/B study.
+            # Gradient is the previous cycle's critical row (one-cycle-stale,
+            # like the escape/clearance compose); zero-gradient leaves fb.
+            h_prev = self.last_h_value_for_feedback
+            h_act = max(self.cbf_h_activate, 1e-6)
+            ramp = (h_act - h_prev) / h_act
+            if not (ramp > 0.0):  # also False on nan/inf h_prev
+                return dq_fb
+            ramp = min(ramp, 1.0)
+            g = self.static_grad_h
+            g_norm_sq = (g * g).sum(dim=1, keepdim=True)
+            g_ok = (g_norm_sq > 1e-12).to(dq_fb.dtype)
+            inward = torch.clamp(
+                (dq_fb * g).sum(dim=1, keepdim=True), max=0.0
+            ) / (g_norm_sq + 1e-12)
+            return dq_fb - ramp * g_ok * inward * g
         if mode == "tangent_near" and self.last_h_value_for_feedback > self.cbf_h_activate:
             return dq_fb
 
@@ -5205,9 +5294,14 @@ class CBFSafetyNode:
                                  if self.cbf_escape_use_bias_corrected_h
                                  else 0.0)
                         # Measured joint speed for the executed-velocity
-                        # margin linearization (EMA'd FD from joint_callback;
-                        # atomic numpy ref grab, callback rebinds).
-                        sn[5] = float(np.linalg.norm(self._dq_real_np))
+                        # margin linearization: max of the EMA'd FD and the
+                        # instantaneous FD norm (the EMA alone lagged fast
+                        # transients ~50x, runPP1023 v5). Strictly
+                        # conservative: a larger executed speed only raises
+                        # the margin, still capped by the command-based arm
+                        # of the min() in the graph.
+                        sn[5] = max(float(np.linalg.norm(self._dq_real_np)),
+                                    self._dq_real_inst_norm)
                         self.static_scalars.copy_(self._scalar_pin,
                                                   non_blocking=True)
                         self.graph.replay()
@@ -5240,8 +5334,17 @@ class CBFSafetyNode:
                                 min=-self.max_joint_velocity,
                                 max=self.max_joint_velocity)
                         local_obs = self._adopted_obs  # event-complete selection
+                        solver_input = dq_nom_cbf
+                        if (self.cbf_smoothing_mode == "in_projection"
+                                and self.cbf_velocity_filter_tau > 0.0):
+                            # dq_safe_work still holds the previous cycle's
+                            # final command: same in-projection smoothing as
+                            # the graphed path (~cbf_smoothing_mode).
+                            gamma_v = dt / (dt + self.cbf_velocity_filter_tau)
+                            solver_input = dq_nom_cbf + (1.0 - gamma_v) * (
+                                self.dq_safe_work - dq_nom_cbf)
                         self.dq_safe_work.copy_(self._run_velocity_cbf_solver(
-                            current_q, local_obs, dq_nom_cbf))
+                            current_q, local_obs, solver_input))
                         self._joint_limit_clamp_(self.dq_safe_work)
                         self._queue_escape_state(dq_nom_cbf,
                                                  dq_nom_raw=dq_nom_base)
@@ -5278,13 +5381,26 @@ class CBFSafetyNode:
                     if self._graph_control_step:
                         # Clamp, output filter, repair, integration, command
                         # buffer: all already applied inside the graph.
-                        velocity_filter_active = self.cbf_velocity_filter_tau > 0.0
+                        velocity_filter_active = (
+                            self.cbf_velocity_filter_tau > 0.0
+                            and self.cbf_smoothing_mode == "output_filter")
                     else:
                         self.dq_safe_work.clamp_(min=-self.max_joint_velocity,
                                                  max=self.max_joint_velocity)
 
                         velocity_filter_active = False
-                        if self.cbf_velocity_filter_tau > 0.0:
+                        # In-projection smoothing already blended the memory
+                        # into the solve input; the post-solve low-pass would
+                        # double-smooth and re-open the filter-then-repair
+                        # seam. The legacy EMA is kept on the paths that have
+                        # no projection to carry the memory (CBF disabled,
+                        # monitor-only publishing the nominal).
+                        apply_output_filter = (
+                            self.cbf_velocity_filter_tau > 0.0
+                            and (self.cbf_smoothing_mode == "output_filter"
+                                 or not self.enable_cbf
+                                 or self.cbf_monitor_only))
+                        if apply_output_filter:
                             if self._dq_safe_filtered is None:
                                 self._dq_safe_filtered = self.dq_safe_work.detach().clone()
                             else:
@@ -5642,7 +5758,9 @@ class CBFSafetyNode:
                 pos_msg = Float64MultiArray(data=q_safe_work_cpu)
                 self.safe_cmd_pub.publish(pos_msg)
 
-                if (self.reflex_state_pub is not None and self.enable_cbf
+                if ((self.reflex_state_pub is not None
+                     or self.certified_command_pub is not None)
+                        and self.enable_cbf
                         and self._joint_uploaded_np is not None):
                     # Per-link (h, env_hdot, grad_h) snapshot for the 1 kHz
                     # reflex brake. The command readback above already drained
@@ -5662,11 +5780,37 @@ class CBFSafetyNode:
                     # without a lock: a swap racing this read misattributes
                     # at most one monitor pair, which the gate then skips or
                     # keeps as the legacy behavior did.
-                    self.reflex_state_pub.publish(Float32MultiArray(
-                        data=[current_time, float(nr)]
-                        + self._joint_uploaded_np.tolist()
-                        + reflex_cpu.tolist()
-                        + [float(self._selection_generation)]))
+                    if self.reflex_state_pub is not None:
+                        self.reflex_state_pub.publish(Float32MultiArray(
+                            data=[current_time, float(nr)]
+                            + self._joint_uploaded_np.tolist()
+                            + reflex_cpu.tolist()
+                            + [float(self._selection_generation)]))
+
+                    if self.certified_command_pub is not None:
+                        packet = CertifiedCbfCommand()
+                        packet.header = Header(
+                            seq=self._certified_command_sequence,
+                            stamp=rospy.Time.from_sec(current_time))
+                        self._certified_command_sequence = (
+                            self._certified_command_sequence + 1) & 0xffffffff
+                        packet.selection_generation = max(
+                            0, int(self._selection_generation))
+                        packet.row_count = nr
+                        packet.solve_joint_position = (
+                            self._joint_uploaded_np.astype(
+                                np.float64, copy=False).tolist())
+                        packet.safe_joint_velocity = list(dq_pub_cpu[:7])
+                        packet.barrier_value = (
+                            reflex_cpu[:nr].astype(
+                                np.float64, copy=False).tolist())
+                        packet.environment_hdot = (
+                            reflex_cpu[nr:2 * nr].astype(
+                                np.float64, copy=False).tolist())
+                        packet.barrier_gradient = (
+                            reflex_cpu[2 * nr:].astype(
+                                np.float64, copy=False).tolist())
+                        self.certified_command_pub.publish(packet)
 
                     # ISSf assumption monitor (see __init__): realized
                     # disturbance projected on the active barrier gradients,

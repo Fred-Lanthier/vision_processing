@@ -1,0 +1,62 @@
+{
+  "assumption": "The N seeded trajectories and the future trajectory are exchangeable; controller ticks within a trajectory are not treated as independent.",
+  "braking_execution": {
+    "epsilon": 0.3252932395839031,
+    "finite_target_bound_available": true,
+    "minimum_runs_for_target": 1,
+    "rank_coverage": 0.5,
+    "requested_order": 1,
+    "sample_count": 1,
+    "selected_order": 1,
+    "target_coverage": 0.5
+  },
+  "completed_utc": "2026-07-20T02:55:29.513469+00:00",
+  "global_execution": {
+    "epsilon": 0.3252932395839031,
+    "finite_target_bound_available": true,
+    "minimum_runs_for_target": 1,
+    "rank_coverage": 0.5,
+    "requested_order": 1,
+    "sample_count": 1,
+    "selected_order": 1,
+    "target_coverage": 0.5
+  },
+  "method": "trajectory-maximum conformal order statistic",
+  "normal_execution": {
+    "epsilon": 0.03586020362882301,
+    "finite_target_bound_available": true,
+    "minimum_runs_for_target": 1,
+    "rank_coverage": 0.5,
+    "requested_order": 1,
+    "sample_count": 1,
+    "selected_order": 1,
+    "target_coverage": 0.5
+  },
+  "observed_global_max": 0.3252932395839031,
+  "recommended_cbf_issf_epsilon": 0.3252932395839031,
+  "run_count": 1,
+  "runs": [
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_smoke_v2/run_001_seed_2000/epsilon.bag",
+      "braking_max": 0.3252932395839031,
+      "braking_windows": 1826,
+      "capture_wall_seconds": 45.0,
+      "complete": false,
+      "epsilon_windows": 3238,
+      "global_max": 0.3252932395839031,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED"
+      ],
+      "normal_max": 0.03586020362882301,
+      "normal_windows": 1471,
+      "run": 1,
+      "seed": 2000
+    }
+  ],
+  "task_completed_runs": 0,
+  "task_completion_rate": 0.0,
+  "velocity_measurement": "ros_control JointHandle.getVelocity at tick k minus the applied command saved at tick k-1",
+  "warnings": []
+}

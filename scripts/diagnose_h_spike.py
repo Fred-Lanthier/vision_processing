@@ -4,9 +4,8 @@
 For every diagnostics sample whose barrier value dips below --h-threshold, this
 recomputes the TRUE mesh-to-cloud clearance (real_distance) with details on and
 prints which protected link owns the closest robot surface point, where that
-point is, and which obstacle point it matched to. Use it to tell a real wall
-approach (link is an arm link / obs_pt on the obstacle) apart from a self or
-swept-point artifact (link == 'fork_tip' and obs_pt sitting on the fork body).
+point is, and which obstacle point it matched to. Pick-and-place is the default:
+the offline FK uses the measured arm and finger joints and the no-fork URDF.
 
 Usage:
     python3 scripts/diagnose_h_spike.py run22.bag [--h-threshold -0.002]
@@ -31,6 +30,9 @@ def main():
     ap.add_argument("--d-safe", type=float, default=0.015)
     ap.add_argument("--samples", type=int, default=800,
                     help="surface samples per protected link")
+    ap.add_argument("--real-robot", choices=("pickplace", "feeding"),
+                    default="pickplace",
+                    help="offline robot geometry (default: pickplace)")
     args = ap.parse_args()
 
     t, s, t0 = P.load_bag(args.bag)
@@ -41,10 +43,17 @@ def main():
     t_q, q, obs_t, obs = P.load_motion(args.bag, t0)
     if len(t_q) < 2 or len(obs_t) == 0:
         sys.exit("joint_states / persistent_obstacles missing from bag.")
-    q_at_t = np.stack([np.interp(t, t_q, q[:, j]) for j in range(7)], axis=1)
+    if q.ndim != 2 or q.shape[1] != len(P.PANDA_KINEMATIC_JOINTS):
+        sys.exit(
+            "Both measured Panda finger joints are required; refusing to "
+            f"assume a closed gripper for q shape {q.shape}.")
+    q_at_t = np.stack([
+        np.interp(t, t_q, q[:, j]) for j in range(q.shape[1])
+    ], axis=1)
     obs_index = np.abs(obs_t[None, :] - t[:, None]).argmin(axis=1)
 
-    rc = rdist.RealClearance(samples_per_link=args.samples)
+    rc = rdist.RealClearance(
+        samples_per_link=args.samples, robot_variant=args.real_robot)
     print(f"[diagnose] protected meshes: {rc.found_links}")
     d_real, det = rc.clearance(q_at_t, obs, obs_index, return_details=True)
     d_real[dummy] = np.nan

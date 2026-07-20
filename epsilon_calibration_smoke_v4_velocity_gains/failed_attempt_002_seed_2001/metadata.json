@@ -1,0 +1,61 @@
+{
+  "accepted": false,
+  "attempt": 2,
+  "bag_summary": {
+    "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_smoke_v4_velocity_gains/attempt_002/epsilon.bag",
+    "braking_max": 0.0,
+    "braking_windows": 0,
+    "complete": false,
+    "epsilon_windows": 3259,
+    "global_max": 0.0,
+    "grasp_states": [
+      "PRE_GRASP"
+    ],
+    "normal_max": 0.0,
+    "normal_windows": 0
+  },
+  "capture_wall_seconds": 45.0,
+  "failure": "bag contains no active epsilon samples",
+  "finished_utc": "2026-07-20T03:27:09.394524+00:00",
+  "launch_command": [
+    "roslaunch",
+    "vision_processing",
+    "green_cube_feeding_casf_pp.launch",
+    "gui:=false",
+    "launch_rviz:=false",
+    "use_cpp_certified_controller:=true",
+    "planner_fm_noise_seed:=2001"
+  ],
+  "max_active_wall_seconds": 45.0,
+  "minimal_bag_topics": [
+    "/cbf_reflex/epsilon_sample",
+    "/pp_grasp/state"
+  ],
+  "released_live": false,
+  "ros_parameters": {
+    "/cbf_safety_Bernstein/cbf_h_activate": 0.04,
+    "/cbf_safety_Bernstein/cbf_issf_epsilon": 0.025,
+    "/cbf_safety_Bernstein/cbf_issf_rho": 0.0,
+    "/cbf_safety_Bernstein/cbf_link_names": [
+      "panda_link2",
+      "panda_link3",
+      "panda_link4",
+      "panda_link5",
+      "panda_link6",
+      "panda_link7",
+      "panda_hand",
+      "panda_rightfinger",
+      "panda_leftfinger"
+    ],
+    "/certified_cbf_velocity_controller/epsilon_motion_threshold": 0.0001,
+    "/certified_cbf_velocity_controller/epsilon_normal_alpha_threshold": 0.9,
+    "/certified_cbf_velocity_controller/epsilon_sample_divisor": 10,
+    "/certified_cbf_velocity_controller/h_activate": 0.04,
+    "/certified_cbf_velocity_controller/issf_epsilon": 0.025,
+    "/certified_cbf_velocity_controller/issf_rho": 0.0,
+    "/safe_generative_planner/fm_noise_seed": 2001
+  },
+  "seed": 2001,
+  "stop_reason": "wall_time_limit",
+  "trajectory_started_utc": "2026-07-20T03:26:17.923605+00:00"
+}

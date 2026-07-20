@@ -32,6 +32,8 @@
   <arg name="pickplace_model_name" default="best_fm_model_pickplace_10D_1024_rdn.ckpt"/>
   <arg name="condition_num_points" default="1024"/>
   <arg name="planner_rate_hz" default="3"/>
+  <!-- Exposed so epsilon-calibration runs are independent policy samples. -->
+  <arg name="planner_fm_noise_seed" default="7"/>
   <!-- Via-point detour router (A/B toggle). true = insert a deterministic
        routing layer between the FM planner and the executor: when the FM
        trajectory's TCP path is blocked by the obstacle cloud, it enumerates
@@ -179,7 +181,8 @@
   <!-- Cross-cycle Dykstra warm start: carry the dual multipliers per link
        identity across cycles (offline prototype: solver_study.py - the
        ill-conditioned tail converges in ~2-3 cycles instead of plateauing).
-       OFF until validated in sim (A/B on the wall-graze scenario). -->
+       ON in the canonical configuration (deliberate; every runPP102x-series
+       validation ran with it). -->
   <arg name="cbf_dykstra_warmstart" default="true"/>
   <arg name="cbf_final_constraint_mode" default="solver_bound"/>
   <arg name="cbf_multi_gradient_mode" default="analytical"/>
@@ -243,6 +246,11 @@
        identified projection needs no speed term. eps0=rho=0 = off. -->
   <arg name="cbf_issf_epsilon" default="0.025"/>
   <arg name="cbf_issf_rho" default="0.0"/>
+  <!-- Compact controller-rate epsilon identification. Every tick is
+       evaluated; one worst-case summary is published per divisor window. -->
+  <arg name="cbf_epsilon_sample_divisor" default="10"/>
+  <arg name="cbf_epsilon_normal_alpha_threshold" default="0.90"/>
+  <arg name="cbf_epsilon_motion_threshold" default="0.0001"/>
   <!-- Linearization point of the margin/eps speed: "executed" =
        min(command-based v^2, (||dq_measured|| + headroom)^2). Fixes the two
        runPP1023 artifacts: the repair->margin feedback loop (published
@@ -299,11 +307,15 @@
        0.5/0.04 = 12.5 1/s parks the SAME certified margins at ~1-2 mm:
        tightness comes from allowing faster decay near the boundary, not
        from deleting safety. Keep cbf_reflex_exp_kappa >= this slope. -->
-  <arg name="cbf_h_activate" default="0.04"/>
+  <arg name="cbf_h_activate" default="0.08"/>
   <!-- Two-rate reflex brake (see green_cube_feeding_casf.launch): ~1 kHz
        h-extrapolation layer between the 100 Hz CBF-QP and the velocity
        controller. Off by default; inert diff when disabled. -->
   <arg name="enable_cbf_reflex" default="true"/>
+  <!-- Experimental hard-real-time path: keep the GPU SDF/QP in Python, but
+       consume one atomic command+certificate packet inside the 1 kHz C++
+       ros_control update.  false preserves the validated Python reflex. -->
+  <arg name="use_cpp_certified_controller" default="true"/>
   <arg name="cbf_reflex_rate_hz" default="1000.0"/>
   <!-- No horizon arg: the reflex MEASURES its own decision period and
        certifies only that (it re-decides every tick), so the guarantee no
@@ -357,7 +369,7 @@
        (ii) was measurably violated). These are the nfunc12-candidate sups
        matching the active cbf_model_override_dir below. -->
   <!--arg name="cbf_reflex_grad_lipschitz" default="1.0 4.3 4.7 9.6 21.8 32.0 19.7 5 5"/-->
-  <arg name="cbf_reflex_grad_lipschitz" default="10"/>
+  <arg name="cbf_reflex_grad_lipschitz" default="1.0 4.3 4.7 9.6 21.8 32.0 19.7 20 20"/>
   <!-- Retrained n_func=12 finger RDFs (validated 2026-07-14: MAE halved to
        0.61 mm, p95 gradient angle 124->41 deg, negative curvature sup
        840->508 vs production n_func=8). link2/link3 retrained at n_func=12
@@ -382,6 +394,19 @@
   <arg name="cbf_repair_grad_min" default="0.03"/>
   <arg name="cbf_projection_iters" default="3"/>
   <arg name="cbf_projection_relaxation" default="1.0"/>
+  <!-- Feedback shaping near the boundary. tangent_near collapses the tracking
+       feedback to its forward-tangential component once h <= h_act, keeping
+       only advance along the nominal and dropping every lateral/vertical pull.
+       This is NOT a removable patch: it is a stabilizer. The alternative
+       projection_aware (keep everything except the purely-inward component)
+       was tried and REVERTED — a controlled same-seed A/B (2026-07-20,
+       scratchpad/controlled_ab) showed it drives the hand 46 cm up (vs 5 cm)
+       and pins it against the moving sphere WITH a barrier violation
+       (min_h -0.10 mm vs +0.85 mm); the retained cross-track feedback
+       compounds with the CBF correction into a runaway climb. tangent_near
+       stays the default; projection_aware remains only as a diagnostic knob.
+       Isolation: the A/B proved this flag (not cbf_smoothing_mode) owns the
+       climb — smoothing_only stayed at 4.9 cm / +0.85 mm. -->
   <arg name="cbf_tracking_feedback_mode" default="tangent_near"/>
   <!-- QP projection metric ablation. identity = legacy Euclidean min-norm
        (correction lands on the joint with the largest moment arm on the
@@ -526,6 +551,15 @@
   <arg name="cbf_monitor_only" default="false"/>
   <arg name="cbf_filter_tau" default="0.08"/>
   <arg name="cbf_velocity_filter_tau" default="0.1"/>
+  <!-- Output-smoothing seam (uses cbf_velocity_filter_tau as its time
+       constant). output_filter = legacy post-QP low-pass, re-certified by the
+       final repair. in_projection = the same exponential memory moved into
+       the projection objective (solver input = (1-gamma)*previous command +
+       gamma*nominal): identical smoothing when no constraint is active,
+       feasible-by-construction output on active rows (removes the
+       filter-then-repair seam; the repair stays as verification).
+       Offline equivalence + seam proof: tests/test_smoothing_in_projection.py. -->
+  <arg name="cbf_smoothing_mode" default="in_projection"/>
   <arg name="cbf_diagnostics_decimation" default="4"/>
   <arg name="barrier_alpha" default="0.002"/>
   <arg name="d_safe" default="0.015"/>
@@ -541,10 +575,11 @@
   <arg name="trajectory_waypoint_rate_hz" default="10.0"/>
 
   <!-- Temporal ensembler: the FM pick-place policy is MULTIMODAL (offline you see
-       up- and down-branches from the same scene). Re-querying it every cycle lets
-       it flip mode at the grasp/bottom. Ensembling blends each future timestep over
-       the last few plans (weight = exp(-decay * age_s)) so an occasional off-mode
-       sample is outvoted by the consistent one. Set false to A/B the raw policy. -->
+       up- and down-branches from the same scene). Ensembling blends each future
+       timestep over the last few plans so an off-mode sample is outvoted.
+       Canonically OFF here (deliberate): mode commitment is owned by the fixed
+       planner seed + the via-point router, and blending across plans would
+       smear the router's spliced detours. Set true only to A/B the ensembler. -->
   <arg name="use_temporal_ensembler" default="false"/>
   <arg name="ensembler_buffer_size" default="5"/>
   <arg name="ensembler_decay" default="1.5"/>
@@ -561,6 +596,20 @@
     <arg name="gui" value="$(arg gui)"/>
     <arg name="launch_sam3_server" value="$(arg launch_sam3_server)"/>
     <arg name="use_direct_group_velocity_controller" value="true"/>
+    <arg name="use_certified_cbf_controller"
+         value="$(eval arg('use_cpp_certified_controller') and arg('enable_cbf_reflex'))"/>
+    <arg name="certified_max_joint_velocity" value="$(arg max_joint_velocity)"/>
+    <arg name="certified_h_stop" value="$(arg cbf_reflex_h_stop)"/>
+    <arg name="certified_h_activate" value="$(arg cbf_h_activate)"/>
+    <arg name="certified_grad_lipschitz" value="$(arg cbf_reflex_grad_lipschitz)"/>
+    <arg name="certified_exp_kappa" value="$(arg cbf_reflex_exp_kappa)"/>
+    <arg name="certified_recovery_speed" value="$(arg cbf_recovery_speed)"/>
+    <arg name="certified_recovery_depth" value="$(arg cbf_recovery_depth)"/>
+    <arg name="certified_issf_epsilon" value="$(arg cbf_issf_epsilon)"/>
+    <arg name="certified_issf_rho" value="$(arg cbf_issf_rho)"/>
+    <arg name="certified_epsilon_sample_divisor" value="$(arg cbf_epsilon_sample_divisor)"/>
+    <arg name="certified_epsilon_normal_alpha_threshold" value="$(arg cbf_epsilon_normal_alpha_threshold)"/>
+    <arg name="certified_epsilon_motion_threshold" value="$(arg cbf_epsilon_motion_threshold)"/>
     <arg name="obstacle_enabled" value="$(arg obstacle_enabled)"/>
     <arg name="obstacle_shape" value="$(arg obstacle_shape)"/>
     <arg name="obstacle_x" value="$(arg obstacle_x)"/>
@@ -706,6 +755,7 @@
              CBF escape lift (cbf_escape_lift_gain) instead. -->
         <param name="enable_casf_correction" value="$(arg enable_casf_correction)"/>
         <param name="planner_rate_hz" value="$(arg planner_rate_hz)"/>
+        <param name="fm_noise_seed" value="$(arg planner_fm_noise_seed)"/>
         <param name="trajectory_retime_mode" value="$(arg trajectory_retime_mode)"/>
         <param name="trajectory_retime_joint_speed" value="$(arg trajectory_retime_joint_speed)"/>
         <param name="trajectory_retime_joint_weights" value="$(arg trajectory_retime_joint_weights)"/>
@@ -806,9 +856,12 @@
         output="screen" cwd="node" if="$(arg execute)">
         <remap from="/joint_group_velocity_controller/command"
                to="/cbf_safety/pre_reflex_command"
-               if="$(arg enable_cbf_reflex)"/>
+               if="$(eval arg('enable_cbf_reflex') and not arg('use_cpp_certified_controller'))"/>
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)"/>
-        <param name="cbf_reflex_publish" value="$(arg enable_cbf_reflex)"/>
+        <param name="cbf_reflex_publish"
+               value="$(eval arg('enable_cbf_reflex') and not arg('use_cpp_certified_controller'))"/>
+        <param name="certified_command_publish"
+               value="$(eval arg('enable_cbf_reflex') and arg('use_cpp_certified_controller'))"/>
         <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
         <param name="controlled_link" value="panda_TCP"/>
         <rosparam param="cbf_link_names">['panda_link2', 'panda_link3', 'panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
@@ -851,6 +904,7 @@
         <param name="max_feedback_velocity" value="0.5"/>
         <param name="cbf_filter_tau" value="$(arg cbf_filter_tau)"/>
         <param name="cbf_velocity_filter_tau" value="$(arg cbf_velocity_filter_tau)"/>
+        <param name="cbf_smoothing_mode" value="$(arg cbf_smoothing_mode)"/>
         <param name="max_joint_velocity" value="$(arg max_joint_velocity)"/>
         <param name="cbf_joint_limit_margin" value="$(arg cbf_joint_limit_margin)"/>
         <param name="cbf_joint_limit_kappa" value="$(arg cbf_joint_limit_kappa)"/>
@@ -944,7 +998,8 @@
        only from the certified QP margins, never a tuned floor. issf_epsilon
        mirrors the QP's disturbance bound into the reflex certificate. -->
   <node name="cbf_reflex" pkg="vision_processing" type="cbf_reflex_node.py"
-        output="screen" if="$(eval arg('enable_cbf_reflex') and arg('execute'))">
+        output="screen"
+        if="$(eval arg('enable_cbf_reflex') and arg('execute') and not arg('use_cpp_certified_controller'))">
         <param name="rate_hz" value="$(arg cbf_reflex_rate_hz)"/>
         <param name="h_stop" value="$(arg cbf_reflex_h_stop)"/>
         <param name="h_activate" value="$(arg cbf_h_activate)"/>

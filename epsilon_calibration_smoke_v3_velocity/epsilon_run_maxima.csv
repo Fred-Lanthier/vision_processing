@@ -1,0 +1,2 @@
+run,seed,complete,capture_wall_seconds,epsilon_windows,normal_windows,braking_windows,normal_max,braking_max,global_max,bag
+1,2000,False,45.0,3200,2743,326,0.02067092107259256,0.18860930460942707,0.18860930460942707,/home/flanthier/Github/src/vision_processing/epsilon_calibration_smoke_v3_velocity/run_001_seed_2000/epsilon.bag

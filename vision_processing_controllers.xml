@@ -6,4 +6,13 @@
       Velocity-commanded position servo with gravity-holding stale-command behavior.
     </description>
   </class>
+  <class name="vision_processing/CertifiedCbfVelocityController"
+         type="vision_processing::CertifiedCbfVelocityController"
+         base_class_type="controller_interface::ControllerBase">
+    <description>
+      Hard-real-time certified CBF brake using a gravity-holding joint-position
+      servo. Consumes atomic GPU CBF command/certificate packets, never waits
+      for CUDA, and integrates certified velocity with bounded position lead.
+    </description>
+  </class>
 </library>

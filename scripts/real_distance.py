@@ -1,10 +1,11 @@
-"""Offline ground-truth clearance for validating the soft barrier h.
+"""Offline mesh clearance for validating the learned CBF barrier.
 
-The controller (cbf_safety_node_Bernstein) runs on a learned Bernstein-basis
-*soft-min* SDF, evaluated over a pruned/selected obstacle subset, and only for
-six protected links. This module recomputes, offline, the TRUE geometric
-clearance of those same six links against the FULL obstacle cloud, so the logged
-h(t) can be plotted against reality in h_evolution.
+The pick-and-place controller protects links 2--7, the hand, and both fingers.
+This module recomputes the geometric clearance of those same meshes against the
+full obstacle cloud.  Crucially, FK consumes all nine measured Panda joints:
+the seven arm joints and both prismatic finger joints.  Padding a seven-joint
+trajectory with zeros makes an open gripper look closed and produces a false
+clearance drop when the fingers move, so that input is rejected here.
 
 Method (no rtree/embree needed): each protected link mesh is sampled once on its
 surface in local coordinates; the samples are transformed to the base frame by
@@ -12,8 +13,8 @@ the link's forward-kinematics pose at every trajectory step (batched on GPU);
 the minimum distance to the obstacle cloud is read off a KD-tree. This is the
 surface-to-surface clearance, accurate to the surface-sampling resolution.
 
-The six protected links match cbf_safety_node_Bernstein.py exactly; keep them in
-sync if the node's protected set changes.
+The legacy feeding geometry remains available explicitly through
+``robot_variant="feeding"``.
 """
 
 import os
@@ -23,9 +24,30 @@ import tempfile
 import numpy as np
 from scipy.spatial import cKDTree
 
-# Must match `link_names` in cbf_safety_node_Bernstein.py.
-PROTECTED_LINKS = ['panda_link4', 'panda_link5', 'panda_link6',
-                   'panda_link7', 'panda_hand', 'fork_tip']
+PANDA_JOINTS = [
+    'panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
+    'panda_joint5', 'panda_joint6', 'panda_joint7',
+    'panda_finger_joint1', 'panda_finger_joint2',
+]
+
+# Must match ~cbf_link_names in the corresponding launch.
+ROBOT_VARIANTS = {
+    'pickplace': {
+        'urdf': 'urdf/panda_pickplace.xacro',
+        'protected_links': [
+            'panda_link2', 'panda_link3', 'panda_link4', 'panda_link5',
+            'panda_link6', 'panda_link7', 'panda_hand',
+            'panda_rightfinger', 'panda_leftfinger',
+        ],
+    },
+    'feeding': {
+        'urdf': 'urdf/panda_camera.xacro',
+        'protected_links': [
+            'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
+            'panda_hand', 'fork_tip',
+        ],
+    },
+}
 
 
 def _pkg_path():
@@ -40,29 +62,47 @@ def _pkg_path():
 class RealClearance:
     """Exact min distance between the protected robot meshes and a point cloud."""
 
-    def __init__(self, samples_per_link=1500, device=None, pkg_path=None):
+    def __init__(self, samples_per_link=1500, device=None, pkg_path=None,
+                 robot_variant='pickplace', sample_seed=0):
         import torch
         import trimesh
         import xacro
 
         pkg_path = pkg_path or _pkg_path()
+        if robot_variant not in ROBOT_VARIANTS:
+            raise ValueError(
+                f"unknown robot_variant {robot_variant!r}; expected one of "
+                f"{sorted(ROBOT_VARIANTS)}")
+        config = ROBOT_VARIANTS[robot_variant]
+        self.robot_variant = robot_variant
+        self.protected_links = list(config['protected_links'])
         sys.path.insert(0, pkg_path)
         from third_party.RDF.urdf_layer import URDFLayer
-
-        doc = xacro.process_file(pkg_path + '/urdf/panda_camera.xacro')
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False) as f:
-            f.write(doc.toxml())
-            urdf_path = f.name
 
         self.torch = torch
         self.device = device or torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
-        # voxel_dir=None on purpose: we want the TRUE robot geometry (franka
-        # visual meshes + the real fork_tip.stl), not the coarse voxelised
-        # meshes the loader would otherwise substitute by basename.
-        self.layer = URDFLayer(
-            urdf_path=urdf_path, device=self.device, package_dir=pkg_path,
-            voxel_dir=None)
+        doc = xacro.process_file(os.path.join(pkg_path, config['urdf']))
+        temp_urdf = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.urdf', delete=False)
+        try:
+            temp_urdf.write(doc.toxml())
+            temp_urdf.close()
+            # voxel_dir=None on purpose: use the actual visual meshes rather
+            # than the coarse voxelised meshes used by the learned SDF loader.
+            self.layer = URDFLayer(
+                urdf_path=temp_urdf.name, device=self.device,
+                package_dir=pkg_path, voxel_dir=None)
+        finally:
+            temp_urdf.close()
+            if os.path.exists(temp_urdf.name):
+                os.unlink(temp_urdf.name)
+
+        self.joint_names = list(self.layer.joint_names)
+        if self.joint_names != PANDA_JOINTS:
+            raise RuntimeError(
+                "offline FK joint order does not match the bag loader: "
+                f"URDF={self.joint_names}, expected={PANDA_JOINTS}")
 
         # Sample each protected mesh once, in local (scaled, metres) coordinates.
         # mesh_idx indexes into the per-mesh transform list returned by
@@ -70,10 +110,13 @@ class RealClearance:
         self.mesh_idx = []
         self.local_pts = []
         for i, info in enumerate(self.layer.meshes_info):
-            if info['link_name'] not in PROTECTED_LINKS:
+            if info['link_name'] not in self.protected_links:
                 continue
             mesh = trimesh.load(info['mesh_path'], force='mesh')
-            pts, _ = trimesh.sample.sample_surface(mesh, samples_per_link)
+            # A deterministic seed keeps repeated thesis-figure generation
+            # from changing the reported minimum by sampling noise.
+            pts, _ = trimesh.sample.sample_surface(
+                mesh, samples_per_link, seed=sample_seed + i)
             pts = np.asarray(pts, np.float32) * np.asarray(info['scale'], np.float32)
             self.mesh_idx.append(i)
             self.local_pts.append(pts)
@@ -87,7 +130,7 @@ class RealClearance:
                     self.layer.meshes_info[mi]['link_name'], dtype=object)
             for j, mi in enumerate(self.mesh_idx)])
             if self.mesh_idx else np.empty(0, dtype=object))
-        missing = [l for l in PROTECTED_LINKS if l not in self.found_links]
+        missing = [l for l in self.protected_links if l not in self.found_links]
         if missing:
             print(f"[real_distance] WARNING: no resolvable mesh for {missing}; "
                   "those links are excluded from the real clearance.")
@@ -95,9 +138,23 @@ class RealClearance:
             raise RuntimeError("No protected-link meshes could be loaded.")
 
     def surface_points(self, q_rows):
-        """[T,7] joint angles -> [T,P,3] base-frame robot surface points."""
+        """[T,9] measured joints -> [T,P,3] robot surface points.
+
+        The last two columns are the live prismatic finger positions.  A
+        seven-column input is rejected instead of being silently padded closed.
+        """
         torch = self.torch
-        q = torch.as_tensor(np.asarray(q_rows, np.float32), device=self.device)
+        q_array = np.asarray(q_rows, np.float32)
+        if q_array.ndim == 1:
+            q_array = q_array[None]
+        if q_array.ndim != 2 or q_array.shape[1] != len(self.joint_names):
+            raise ValueError(
+                f"q_rows must have shape [T,{len(self.joint_names)}] in order "
+                f"{self.joint_names}; got {q_array.shape}. Both measured "
+                "finger joints are required for physical clearance.")
+        if not np.isfinite(q_array).all():
+            raise ValueError("q_rows contains non-finite joint positions")
+        q = torch.as_tensor(q_array, device=self.device)
         if q.ndim == 1:
             q = q[None]
         pose = torch.eye(4, device=self.device).expand(q.shape[0], 4, 4)
@@ -114,7 +171,7 @@ class RealClearance:
                   return_details=False):
         """Minimum surface-to-cloud distance per trajectory step.
 
-        q_rows:     [T,7] joint angles, one per output sample
+        q_rows:     [T,9] measured joint positions, including both fingers
         obs_clouds: list of [Ni,3] point clouds (base frame)
         obs_index:  [T] index into obs_clouds for each step
         returns:    [T] distances in metres (NaN where no usable cloud)

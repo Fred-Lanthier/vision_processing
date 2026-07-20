@@ -1,0 +1,1320 @@
+arm_id: panda
+brown_box_description: "<?xml version=\"1.0\"?>\n<!-- Brown place-target box. Matches\
+  \ the low ManiSkill PickPlace shelf:\n     half-sizes (0.08, 0.08, 0.005) -> full\
+  \ (0.16, 0.16, 0.01). Static:\n     it never moves, the cube is placed on its top\
+  \ face. base_link is at the box\n     CENTER, so spawn it at world (0.515, -0.35,\
+  \ 0.755) -> top face at z = 0.76. -->\n<robot name=\"brown_box\">\n  <link name=\"\
+  base_link\">\n    <visual>\n      <geometry>\n        <box size=\"0.16 0.16 0.01\"\
+  />\n      </geometry>\n      <material name=\"brown\">\n        <color rgba=\"0.22\
+  \ 0.11 0.04 1\"/>\n      </material>\n    </visual>\n\n    <collision>\n      <geometry>\n\
+  \        <box size=\"0.16 0.16 0.01\"/>\n      </geometry>\n    </collision>\n\n\
+  \    <inertial>\n      <mass value=\"5.0\"/>\n      <inertia ixx=\"0.02\" ixy=\"\
+  0.0\" ixz=\"0.0\" iyy=\"0.02\" iyz=\"0.0\" izz=\"0.02\"/>\n    </inertial>\n  </link>\n\
+  \n  <gazebo>\n    <static>true</static>\n  </gazebo>\n</robot>\n"
+camera_static:
+  color:
+    image_raw:
+      compressed:
+        format: jpeg
+        jpeg_optimize: false
+        jpeg_progressive: false
+        jpeg_quality: 80
+        jpeg_restart_interval: 0
+        png_level: 9
+      compressedDepth:
+        depth_max: 10.0
+        depth_quantization: 100.0
+        format: png
+        png_level: 1
+      theora:
+        keyframe_frequency: 64
+        optimize_for: 1
+        quality: 31
+        target_bitrate: 800000
+  imager_rate: 2.0
+camera_wrist:
+  color:
+    image_raw:
+      compressed:
+        format: jpeg
+        jpeg_optimize: false
+        jpeg_progressive: false
+        jpeg_quality: 80
+        jpeg_restart_interval: 0
+        png_level: 9
+      compressedDepth:
+        depth_max: 10.0
+        depth_quantization: 100.0
+        format: png
+        png_level: 1
+      theora:
+        keyframe_frequency: 64
+        optimize_for: 1
+        quality: 31
+        target_bitrate: 800000
+  imager_rate: 2.0
+cartesian_impedance_example_controller:
+  arm_id: panda
+  joint_names:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  type: franka_example_controllers/CartesianImpedanceExampleController
+cbf_safety_Bernstein:
+  barrier_alpha: 0.002
+  cbf_active_constraints: 9
+  cbf_barrier_value_mode: hard
+  cbf_candidate_filter: sdf
+  cbf_cluster_mode: topk
+  cbf_command_dt: 0.05
+  cbf_constraint_margin: 0.001
+  cbf_constraint_sweeps: 6
+  cbf_diagnostics_decimation: 4
+  cbf_direct_position_mode: integrated
+  cbf_dykstra_warmstart: true
+  cbf_dynamic_hdot_deadband: 0.05
+  cbf_dynamic_hdot_enabled: true
+  cbf_dynamic_hdot_max: 0.5
+  cbf_dynamic_hdot_tau: 0.05
+  cbf_enforce_final_constraint: true
+  cbf_escape_enabled: false
+  cbf_escape_gate_tau: 0.3
+  cbf_escape_h_release: 0.12
+  cbf_escape_h_trigger: 0.02
+  cbf_escape_lift_gain: 0.2
+  cbf_escape_max_velocity: 0.15
+  cbf_escape_normal_gain: 0.0
+  cbf_escape_normal_h_trigger: 0.03
+  cbf_escape_probe_clearance_cap: 0.2
+  cbf_escape_probe_commit_weight: 0.02
+  cbf_escape_probe_elevations: 0
+  cbf_escape_probe_ema: 0.3
+  cbf_escape_probe_enabled: false
+  cbf_escape_probe_goal_weight: 0.02
+  cbf_escape_probe_growth_weight: 0.0
+  cbf_escape_probe_min_z: 0.03
+  cbf_escape_probe_num_dirs: 16
+  cbf_escape_probe_radii: 0.05 0.10 0.20 0.5
+  cbf_escape_probe_reentry_window: 0.0
+  cbf_escape_probe_resolve_timeout: 0.0
+  cbf_escape_probe_tabu_min_progress: 0.03
+  cbf_escape_probe_tabu_timeout: 1.5
+  cbf_escape_probe_tabu_ttl: 8.0
+  cbf_escape_probe_tabu_weight: 0.8
+  cbf_escape_suppress_nominal: 0.0
+  cbf_escape_tangent_gain: 1.0
+  cbf_filter_tau: 0.08
+  cbf_final_constraint_mode: solver_bound
+  cbf_graph_points: 64
+  cbf_graphed_control_step: true
+  cbf_grasp_box_enabled: false
+  cbf_h_activate: 0.04
+  cbf_integrate_from_current: true
+  cbf_issf_epsilon: 0.0603
+  cbf_issf_rho: 0.0
+  cbf_joint_limit_kappa: 3.0
+  cbf_joint_limit_margin: 0.15
+  cbf_kappa: 5.0
+  cbf_kp: 5.0
+  cbf_link_names:
+  - panda_link2
+  - panda_link3
+  - panda_link4
+  - panda_link5
+  - panda_link6
+  - panda_link7
+  - panda_hand
+  - panda_rightfinger
+  - panda_leftfinger
+  cbf_max_command_lead: 0.05
+  cbf_max_correction_speed: 0.5
+  cbf_max_inward_speed: 0.5
+  cbf_monitor_only: false
+  cbf_multi_fd_eps: 0.001
+  cbf_multi_gradient_mode: analytical
+  cbf_nullspace_clearance_gain: 0.3
+  cbf_nullspace_clearance_h_activate: 0.05
+  cbf_passthrough_when_inactive: true
+  cbf_position_correction_dt: 0.02
+  cbf_projection_iters: 3
+  cbf_projection_metric: task
+  cbf_projection_relaxation: 1.0
+  cbf_qp_algorithm: dykstra
+  cbf_recovery_depth: 0.015
+  cbf_recovery_kappa: 5.0
+  cbf_recovery_max_correction_speed: 0.5
+  cbf_recovery_speed: 0.05
+  cbf_recovery_switch_margin: 0.015
+  cbf_reflex_publish: false
+  cbf_repair_all_rows: true
+  cbf_repair_grad_min: 0.03
+  cbf_repair_qp_algorithm: dykstra
+  cbf_repair_sweeps: 24
+  cbf_sampled_data_L_links: 1.0 4.3 4.7 9.6 21.8 32.0 19.7 5 5
+  cbf_sampled_data_linearization: executed
+  cbf_sampled_data_margin: true
+  cbf_sampled_data_vel_headroom: 0.15
+  cbf_sdf_candidate_max_dist: 0.35
+  cbf_sdf_graph_points: 4096
+  cbf_sdf_prefilter_max_points: 4096
+  cbf_sdf_prefilter_radius: 0.4
+  cbf_sdf_prune_chunk_size: 2048
+  cbf_sdf_self_filter_margin: -0.05
+  cbf_selection_metric: sdf
+  cbf_selection_mode: graphed
+  cbf_separate_streams: true
+  cbf_solver_mode: multi_graphed
+  cbf_task_metric_lambda: 0.01
+  cbf_task_metric_rot_weight: 0.05
+  cbf_task_metric_update_every: 3
+  cbf_tracking_feedback_mode: tangent_near
+  cbf_velocity_filter_tau: 0.1
+  certified_command_publish: true
+  controlled_link: panda_TCP
+  d_safe: 0.015
+  enable_cbf: true
+  max_feedback_velocity: 0.5
+  max_joint_velocity: 0.7
+  model_override_dir: /home/flanthier/Github/src/vision_processing/third_party/SDF_Bernstein_Basis/panda_test/Models/nfunc12_candidate
+  model_override_links: panda_link2 panda_link3 panda_leftfinger panda_rightfinger
+  nominal_feedforward_gain: 1.0
+  nominal_velocity_timeout: 0.25
+  nominal_velocity_topic: /planner/nominal_joint_velocity
+  obs_topic: /perception/cleaned_obstacles
+  preprocess_max_points: 4096
+  preprocess_rate_hz: 100.0
+  publish_controller_command: false
+  publish_diagnostics: true
+  publish_velocity_controller_command: true
+  publish_viz_topics: true
+  rate_hz: 100.0
+  tcp_frame: panda_TCP
+  urdf_path: /home/flanthier/Github/src/vision_processing/urdf/panda_pickplace.xacro
+  use_nominal_velocity_topic: true
+certified_cbf_velocity_controller:
+  certified_command_topic: /cbf_safety/certified_command
+  command_timeout: 0.1
+  exp_kappa: 25.0
+  grad_lipschitz: 1.0 4.3 4.7 9.6 21.8 32.0 19.7 20 5
+  h_activate: 0.04
+  h_stop: 0.0
+  issf_epsilon: 0.0603
+  issf_rho: 0.0
+  issf_veto_hold: 0.05
+  joints:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  max_abs_velocity: 0.7
+  max_position_lead: 0.05
+  nominal_period: 0.001
+  recovery_depth: 0.015
+  recovery_slack: 0.5
+  recovery_speed: 0.05
+  release_tau: 0.05
+  status_divisor: 20
+  tick_decay: 0.98
+  timing_divisor: 10
+  type: vision_processing/CertifiedCbfVelocityController
+condition_pickplace:
+  cube_topic: /perception/target_cube
+  num_points: 1024
+  tcp_frame: panda_TCP
+  world_frame: world
+effort_joint_trajectory_controller:
+  constraints:
+    goal_time: 0.5
+    panda_joint1:
+      goal: 0.05
+    panda_joint2:
+      goal: 0.05
+    panda_joint3:
+      goal: 0.05
+    panda_joint4:
+      goal: 0.05
+    panda_joint5:
+      goal: 0.05
+    panda_joint6:
+      goal: 0.05
+    panda_joint7:
+      goal: 0.05
+  gains:
+    panda_joint1:
+      d: 30
+      i: 0
+      p: 600
+    panda_joint2:
+      d: 30
+      i: 0
+      p: 600
+    panda_joint3:
+      d: 30
+      i: 0
+      p: 600
+    panda_joint4:
+      d: 30
+      i: 0
+      p: 600
+    panda_joint5:
+      d: 10
+      i: 0
+      p: 250
+    panda_joint6:
+      d: 10
+      i: 0
+      p: 150
+    panda_joint7:
+      d: 5
+      i: 0
+      p: 50
+  joints:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  type: effort_controllers/JointTrajectoryController
+force_example_controller:
+  arm_id: panda
+  joint_names:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  type: franka_example_controllers/ForceExampleController
+franka_gripper:
+  arm_id: panda
+  finger1:
+    gains:
+      d: 1.0
+      i: 0
+      p: 100
+  finger2:
+    gains:
+      d: 1.0
+      i: 0
+      p: 100
+  type: franka_gazebo/FrankaGripperSim
+franka_state_controller:
+  arm_id: panda
+  joint_names:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  publish_rate: 30
+  type: franka_control/FrankaStateController
+gazebo:
+  auto_disable_bodies: false
+  cfm: 0.0
+  contact_max_correcting_vel: 100.0
+  contact_surface_layer: 0.001
+  enable_ros_network: true
+  erp: 0.2
+  gravity_x: 0.0
+  gravity_y: 0.0
+  gravity_z: -9.8
+  max_contacts: 20
+  max_update_rate: 1000.0
+  sor_pgs_iters: 50
+  sor_pgs_precon_iters: 0
+  sor_pgs_rms_error_tol: 0.0
+  sor_pgs_w: 1.3
+  time_step: 0.001
+gazebo_ros_control:
+  pid_gains:
+    panda_finger_joint1:
+      d: 10
+      i: 1
+      p: 100
+    panda_finger_joint2:
+      d: 10
+      i: 1
+      p: 100
+    panda_joint1:
+      d: 30.0
+      i: 0.0
+      i_clamp: 10000.0
+      p: 600.0
+    panda_joint2:
+      d: 30.0
+      i: 0.0
+      i_clamp: 10000.0
+      p: 600.0
+    panda_joint3:
+      d: 30.0
+      i: 0.0
+      i_clamp: 10000.0
+      p: 600.0
+    panda_joint4:
+      d: 30.0
+      i: 0.0
+      i_clamp: 10000.0
+      p: 600.0
+    panda_joint5:
+      d: 10.0
+      i: 0.0
+      i_clamp: 10000.0
+      p: 250.0
+    panda_joint6:
+      d: 10.0
+      i: 0.0
+      i_clamp: 10000.0
+      p: 150.0
+    panda_joint7:
+      d: 5.0
+      i: 0.0
+      i_clamp: 10000.0
+      p: 50.0
+gripper_grasp_pp:
+  contact_weld_finger: 0.024
+  cube_model: red_cube
+  grasp_force: 40.0
+  grasp_width: 0.04
+  gripper_ns: /franka_gripper
+  hold_after_weld: true
+  hold_width: 0.04
+  open_width: 0.08
+  release_z_clearance: 0.1
+  tcp_frame: panda_TCP
+joint_group_position_controller:
+  constraints:
+    goal_time: 1.0
+    panda_joint1:
+      goal: 0.05
+      trajectory: 0.1
+    panda_joint2:
+      goal: 0.05
+      trajectory: 0.1
+    panda_joint3:
+      goal: 0.05
+      trajectory: 0.1
+    panda_joint4:
+      goal: 0.05
+      trajectory: 0.1
+    panda_joint5:
+      goal: 0.05
+      trajectory: 0.1
+    panda_joint6:
+      goal: 0.05
+      trajectory: 0.1
+    panda_joint7:
+      goal: 0.05
+      trajectory: 0.1
+  joints:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  type: position_controllers/JointGroupPositionController
+joint_group_velocity_controller:
+  command_timeout: 0.1
+  joints:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  max_abs_velocity: 0.7
+  max_position_lead: 0.05
+  type: vision_processing/JointGroupVelocityController
+joint_position_example_controller:
+  joint_names:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  type: franka_example_controllers/JointPositionExampleController
+joint_state_controller:
+  publish_rate: 30
+  type: joint_state_controller/JointStateController
+joint_state_publisher:
+  rate: 60
+  source_list:
+  - franka_state_controller/joint_states
+  - franka_gripper/joint_states
+joint_velocity_example_controller:
+  joint_names:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  type: franka_example_controllers/JointVelocityExampleController
+model_example_controller:
+  arm_id: panda
+  type: franka_example_controllers/ModelExampleController
+motion_generators:
+  position:
+    gains:
+      panda_joint1:
+        antiwindup: false
+        d: 30.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 600.0
+      panda_joint2:
+        antiwindup: false
+        d: 30.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 600.0
+      panda_joint3:
+        antiwindup: false
+        d: 30.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 600.0
+      panda_joint4:
+        antiwindup: false
+        d: 30.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 600.0
+      panda_joint5:
+        antiwindup: false
+        d: 10.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 250.0
+      panda_joint6:
+        antiwindup: false
+        d: 10.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 150.0
+      panda_joint7:
+        antiwindup: false
+        d: 5.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 50.0
+  velocity:
+    gains:
+      panda_joint1:
+        antiwindup: false
+        d: 0.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 30.0
+      panda_joint2:
+        antiwindup: false
+        d: 0.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 30.0
+      panda_joint3:
+        antiwindup: false
+        d: 0.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 30.0
+      panda_joint4:
+        antiwindup: false
+        d: 0.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 30.0
+      panda_joint5:
+        antiwindup: false
+        d: 0.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 10.0
+      panda_joint6:
+        antiwindup: false
+        d: 0.0
+        i: 0.0
+        i_clamp_max: 0.0
+        i_clamp_min: -0.0
+        p: 10.0
+      panda_joint7:
+        d: 0
+        i: 0
+        p: 5.0
+position_joint_trajectory_controller:
+  constraints:
+    goal_time: 0.5
+    panda_joint1:
+      goal: 0.05
+    panda_joint2:
+      goal: 0.05
+    panda_joint3:
+      goal: 0.05
+    panda_joint4:
+      goal: 0.05
+    panda_joint5:
+      goal: 0.05
+    panda_joint6:
+      goal: 0.05
+    panda_joint7:
+      goal: 0.05
+  joints:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+  type: position_controllers/JointTrajectoryController
+pp_crescent_obstacle_description: "<?xml version=\"1.0\" ?>\n<!-- ===================================================================================\
+  \ -->\n<!-- |    This document was autogenerated by xacro from /home/flanthier/Github/src/vision_processing/urdf/pp_crescent_obstacle.xacro\
+  \ | -->\n<!-- |    EDITING THIS FILE BY HAND IS NOT RECOMMENDED                \
+  \                 | -->\n<!-- ===================================================================================\
+  \ -->\n<robot name=\"pp_crescent_obstacle\">\n  <link name=\"base_link\"/>\n  <link\
+  \ name=\"slice_0\">\n    <visual>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n      <material name=\"dark_gray\">\n      \
+  \  <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n    </visual>\n    <collision>\n\
+  \      <geometry>\n        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n\
+  \    </collision>\n    <inertial>\n      <mass value=\"0.2\"/>\n      <inertia ixx=\"\
+  0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\" iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n\
+  \  </link>\n  <joint name=\"slice_0_joint\" type=\"fixed\">\n    <parent link=\"\
+  base_link\"/>\n    <child link=\"slice_0\"/>\n    <origin rpy=\"0 0 0\" xyz=\"-0.048889\
+  \ -0.010197 0\"/>\n  </joint>\n  <link name=\"slice_1\">\n    <visual>\n      <geometry>\n\
+  \        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n      <material\
+  \ name=\"dark_gray\">\n        <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n\
+  \    </visual>\n    <collision>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n    </collision>\n    <inertial>\n      <mass\
+  \ value=\"0.2\"/>\n      <inertia ixx=\"0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\"\
+  \ iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n  </link>\n  <joint name=\"slice_1_joint\"\
+  \ type=\"fixed\">\n    <parent link=\"base_link\"/>\n    <child link=\"slice_1\"\
+  />\n    <origin rpy=\"0 0 0\" xyz=\"-0.036667 -0.025995 0\"/>\n  </joint>\n  <link\
+  \ name=\"slice_2\">\n    <visual>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n      <material name=\"dark_gray\">\n      \
+  \  <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n    </visual>\n    <collision>\n\
+  \      <geometry>\n        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n\
+  \    </collision>\n    <inertial>\n      <mass value=\"0.2\"/>\n      <inertia ixx=\"\
+  0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\" iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n\
+  \  </link>\n  <joint name=\"slice_2_joint\" type=\"fixed\">\n    <parent link=\"\
+  base_link\"/>\n    <child link=\"slice_2\"/>\n    <origin rpy=\"0 0 0\" xyz=\"-0.024444\
+  \ -0.034269 0\"/>\n  </joint>\n  <link name=\"slice_3\">\n    <visual>\n      <geometry>\n\
+  \        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n      <material\
+  \ name=\"dark_gray\">\n        <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n\
+  \    </visual>\n    <collision>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n    </collision>\n    <inertial>\n      <mass\
+  \ value=\"0.2\"/>\n      <inertia ixx=\"0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\"\
+  \ iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n  </link>\n  <joint name=\"slice_3_joint\"\
+  \ type=\"fixed\">\n    <parent link=\"base_link\"/>\n    <child link=\"slice_3\"\
+  />\n    <origin rpy=\"0 0 0\" xyz=\"-0.012222 -0.038625 0\"/>\n  </joint>\n  <link\
+  \ name=\"slice_4\">\n    <visual>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n      <material name=\"dark_gray\">\n      \
+  \  <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n    </visual>\n    <collision>\n\
+  \      <geometry>\n        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n\
+  \    </collision>\n    <inertial>\n      <mass value=\"0.2\"/>\n      <inertia ixx=\"\
+  0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\" iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n\
+  \  </link>\n  <joint name=\"slice_4_joint\" type=\"fixed\">\n    <parent link=\"\
+  base_link\"/>\n    <child link=\"slice_4\"/>\n    <origin rpy=\"0 0 0\" xyz=\"0.0\
+  \ -0.04 0\"/>\n  </joint>\n  <link name=\"slice_5\">\n    <visual>\n      <geometry>\n\
+  \        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n      <material\
+  \ name=\"dark_gray\">\n        <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n\
+  \    </visual>\n    <collision>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n    </collision>\n    <inertial>\n      <mass\
+  \ value=\"0.2\"/>\n      <inertia ixx=\"0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\"\
+  \ iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n  </link>\n  <joint name=\"slice_5_joint\"\
+  \ type=\"fixed\">\n    <parent link=\"base_link\"/>\n    <child link=\"slice_5\"\
+  />\n    <origin rpy=\"0 0 0\" xyz=\"0.012222 -0.038625 0\"/>\n  </joint>\n  <link\
+  \ name=\"slice_6\">\n    <visual>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n      <material name=\"dark_gray\">\n      \
+  \  <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n    </visual>\n    <collision>\n\
+  \      <geometry>\n        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n\
+  \    </collision>\n    <inertial>\n      <mass value=\"0.2\"/>\n      <inertia ixx=\"\
+  0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\" iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n\
+  \  </link>\n  <joint name=\"slice_6_joint\" type=\"fixed\">\n    <parent link=\"\
+  base_link\"/>\n    <child link=\"slice_6\"/>\n    <origin rpy=\"0 0 0\" xyz=\"0.024444\
+  \ -0.034269 0\"/>\n  </joint>\n  <link name=\"slice_7\">\n    <visual>\n      <geometry>\n\
+  \        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n      <material\
+  \ name=\"dark_gray\">\n        <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n\
+  \    </visual>\n    <collision>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n    </collision>\n    <inertial>\n      <mass\
+  \ value=\"0.2\"/>\n      <inertia ixx=\"0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\"\
+  \ iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n  </link>\n  <joint name=\"slice_7_joint\"\
+  \ type=\"fixed\">\n    <parent link=\"base_link\"/>\n    <child link=\"slice_7\"\
+  />\n    <origin rpy=\"0 0 0\" xyz=\"0.036667 -0.025995 0\"/>\n  </joint>\n  <link\
+  \ name=\"slice_8\">\n    <visual>\n      <geometry>\n        <box size=\"0.012833\
+  \ 0.03 0.36\"/>\n      </geometry>\n      <material name=\"dark_gray\">\n      \
+  \  <color rgba=\"0.08 0.08 0.08 1\"/>\n      </material>\n    </visual>\n    <collision>\n\
+  \      <geometry>\n        <box size=\"0.012833 0.03 0.36\"/>\n      </geometry>\n\
+  \    </collision>\n    <inertial>\n      <mass value=\"0.2\"/>\n      <inertia ixx=\"\
+  0.001\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.001\" iyz=\"0.0\" izz=\"0.001\"/>\n    </inertial>\n\
+  \  </link>\n  <joint name=\"slice_8_joint\" type=\"fixed\">\n    <parent link=\"\
+  base_link\"/>\n    <child link=\"slice_8\"/>\n    <origin rpy=\"0 0 0\" xyz=\"0.048889\
+  \ -0.010197 0\"/>\n  </joint>\n  <gazebo>\n    <static>true</static>\n  </gazebo>\n\
+  </robot>\n\n"
+pp_cylinder_obstacle_description: "<?xml version=\"1.0\" ?>\n<!-- ===================================================================================\
+  \ -->\n<!-- |    This document was autogenerated by xacro from /home/flanthier/Github/src/vision_processing/urdf/pp_cylinder_obstacle.xacro\
+  \ | -->\n<!-- |    EDITING THIS FILE BY HAND IS NOT RECOMMENDED                \
+  \                 | -->\n<!-- ===================================================================================\
+  \ -->\n<robot name=\"pp_cylinder_obstacle\">\n  <link name=\"base_link\">\n    <visual>\n\
+  \      <geometry>\n        <cylinder length=\"0.36\" radius=\"0.040\"/>\n      </geometry>\n\
+  \      <material name=\"dark_gray\">\n        <color rgba=\"0.08 0.08 0.08 1\"/>\n\
+  \      </material>\n    </visual>\n    <collision>\n      <geometry>\n        <cylinder\
+  \ length=\"0.36\" radius=\"0.040\"/>\n      </geometry>\n    </collision>\n    <inertial>\n\
+  \      <mass value=\"2.0\"/>\n      <inertia ixx=\"0.01\" ixy=\"0.0\" ixz=\"0.0\"\
+  \ iyy=\"0.01\" iyz=\"0.0\" izz=\"0.01\"/>\n    </inertial>\n  </link>\n  <gazebo>\n\
+  \    <static>true</static>\n  </gazebo>\n</robot>\n\n"
+pp_prism_obstacle_description: "<?xml version=\"1.0\" ?>\n<!-- ===================================================================================\
+  \ -->\n<!-- |    This document was autogenerated by xacro from /home/flanthier/Github/src/vision_processing/urdf/pp_prism_obstacle.xacro\
+  \ | -->\n<!-- |    EDITING THIS FILE BY HAND IS NOT RECOMMENDED                \
+  \                 | -->\n<!-- ===================================================================================\
+  \ -->\n<robot name=\"pp_prism_obstacle\">\n  <link name=\"base_link\">\n    <visual>\n\
+  \      <geometry>\n        <box size=\"0.200 0.060 0.36\"/>\n      </geometry>\n\
+  \      <material name=\"black\">\n        <color rgba=\"0 0 0 1\"/>\n      </material>\n\
+  \    </visual>\n    <collision>\n      <geometry>\n        <box size=\"0.200 0.060\
+  \ 0.36\"/>\n      </geometry>\n    </collision>\n    <inertial>\n      <mass value=\"\
+  2.0\"/>\n      <inertia ixx=\"0.01\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"0.01\" iyz=\"\
+  0.0\" izz=\"0.01\"/>\n    </inertial>\n  </link>\n  <gazebo>\n    <static>true</static>\n\
+  \  </gazebo>\n  <gazebo reference=\"base_link\">\n    <material>Gazebo/Black</material>\n\
+  \    <ambient>0 0 0 1</ambient>\n    <diffuse>0 0 0 1</diffuse>\n    <specular>0.01\
+  \ 0.01 0.01 1</specular>\n  </gazebo>\n</robot>\n\n"
+pp_static_obstacle:
+  base_z: 0.0
+  center_x: 0.535
+  center_y: -0.19
+  crescent_bite_offset: 0.03
+  crescent_inner_radius: 0.055
+  crescent_outer_radius: 0.055
+  extra_topic: /perception/persistent_obstacles
+  frame_id: world
+  gazebo_mirror_enabled: true
+  gazebo_z_offset: 0.75
+  height: 0.36
+  moving_sphere_enabled: true
+  moving_sphere_initial_x: 0.1
+  moving_sphere_initial_y: -0.19
+  moving_sphere_initial_z: 0.55
+  moving_sphere_num_points: 1000
+  moving_sphere_radius: 0.08
+  moving_sphere_velocity_x: 0.0
+  moving_sphere_velocity_y: 0.0
+  moving_sphere_velocity_z: 0.0
+  num_points: 1000
+  prism_size_x: 0.2
+  prism_size_y: 0.06
+  publish_rate_hz: 30.0
+  radius: 0.04
+  shape: prism
+  topic: /perception/cleaned_obstacles
+  yaw: -0.16
+projector_box:
+  camera_frame: camera_static_optical_frame
+  depth_topic: /camera_static/aligned_depth_to_color/image_raw
+  enable_fork_filter: false
+  enable_fork_sam3_mask: false
+  fork_sdf_filter: false
+  info_topic: /camera_static/color/camera_info
+  mask_topic: /vision/sam2_mask_box
+  rgb_topic: /camera_static/color/image_raw
+  target_frame: world
+projector_cube:
+  camera_frame: camera_static_optical_frame
+  depth_topic: /camera_static/aligned_depth_to_color/image_raw
+  enable_fork_filter: false
+  enable_fork_sam3_mask: false
+  fork_sdf_filter: false
+  info_topic: /camera_static/color/camera_info
+  mask_topic: /vision/sam2_mask_cube
+  rgb_topic: /camera_static/color/image_raw
+  target_frame: world
+red_cube_description: "<?xml version=\"1.0\"?>\n<!-- Red pick target cube. Matches\
+  \ the ManiSkill PickPlace cube: half-size 0.02 m\n     (full 0.04). Dynamic + graspable\
+  \ (welded to panda_hand by the grasp node). -->\n<robot name=\"red_cube\">\n  <link\
+  \ name=\"base_link\">\n    <visual>\n      <geometry>\n        <box size=\"0.04\
+  \ 0.04 0.04\"/>\n      </geometry>\n      <material name=\"red\">\n        <color\
+  \ rgba=\"0.8 0.1 0.1 1\"/>\n      </material>\n    </visual>\n\n    <collision>\n\
+  \      <geometry>\n        <box size=\"0.04 0.04 0.04\"/>\n      </geometry>\n \
+  \   </collision>\n\n    <inertial>\n      <mass value=\"0.000000000000000005\"/>\n\
+  \      <inertia ixx=\"1.33e-7\" ixy=\"0.0\" ixz=\"0.0\" iyy=\"1.33e-7\" iyz=\"0.0\"\
+  \ izz=\"1.33e-7\"/>\n    </inertial>\n  </link>\n\n  <gazebo reference=\"base_link\"\
+  >\n    <material>Gazebo/Red</material>\n    <mu1>0.0</mu1>\n    <mu2>0.0</mu2>\n\
+  \  </gazebo>\n</robot>\n"
+robot_description: "<?xml version=\"1.0\" ?>\n<!-- ===================================================================================\
+  \ -->\n<!-- |    This document was autogenerated by xacro from /home/flanthier/Github/src/vision_processing/urdf/panda_pickplace.xacro\
+  \ | -->\n<!-- |    EDITING THIS FILE BY HAND IS NOT RECOMMENDED                \
+  \                 | -->\n<!-- ===================================================================================\
+  \ -->\n<!-- Panda for the PICK-AND-PLACE Gazebo system.\n     Copy of panda_camera.xacro\
+  \ WITHOUT the fork: the FM pick-and-place policy\n     predicts the panda_TCP pose\
+  \ directly and grasps the cube with the gripper.\n     The static camera is repositioned\
+  \ to face the robot from the front (matching\n     the ManiSkill front-facing static\
+  \ cam used to collect/preprocess the data).\n     Do NOT use this for the feeding\
+  \ system (use panda_camera.xacro there). -->\n<robot name=\"panda\">\n  <!-- sub-link\
+  \ defining detailed meshes for collision with environment -->\n  <link name=\"panda_link0\"\
+  >\n    <visual>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/link0.dae\"\
+  />\n      </geometry>\n    </visual>\n    <collision>\n      <geometry>\n      \
+  \  <mesh filename=\"package://franka_description/meshes/collision/link0.stl\"/>\n\
+  \      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0 0\"\
+  \ xyz=\"-0.041018 -0.00014 0.049974\"/>\n      <mass value=\"0.629769\"/>\n    \
+  \  <inertia ixx=\"0.00315\" ixy=\"8.2904e-07\" ixz=\"0.00015\" iyy=\"0.00388\" iyz=\"\
+  8.2299e-06\" izz=\"0.004285\"/>\n    </inertial>\n  </link>\n  <!-- sub-link defining\
+  \ coarse geometries of real robot's internal self-collision -->\n  <link name=\"\
+  panda_link0_sc\">\n  </link>\n  <!-- fixed joint between both sub-links -->\n  <joint\
+  \ name=\"panda_link0_sc_joint\" type=\"fixed\">\n    <origin rpy=\"0 0 0\"/>\n \
+  \   <parent link=\"panda_link0\"/>\n    <child link=\"panda_link0_sc\"/>\n  </joint>\n\
+  \  <!-- sub-link defining detailed meshes for collision with environment -->\n \
+  \ <link name=\"panda_link1\">\n    <visual>\n      <geometry>\n        <mesh filename=\"\
+  package://franka_description/meshes/visual/link1.dae\"/>\n      </geometry>\n  \
+  \  </visual>\n    <collision>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/collision/link1.stl\"\
+  />\n      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0\
+  \ 0\" xyz=\"0.003875 0.002081 -0.04762\"/>\n      <mass value=\"4.970684\"/>\n \
+  \     <inertia ixx=\"0.70337\" ixy=\"-0.000139\" ixz=\"0.006772\" iyy=\"0.70661\"\
+  \ iyz=\"0.019169\" izz=\"0.009117\"/>\n    </inertial>\n  </link>\n  <!-- sub-link\
+  \ defining coarse geometries of real robot's internal self-collision -->\n  <link\
+  \ name=\"panda_link1_sc\">\n  </link>\n  <!-- fixed joint between both sub-links\
+  \ -->\n  <joint name=\"panda_link1_sc_joint\" type=\"fixed\">\n    <origin rpy=\"\
+  0 0 0\"/>\n    <parent link=\"panda_link1\"/>\n    <child link=\"panda_link1_sc\"\
+  />\n  </joint>\n  <joint name=\"panda_joint1\" type=\"revolute\">\n    <origin rpy=\"\
+  0 0 0\" xyz=\"0 0 0.333\"/>\n    <parent link=\"panda_link0\"/>\n    <child link=\"\
+  panda_link1\"/>\n    <axis xyz=\"0 0 1\"/>\n    <limit effort=\"87.0\" lower=\"\
+  -2.8973\" upper=\"2.8973\" velocity=\"2.175\"/>\n    <safety_controller k_position=\"\
+  100.0\" k_velocity=\"40.0\" soft_lower_limit=\"-2.8973\" soft_upper_limit=\"2.8973\"\
+  />\n    <dynamics D=\"1\" K=\"7000\" damping=\"0.003\" friction=\"0.0\" mu_coulomb=\"\
+  0\" mu_viscous=\"16\"/>\n  </joint>\n  <!-- sub-link defining detailed meshes for\
+  \ collision with environment -->\n  <link name=\"panda_link2\">\n    <visual>\n\
+  \      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/link2.dae\"\
+  />\n      </geometry>\n    </visual>\n    <collision>\n      <geometry>\n      \
+  \  <mesh filename=\"package://franka_description/meshes/collision/link2.stl\"/>\n\
+  \      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0 0\"\
+  \ xyz=\"-0.003141 -0.02872  0.003495\"/>\n      <mass value=\"0.646926\"/>\n   \
+  \   <inertia ixx=\"0.007962\" ixy=\"-0.003925\" ixz=\"0.010254\" iyy=\"0.02811\"\
+  \ iyz=\"0.000704\" izz=\"0.025995\"/>\n    </inertial>\n  </link>\n  <!-- sub-link\
+  \ defining coarse geometries of real robot's internal self-collision -->\n  <link\
+  \ name=\"panda_link2_sc\">\n  </link>\n  <!-- fixed joint between both sub-links\
+  \ -->\n  <joint name=\"panda_link2_sc_joint\" type=\"fixed\">\n    <origin rpy=\"\
+  0 0 0\"/>\n    <parent link=\"panda_link2\"/>\n    <child link=\"panda_link2_sc\"\
+  />\n  </joint>\n  <joint name=\"panda_joint2\" type=\"revolute\">\n    <origin rpy=\"\
+  -1.5707963267948966 0 0\" xyz=\"0 0 0\"/>\n    <parent link=\"panda_link1\"/>\n\
+  \    <child link=\"panda_link2\"/>\n    <axis xyz=\"0 0 1\"/>\n    <limit effort=\"\
+  87.0\" lower=\"-1.7628\" upper=\"1.7628\" velocity=\"2.175\"/>\n    <safety_controller\
+  \ k_position=\"100.0\" k_velocity=\"40.0\" soft_lower_limit=\"-1.7628\" soft_upper_limit=\"\
+  1.7628\"/>\n    <dynamics D=\"1\" K=\"7000\" damping=\"0.003\" friction=\"0.0\"\
+  \ mu_coulomb=\"0\" mu_viscous=\"16\"/>\n  </joint>\n  <!-- sub-link defining detailed\
+  \ meshes for collision with environment -->\n  <link name=\"panda_link3\">\n   \
+  \ <visual>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/link3.dae\"\
+  />\n      </geometry>\n    </visual>\n    <collision>\n      <geometry>\n      \
+  \  <mesh filename=\"package://franka_description/meshes/collision/link3.stl\"/>\n\
+  \      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0 0\"\
+  \ xyz=\"2.7518e-02 3.9252e-02 -6.6502e-02\"/>\n      <mass value=\"3.228604\"/>\n\
+  \      <inertia ixx=\"0.037242\" ixy=\"-0.004761\" ixz=\"-0.011396\" iyy=\"0.036155\"\
+  \ iyz=\"-0.012805\" izz=\"0.01083\"/>\n    </inertial>\n  </link>\n  <!-- sub-link\
+  \ defining coarse geometries of real robot's internal self-collision -->\n  <link\
+  \ name=\"panda_link3_sc\">\n  </link>\n  <!-- fixed joint between both sub-links\
+  \ -->\n  <joint name=\"panda_link3_sc_joint\" type=\"fixed\">\n    <origin rpy=\"\
+  0 0 0\"/>\n    <parent link=\"panda_link3\"/>\n    <child link=\"panda_link3_sc\"\
+  />\n  </joint>\n  <joint name=\"panda_joint3\" type=\"revolute\">\n    <origin rpy=\"\
+  1.5707963267948966 0 0\" xyz=\"0 -0.316 0\"/>\n    <parent link=\"panda_link2\"\
+  />\n    <child link=\"panda_link3\"/>\n    <axis xyz=\"0 0 1\"/>\n    <limit effort=\"\
+  87.0\" lower=\"-2.8973\" upper=\"2.8973\" velocity=\"2.175\"/>\n    <safety_controller\
+  \ k_position=\"100.0\" k_velocity=\"40.0\" soft_lower_limit=\"-2.8973\" soft_upper_limit=\"\
+  2.8973\"/>\n    <dynamics D=\"1\" K=\"7000\" damping=\"0.003\" friction=\"0.0\"\
+  \ mu_coulomb=\"0\" mu_viscous=\"16\"/>\n  </joint>\n  <!-- sub-link defining detailed\
+  \ meshes for collision with environment -->\n  <link name=\"panda_link4\">\n   \
+  \ <visual>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/link4.dae\"\
+  />\n      </geometry>\n    </visual>\n    <collision>\n      <geometry>\n      \
+  \  <mesh filename=\"package://franka_description/meshes/collision/link4.stl\"/>\n\
+  \      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0 0\"\
+  \ xyz=\"-5.317e-02 1.04419e-01 2.7454e-02\"/>\n      <mass value=\"3.587895\"/>\n\
+  \      <inertia ixx=\"0.025853\" ixy=\"0.007796\" ixz=\"-0.001332\" iyy=\"0.019552\"\
+  \ iyz=\"0.008641\" izz=\"0.028323\"/>\n    </inertial>\n  </link>\n  <!-- sub-link\
+  \ defining coarse geometries of real robot's internal self-collision -->\n  <link\
+  \ name=\"panda_link4_sc\">\n  </link>\n  <!-- fixed joint between both sub-links\
+  \ -->\n  <joint name=\"panda_link4_sc_joint\" type=\"fixed\">\n    <origin rpy=\"\
+  0 0 0\"/>\n    <parent link=\"panda_link4\"/>\n    <child link=\"panda_link4_sc\"\
+  />\n  </joint>\n  <joint name=\"panda_joint4\" type=\"revolute\">\n    <origin rpy=\"\
+  1.5707963267948966 0 0\" xyz=\"0.0825 0 0\"/>\n    <parent link=\"panda_link3\"\
+  />\n    <child link=\"panda_link4\"/>\n    <axis xyz=\"0 0 1\"/>\n    <limit effort=\"\
+  87.0\" lower=\"-3.0718\" upper=\"-0.0698\" velocity=\"2.175\"/>\n    <safety_controller\
+  \ k_position=\"100.0\" k_velocity=\"40.0\" soft_lower_limit=\"-3.0718\" soft_upper_limit=\"\
+  -0.0698\"/>\n    <dynamics D=\"1\" K=\"7000\" damping=\"0.003\" friction=\"0.0\"\
+  \ mu_coulomb=\"0\" mu_viscous=\"16\"/>\n  </joint>\n  <!-- sub-link defining detailed\
+  \ meshes for collision with environment -->\n  <link name=\"panda_link5\">\n   \
+  \ <visual>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/link5.dae\"\
+  />\n      </geometry>\n    </visual>\n    <collision>\n      <geometry>\n      \
+  \  <mesh filename=\"package://franka_description/meshes/collision/link5.stl\"/>\n\
+  \      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0 0\"\
+  \ xyz=\"-1.1953e-02 4.1065e-02 -3.8437e-02\"/>\n      <mass value=\"1.225946\"/>\n\
+  \      <inertia ixx=\"0.035549\" ixy=\"-0.002117\" ixz=\"-0.004037\" iyy=\"0.029474\"\
+  \ iyz=\"0.000229\" izz=\"0.008627\"/>\n    </inertial>\n  </link>\n  <!-- sub-link\
+  \ defining coarse geometries of real robot's internal self-collision -->\n  <link\
+  \ name=\"panda_link5_sc\">\n  </link>\n  <!-- fixed joint between both sub-links\
+  \ -->\n  <joint name=\"panda_link5_sc_joint\" type=\"fixed\">\n    <origin rpy=\"\
+  0 0 0\"/>\n    <parent link=\"panda_link5\"/>\n    <child link=\"panda_link5_sc\"\
+  />\n  </joint>\n  <joint name=\"panda_joint5\" type=\"revolute\">\n    <origin rpy=\"\
+  -1.5707963267948966 0 0\" xyz=\"-0.0825 0.384 0\"/>\n    <parent link=\"panda_link4\"\
+  />\n    <child link=\"panda_link5\"/>\n    <axis xyz=\"0 0 1\"/>\n    <limit effort=\"\
+  12.0\" lower=\"-2.8973\" upper=\"2.8973\" velocity=\"2.61\"/>\n    <safety_controller\
+  \ k_position=\"100.0\" k_velocity=\"40.0\" soft_lower_limit=\"-2.8973\" soft_upper_limit=\"\
+  2.8973\"/>\n    <dynamics D=\"1\" K=\"7000\" damping=\"0.003\" friction=\"0.0\"\
+  \ mu_coulomb=\"0\" mu_viscous=\"16\"/>\n  </joint>\n  <!-- sub-link defining detailed\
+  \ meshes for collision with environment -->\n  <link name=\"panda_link6\">\n   \
+  \ <visual>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/link6.dae\"\
+  />\n      </geometry>\n    </visual>\n    <collision>\n      <geometry>\n      \
+  \  <mesh filename=\"package://franka_description/meshes/collision/link6.stl\"/>\n\
+  \      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0 0\"\
+  \ xyz=\"6.0149e-02 -1.4117e-02 -1.0517e-02\"/>\n      <mass value=\"1.666555\"/>\n\
+  \      <inertia ixx=\"0.001964\" ixy=\"0.000109\" ixz=\"-0.001158\" iyy=\"0.004354\"\
+  \ iyz=\"0.000341\" izz=\"0.005433\"/>\n    </inertial>\n  </link>\n  <!-- sub-link\
+  \ defining coarse geometries of real robot's internal self-collision -->\n  <link\
+  \ name=\"panda_link6_sc\">\n  </link>\n  <!-- fixed joint between both sub-links\
+  \ -->\n  <joint name=\"panda_link6_sc_joint\" type=\"fixed\">\n    <origin rpy=\"\
+  0 0 0\"/>\n    <parent link=\"panda_link6\"/>\n    <child link=\"panda_link6_sc\"\
+  />\n  </joint>\n  <joint name=\"panda_joint6\" type=\"revolute\">\n    <origin rpy=\"\
+  1.5707963267948966 0 0\" xyz=\"0 0 0\"/>\n    <parent link=\"panda_link5\"/>\n \
+  \   <child link=\"panda_link6\"/>\n    <axis xyz=\"0 0 1\"/>\n    <limit effort=\"\
+  12.0\" lower=\"-0.0175\" upper=\"3.7525\" velocity=\"2.61\"/>\n    <safety_controller\
+  \ k_position=\"100.0\" k_velocity=\"40.0\" soft_lower_limit=\"-0.0175\" soft_upper_limit=\"\
+  3.7525\"/>\n    <dynamics D=\"1\" K=\"7000\" damping=\"0.003\" friction=\"0.0\"\
+  \ mu_coulomb=\"0\" mu_viscous=\"16\"/>\n  </joint>\n  <!-- sub-link defining detailed\
+  \ meshes for collision with environment -->\n  <link name=\"panda_link7\">\n   \
+  \ <visual>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/link7.dae\"\
+  />\n      </geometry>\n    </visual>\n    <collision>\n      <geometry>\n      \
+  \  <mesh filename=\"package://franka_description/meshes/collision/link7.stl\"/>\n\
+  \      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0 0\"\
+  \ xyz=\"1.0517e-02 -4.252e-03 6.1597e-02\"/>\n      <mass value=\"0.735522\"/>\n\
+  \      <inertia ixx=\"0.012516\" ixy=\"-0.000428\" ixz=\"-0.001196\" iyy=\"0.010027\"\
+  \ iyz=\"-0.000741\" izz=\"0.004815\"/>\n    </inertial>\n  </link>\n  <!-- sub-link\
+  \ defining coarse geometries of real robot's internal self-collision -->\n  <link\
+  \ name=\"panda_link7_sc\">\n  </link>\n  <!-- fixed joint between both sub-links\
+  \ -->\n  <joint name=\"panda_link7_sc_joint\" type=\"fixed\">\n    <origin rpy=\"\
+  0 0 0.7853981633974483\"/>\n    <parent link=\"panda_link7\"/>\n    <child link=\"\
+  panda_link7_sc\"/>\n  </joint>\n  <joint name=\"panda_joint7\" type=\"revolute\"\
+  >\n    <origin rpy=\"1.5707963267948966 0 0\" xyz=\"0.088 0 0\"/>\n    <parent link=\"\
+  panda_link6\"/>\n    <child link=\"panda_link7\"/>\n    <axis xyz=\"0 0 1\"/>\n\
+  \    <limit effort=\"12.0\" lower=\"-2.8973\" upper=\"2.8973\" velocity=\"2.61\"\
+  />\n    <safety_controller k_position=\"100.0\" k_velocity=\"40.0\" soft_lower_limit=\"\
+  -2.8973\" soft_upper_limit=\"2.8973\"/>\n    <dynamics D=\"1\" K=\"7000\" damping=\"\
+  0.003\" friction=\"0.0\" mu_coulomb=\"0\" mu_viscous=\"16\"/>\n  </joint>\n  <link\
+  \ name=\"panda_link8\"/>\n  <joint name=\"panda_joint8\" type=\"fixed\">\n    <origin\
+  \ rpy=\"0 0 0\" xyz=\"0 0 0.107\"/>\n    <parent link=\"panda_link7\"/>\n    <child\
+  \ link=\"panda_link8\"/>\n  </joint>\n  <joint name=\"panda_hand_joint\" type=\"\
+  fixed\">\n    <parent link=\"panda_link8\"/>\n    <child link=\"panda_hand\"/>\n\
+  \    <origin rpy=\"0 0 -0.7853981633974483\" xyz=\"0 0 0\"/>\n  </joint>\n  <!--\
+  \ sub-link defining detailed meshes for collision with environment -->\n  <link\
+  \ name=\"panda_hand\">\n    <visual>\n      <geometry>\n        <mesh filename=\"\
+  package://franka_description/meshes/visual/hand.dae\"/>\n      </geometry>\n   \
+  \ </visual>\n    <collision>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/collision/hand.stl\"\
+  />\n      </geometry>\n    </collision>\n    <inertial>\n      <origin rpy=\"0 0\
+  \ 0\" xyz=\"-0.01 0 0.03\"/>\n      <mass value=\"0.73\"/>\n      <inertia ixx=\"\
+  0.001\" ixy=\"0\" ixz=\"0\" iyy=\"0.0025\" iyz=\"0\" izz=\"0.0017\"/>\n    </inertial>\n\
+  \  </link>\n  <!-- sub-link defining coarse geometries of real robot's internal\
+  \ self-collision -->\n  <link name=\"panda_hand_sc\">\n  </link>\n  <!-- fixed joint\
+  \ between both sub-links -->\n  <joint name=\"panda_hand_sc_joint\" type=\"fixed\"\
+  >\n    <origin rpy=\"0 0 0\"/>\n    <parent link=\"panda_hand\"/>\n    <child link=\"\
+  panda_hand_sc\"/>\n  </joint>\n  <!-- Define the hand_tcp frame -->\n  <link name=\"\
+  panda_hand_tcp\"/>\n  <joint name=\"panda_hand_tcp_joint\" type=\"fixed\">\n   \
+  \ <origin rpy=\"0 0 0\" xyz=\"0 0 0.1034\"/>\n    <parent link=\"panda_hand\"/>\n\
+  \    <child link=\"panda_hand_tcp\"/>\n  </joint>\n  <link name=\"panda_leftfinger\"\
+  >\n    <visual>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/finger.dae\"\
+  />\n      </geometry>\n    </visual>\n    <!-- screw mount -->\n    <collision>\n\
+  \      <origin rpy=\"0 0 0\" xyz=\"0 18.5e-3 11e-3\"/>\n      <geometry>\n     \
+  \   <box size=\"22e-3 15e-3 20e-3\"/>\n      </geometry>\n    </collision>\n   \
+  \ <!-- cartriage sledge -->\n    <collision>\n      <origin rpy=\"0 0 0\" xyz=\"\
+  0 6.8e-3 2.2e-3\"/>\n      <geometry>\n        <box size=\"22e-3 8.8e-3 3.8e-3\"\
+  />\n      </geometry>\n    </collision>\n    <!-- diagonal finger -->\n    <collision>\n\
+  \      <origin rpy=\"0.5235987755982988 0 0\" xyz=\"0 15.9e-3 28.35e-3\"/>\n   \
+  \   <geometry>\n        <box size=\"17.5e-3 7e-3 23.5e-3\"/>\n      </geometry>\n\
+  \    </collision>\n    <!-- rubber tip with which to grasp -->\n    <collision>\n\
+  \      <origin rpy=\"0 0 0\" xyz=\"0 7.58e-3 45.25e-3\"/>\n      <geometry>\n  \
+  \      <box size=\"17.5e-3 15.2e-3 18.5e-3\"/>\n      </geometry>\n    </collision>\n\
+  \    <inertial>\n      <origin rpy=\"0 0 0\" xyz=\"0 0 0\"/>\n      <mass value=\"\
+  0.015\"/>\n      <inertia ixx=\"2.3749999999999997e-06\" ixy=\"0\" ixz=\"0\" iyy=\"\
+  2.3749999999999997e-06\" iyz=\"0\" izz=\"7.5e-07\"/>\n    </inertial>\n  </link>\n\
+  \  <link name=\"panda_rightfinger\">\n    <visual>\n      <origin rpy=\"0 0 3.141592653589793\"\
+  \ xyz=\"0 0 0\"/>\n      <geometry>\n        <mesh filename=\"package://franka_description/meshes/visual/finger.dae\"\
+  />\n      </geometry>\n    </visual>\n    <!-- screw mount -->\n    <collision>\n\
+  \      <origin rpy=\"0 0 0\" xyz=\"0 -18.5e-3 11e-3\"/>\n      <geometry>\n    \
+  \    <box size=\"22e-3 15e-3 20e-3\"/>\n      </geometry>\n    </collision>\n  \
+  \  <!-- cartriage sledge -->\n    <collision>\n      <origin rpy=\"0 0 0\" xyz=\"\
+  0 -6.8e-3 2.2e-3\"/>\n      <geometry>\n        <box size=\"22e-3 8.8e-3 3.8e-3\"\
+  />\n      </geometry>\n    </collision>\n    <!-- diagonal finger -->\n    <collision>\n\
+  \      <origin rpy=\"-0.5235987755982988 0 0\" xyz=\"0 -15.9e-3 28.35e-3\"/>\n \
+  \     <geometry>\n        <box size=\"17.5e-3 7e-3 23.5e-3\"/>\n      </geometry>\n\
+  \    </collision>\n    <!-- rubber tip with which to grasp -->\n    <collision>\n\
+  \      <origin rpy=\"0 0 0\" xyz=\"0 -7.58e-3 45.25e-3\"/>\n      <geometry>\n \
+  \       <box size=\"17.5e-3 15.2e-3 18.5e-3\"/>\n      </geometry>\n    </collision>\n\
+  \    <inertial>\n      <origin rpy=\"0 0 0\" xyz=\"0 0 0\"/>\n      <mass value=\"\
+  0.015\"/>\n      <inertia ixx=\"2.3749999999999997e-06\" ixy=\"0\" ixz=\"0\" iyy=\"\
+  2.3749999999999997e-06\" iyz=\"0\" izz=\"7.5e-07\"/>\n    </inertial>\n  </link>\n\
+  \  <joint name=\"panda_finger_joint1\" type=\"prismatic\">\n    <parent link=\"\
+  panda_hand\"/>\n    <child link=\"panda_leftfinger\"/>\n    <origin rpy=\"0 0 0\"\
+  \ xyz=\"0 0 0.0584\"/>\n    <axis xyz=\"0 1 0\"/>\n    <limit effort=\"100\" lower=\"\
+  0.0\" upper=\"0.04\" velocity=\"0.2\"/>\n    <dynamics damping=\"0.3\"/>\n  </joint>\n\
+  \  <joint name=\"panda_finger_joint2\" type=\"prismatic\">\n    <parent link=\"\
+  panda_hand\"/>\n    <child link=\"panda_rightfinger\"/>\n    <origin rpy=\"0 0 0\"\
+  \ xyz=\"0 0 0.0584\"/>\n    <axis xyz=\"0 -1 0\"/>\n    <limit effort=\"100\" lower=\"\
+  0.0\" upper=\"0.04\" velocity=\"0.2\"/>\n    <mimic joint=\"panda_finger_joint1\"\
+  />\n    <dynamics damping=\"0.3\"/>\n  </joint>\n  <link name=\"world\"/>\n  <joint\
+  \ name=\"world_joint\" type=\"fixed\">\n    <origin rpy=\"0 0 0\" xyz=\"0 0 0\"\
+  />\n    <parent link=\"world\"/>\n    <child link=\"panda_link0\"/>\n  </joint>\n\
+  \  <gazebo reference=\"panda_joint1\">\n    <!-- Needed for ODE to output external\
+  \ wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n  </gazebo>\n\
+  \  <transmission name=\"panda_joint1_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint1\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint1_motor\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint2\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint2_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint2\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint2_motor\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint3\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint3_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint3\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint3_motor\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint4\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint4_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint4\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint4_motor\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint5\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint5_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint5\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint5_motor\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint6\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint6_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint6\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint6_motor\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint7\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint7_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint7\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint7_motor\">\n      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint1\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint1_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint1\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint1_motor\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint2\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint2_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint2\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint2_motor\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint3\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint3_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint3\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint3_motor\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint4\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint4_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint4\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint4_motor\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint5\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint5_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint5\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint5_motor\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint6\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint6_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint6\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint6_motor\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint7\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint7_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint7\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint7_motor\">\n      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint1\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint1_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint1\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint1_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint2\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint2_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint2\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint2_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint3\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint3_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint3\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint3_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint4\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint4_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint4\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint4_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint5\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint5_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint5\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint5_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint6\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint6_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint6\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint6_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_joint7\">\n   \
+  \ <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_joint7_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_joint7\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_joint7_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <transmission name=\"panda_franka_state\"\
+  >\n    <type>franka_hw/FrankaStateInterface</type>\n    <joint name=\"panda_joint1\"\
+  >\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </joint>\n    <joint name=\"panda_joint2\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </joint>\n    <joint name=\"panda_joint3\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </joint>\n    <joint name=\"panda_joint4\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </joint>\n    <joint name=\"panda_joint5\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </joint>\n    <joint name=\"panda_joint6\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </joint>\n    <joint name=\"panda_joint7\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_motor1\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </actuator>\n    <actuator name=\"panda_motor2\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </actuator>\n    <actuator name=\"panda_motor3\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </actuator>\n    <actuator name=\"panda_motor4\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </actuator>\n    <actuator name=\"panda_motor5\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </actuator>\n    <actuator name=\"panda_motor6\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </actuator>\n    <actuator name=\"panda_motor7\">\n      <hardwareInterface>franka_hw/FrankaStateInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <transmission name=\"panda_franka_model\"\
+  >\n    <type>franka_hw/FrankaModelInterface</type>\n    <joint name=\"panda_joint1\"\
+  >\n      <role>root</role>\n      <hardwareInterface>franka_hw/FrankaModelInterface</hardwareInterface>\n\
+  \    </joint>\n    <joint name=\"panda_joint8\">\n      <role>tip</role>\n     \
+  \ <hardwareInterface>franka_hw/FrankaModelInterface</hardwareInterface>\n    </joint>\n\
+  \    <actuator name=\"panda_joint1_motor_root\">\n      <hardwareInterface>franka_hw/FrankaModelInterface</hardwareInterface>\n\
+  \    </actuator>\n    <actuator name=\"panda_joint8_motor_tip\">\n      <hardwareInterface>franka_hw/FrankaModelInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_finger_joint1\"\
+  >\n    <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_finger_joint1_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_finger_joint1\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_finger_joint1_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_finger_joint2\"\
+  >\n    <!-- Needed for ODE to output external wrenches on joints -->\n    <provideFeedback>true</provideFeedback>\n\
+  \  </gazebo>\n  <transmission name=\"panda_finger_joint2_transmission\">\n    <type>transmission_interface/SimpleTransmission</type>\n\
+  \    <joint name=\"panda_finger_joint2\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </joint>\n    <actuator name=\"panda_finger_joint2_motor\">\n      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>\n\
+  \    </actuator>\n  </transmission>\n  <gazebo reference=\"panda_leftfinger\">\n\
+  \    <collision>\n      <max_contacts>10</max_contacts>\n      <surface>\n     \
+  \   <contact>\n          <ode>\n            <!-- These two parameter need application\
+  \ specific tuning. -->\n            <!-- Usually you want no \"snap out\" velocity\
+  \ and a generous -->\n            <!-- penetration depth to keep the grasping stable\
+  \ -->\n            <max_vel>0</max_vel>\n            <min_depth>0.001</min_depth>\n\
+  \          </ode>\n        </contact>\n        <friction>\n          <ode>\n   \
+  \         <mu>1.13</mu>\n            <mu2>1.13</mu2>\n          </ode>\n       \
+  \ </friction>\n        <bounce/>\n      </surface>\n    </collision>\n  </gazebo>\n\
+  \  <gazebo reference=\"panda_rightfinger\">\n    <collision>\n      <max_contacts>10</max_contacts>\n\
+  \      <surface>\n        <contact>\n          <ode>\n            <!-- These two\
+  \ parameter need application specific tuning. -->\n            <!-- Usually you\
+  \ want no \"snap out\" velocity and a generous -->\n            <!-- penetration\
+  \ depth to keep the grasping stable -->\n            <max_vel>0</max_vel>\n    \
+  \        <min_depth>0.001</min_depth>\n          </ode>\n        </contact>\n  \
+  \      <friction>\n          <ode>\n            <mu>1.13</mu>\n            <mu2>1.13</mu2>\n\
+  \          </ode>\n        </friction>\n        <bounce/>\n      </surface>\n  \
+  \  </collision>\n  </gazebo>\n  <gazebo>\n    <plugin filename=\"libgazebo_ros_control.so\"\
+  \ name=\"gazebo_ros_control\">\n      <controlPeriod>0.001</controlPeriod>\n   \
+  \   <robotSimType>franka_gazebo/FrankaHWSim</robotSimType>\n    </plugin>\n    <self_collide>true</self_collide>\n\
+  \  </gazebo>\n  <!-- TCP = controlled link for the pick-and-place policy (panda_hand\
+  \ + 0.1034 z). -->\n  <link name=\"panda_TCP\"/>\n  <joint name=\"panda_TCP_joint\"\
+  \ type=\"fixed\">\n    <parent link=\"panda_hand\"/>\n    <child link=\"panda_TCP\"\
+  />\n    <origin rpy=\"0 0 0\" xyz=\"0 0 0.1034\"/>\n  </joint>\n  <!-- Keep panda_hand\
+  \ a STANDALONE Gazebo link so gazebo_ros_link_attacher can\n       weld the cube\
+  \ to it. By default Gazebo lumps fixed-joint links into the\n       parent (panda_link8);\
+  \ then the attacher can't find 'panda_hand' and\n       SEGFAULTS gzserver. Same\
+  \ trick the feeding rig uses for fork_tip. -->\n  <gazebo reference=\"panda_hand_joint\"\
+  >\n    <disableFixedJointLumping>true</disableFixedJointLumping>\n    <preserveFixedJoint>true</preserveFixedJoint>\n\
+  \  </gazebo>\n  <!-- Static depth camera: front-facing, centred on the work line,\
+  \ looking back at\n       the robot/cube/box. Parented to `world` (= robot base\
+  \ in Gazebo). Pose derived\n       from the ManiSkill front static cam (base pos\
+  \ (0.90,-0.12,0.60), look\n       (0.30,-0.12,0.10)); rpy computed for the optical-frame\
+  \ convention below. -->\n  <joint name=\"camera_static_joint\" type=\"fixed\">\n\
+  \    <parent link=\"world\"/>\n    <child link=\"camera_static_link\"/>\n    <!--\
+  \ Aimed at the cube/box centroid with a steeper downward tilt so the small\n   \
+  \      cube sits in mid-frame, not the bottom rows where Gazebo depth is\n     \
+  \    unreliable (that emptied the cube target cloud). -->\n    <origin rpy=\"0 1.003\
+  \ 3.1416\" xyz=\"0.9 -0.19 0.62\"/>\n  </joint>\n  <link name=\"camera_static_link\"\
+  >\n    <visual>\n      <geometry>\n        <box size=\"0.025 0.09 0.02\"/>\n   \
+  \   </geometry>\n    </visual>\n    <inertial>\n      <mass value=\"0.1\"/>\n  \
+  \    <inertia ixx=\"1e-4\" ixy=\"0\" ixz=\"0\" iyy=\"1e-4\" iyz=\"0\" izz=\"1e-4\"\
+  />\n    </inertial>\n  </link>\n  <joint name=\"camera_static_optical_joint\" type=\"\
+  fixed\">\n    <parent link=\"camera_static_link\"/>\n    <child link=\"camera_static_optical_frame\"\
+  />\n    <origin rpy=\"-1.5707963267948966 0 -1.5707963267948966\" xyz=\"0 0 0\"\
+  />\n  </joint>\n  <link name=\"camera_static_optical_frame\"/>\n  <joint name=\"\
+  camera_wrist_joint\" type=\"fixed\">\n    <parent link=\"panda_TCP\"/>\n    <child\
+  \ link=\"camera_wrist_link\"/>\n    <origin rpy=\"0 -1.5707963267948966 0\" xyz=\"\
+  -0.052 0.035 -0.045\"/>\n  </joint>\n  <link name=\"camera_wrist_link\">\n    <visual>\n\
+  \      <geometry>\n        <box size=\"0.025 0.09 0.02\"/>\n      </geometry>\n\
+  \    </visual>\n    <inertial>\n      <mass value=\"0.1\"/>\n      <inertia ixx=\"\
+  1e-4\" ixy=\"0\" ixz=\"0\" iyy=\"1e-4\" iyz=\"0\" izz=\"1e-4\"/>\n    </inertial>\n\
+  \  </link>\n  <joint name=\"camera_wrist_optical_joint\" type=\"fixed\">\n    <parent\
+  \ link=\"camera_wrist_link\"/>\n    <child link=\"camera_wrist_optical_frame\"/>\n\
+  \    <origin rpy=\"-1.5707963267948966 0 -1.5707963267948966\" xyz=\"0 0 0\"/>\n\
+  \  </joint>\n  <link name=\"camera_wrist_optical_frame\"/>\n  <gazebo reference=\"\
+  camera_static_link\">\n    <material>Gazebo/Red</material>\n    <sensor name=\"\
+  camera_static\" type=\"depth\">\n      <update_rate>12.0</update_rate>\n      <camera>\n\
+  \        <horizontal_fov>0.958</horizontal_fov>\n        <image>\n          <width>640</width>\n\
+  \          <height>480</height>\n          <format>R8G8B8</format>\n        </image>\n\
+  \        <clip>\n          <near>0.1</near>\n          <far>10.0</far>\n       \
+  \ </clip>\n      </camera>\n      <plugin filename=\"libgazebo_ros_openni_kinect.so\"\
+  \ name=\"static_camera_controller\">\n        <cameraName>camera_static</cameraName>\n\
+  \        <alwaysOn>true</alwaysOn>\n        <imageTopicName>color/image_raw</imageTopicName>\n\
+  \        <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>\n\
+  \        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>\n        <frameName>camera_static_optical_frame</frameName>\n\
+  \      </plugin>\n    </sensor>\n  </gazebo>\n  <gazebo reference=\"camera_wrist_link\"\
+  >\n    <material>Gazebo/Blue</material>\n    <sensor name=\"camera_wrist\" type=\"\
+  depth\">\n      <update_rate>12.0</update_rate>\n      <camera>\n        <horizontal_fov>0.973</horizontal_fov>\n\
+  \        <image>\n          <width>640</width>\n          <height>480</height>\n\
+  \          <format>R8G8B8</format>\n        </image>\n        <clip>\n         \
+  \ <near>0.01</near>\n          <far>10.0</far>\n        </clip>\n      </camera>\n\
+  \      <plugin filename=\"libgazebo_ros_openni_kinect.so\" name=\"wrist_camera_controller\"\
+  >\n        <cameraName>camera_wrist</cameraName>\n        <alwaysOn>true</alwaysOn>\n\
+  \        <imageTopicName>color/image_raw</imageTopicName>\n        <depthImageTopicName>aligned_depth_to_color/image_raw</depthImageTopicName>\n\
+  \        <cameraInfoTopicName>color/camera_info</cameraInfoTopicName>\n        <frameName>camera_wrist_optical_frame</frameName>\n\
+  \        <pointCloudCutoff>0.01</pointCloudCutoff>\n        <pointCloudCutoffMax>10.0</pointCloudCutoffMax>\n\
+  \        <updateRate>12.0</updateRate>\n      </plugin>\n    </sensor>\n  </gazebo>\n\
+  </robot>\n\n"
+rosdistro: 'noetic
+
+  '
+roslaunch:
+  uris:
+    host_132_207_24_13__36573: http://132.207.24.13:36573/
+rosversion: '1.17.4
+
+  '
+run_id: c9bdbd66-83d3-11f1-91f2-53f76b6661fc
+safe_generative_planner:
+  cbf_link_names:
+  - panda_link2
+  - panda_link3
+  - panda_link4
+  - panda_link5
+  - panda_link6
+  - panda_link7
+  - panda_hand
+  - panda_rightfinger
+  - panda_leftfinger
+  controlled_link: panda_TCP
+  enable_casf_correction: false
+  ensembler_buffer_size: 5
+  ensembler_decay: 1.5
+  fm_use_torch_compile: true
+  gripper_open_threshold: 0.03
+  log_trajectory_timing: false
+  merged_cloud_contains_fork: true
+  model_name: best_fm_model_pickplace_10D_1024_rdn.ckpt
+  planner_rate_hz: 3
+  single_shot: false
+  tcp_frame: panda_TCP
+  trajectory_retime_joint_speed: 0.3
+  trajectory_retime_joint_weights: 1 1 1 1 1 1 1
+  trajectory_retime_min_segment_fraction: 0.02
+  trajectory_retime_mode: joint_speed
+  trajectory_waypoint_rate_hz: 10.0
+  urdf_path: /home/flanthier/Github/src/vision_processing/urdf/panda_pickplace.xacro
+  use_temporal_ensembler: false
+  wait_for_cbf_ready: true
+sam3_sam2_pp:
+  box_prompt: white box
+  camera_frame: camera_static_optical_frame
+  cube_prompt: red cube
+  rgb_topic: /camera_static/color/image_raw
+singularity_warning_threshold: 0.0001
+table_description: "<?xml version=\"1.0\"?>\n<robot name=\"table\">\n  <!-- \n   \
+  \ Simple table: 80cm x 120cm surface, 75cm tall.\n    The base_link is at the BOTTOM\
+  \ of the table (floor level).\n    The surface is at z = 0.75m.\n  -->\n\n  <link\
+  \ name=\"base_link\">\n    <!-- Table top -->\n    <visual>\n      <origin xyz=\"\
+  0 0 0.735\" rpy=\"0 0 0\"/>\n      <geometry>\n        <box size=\"0.80 1.20 0.03\"\
+  />\n      </geometry>\n      <material name=\"wood\">\n        <color rgba=\"0.76\
+  \ 0.60 0.42 1\"/>\n      </material>\n    </visual>\n    <collision>\n      <origin\
+  \ xyz=\"0 0 0.735\" rpy=\"0 0 0\"/>\n      <geometry>\n        <box size=\"0.80\
+  \ 1.20 0.03\"/>\n      </geometry>\n    </collision>\n\n    <!-- 4 Legs \u2014 each\
+  \ has visual + collision -->\n    <!-- Front-left -->\n    <visual>\n      <origin\
+  \ xyz=\"-0.35 -0.55 0.36\" rpy=\"0 0 0\"/>\n      <geometry><box size=\"0.05 0.05\
+  \ 0.72\"/></geometry>\n      <material name=\"wood\"/>\n    </visual>\n    <collision>\n\
+  \      <origin xyz=\"-0.35 -0.55 0.36\" rpy=\"0 0 0\"/>\n      <geometry><box size=\"\
+  0.05 0.05 0.72\"/></geometry>\n    </collision>\n    <!-- Front-right -->\n    <visual>\n\
+  \      <origin xyz=\"0.35 -0.55 0.36\" rpy=\"0 0 0\"/>\n      <geometry><box size=\"\
+  0.05 0.05 0.72\"/></geometry>\n      <material name=\"wood\"/>\n    </visual>\n\
+  \    <collision>\n      <origin xyz=\"0.35 -0.55 0.36\" rpy=\"0 0 0\"/>\n      <geometry><box\
+  \ size=\"0.05 0.05 0.72\"/></geometry>\n    </collision>\n    <!-- Back-left -->\n\
+  \    <visual>\n      <origin xyz=\"-0.35 0.55 0.36\" rpy=\"0 0 0\"/>\n      <geometry><box\
+  \ size=\"0.05 0.05 0.72\"/></geometry>\n      <material name=\"wood\"/>\n    </visual>\n\
+  \    <collision>\n      <origin xyz=\"-0.35 0.55 0.36\" rpy=\"0 0 0\"/>\n      <geometry><box\
+  \ size=\"0.05 0.05 0.72\"/></geometry>\n    </collision>\n    <!-- Back-right -->\n\
+  \    <visual>\n      <origin xyz=\"0.35 0.55 0.36\" rpy=\"0 0 0\"/>\n      <geometry><box\
+  \ size=\"0.05 0.05 0.72\"/></geometry>\n      <material name=\"wood\"/>\n    </visual>\n\
+  \    <collision>\n      <origin xyz=\"0.35 0.55 0.36\" rpy=\"0 0 0\"/>\n      <geometry><box\
+  \ size=\"0.05 0.05 0.72\"/></geometry>\n    </collision>\n\n    <inertial>\n   \
+  \   <mass value=\"20.0\"/>\n      <origin xyz=\"0 0 0.375\"/>\n      <inertia ixx=\"\
+  1.0\" ixy=\"0\" ixz=\"0\" iyy=\"1.0\" iyz=\"0\" izz=\"1.0\"/>\n    </inertial>\n\
+  \  </link>\n\n  <gazebo reference=\"base_link\">\n    <material>Gazebo/Wood</material>\n\
+  \  </gazebo>\n  <gazebo>\n    <static>true</static>\n  </gazebo>\n</robot>\n"
+tau_ext_lowpass_filter: 1.0
+trajectory_executor:
+  anchor_mode: start
+  cbf_hold_threshold: 0.0
+  command_lookahead_time: 0.05
+  hold_current_until_trajectory: true
+  log_timing: false
+  out_topic: /planner/nominal_joint_command
+  progress_lag_limit_rad: 0.25
+  rate_hz: 100.0
+  use_progress_clock: true
+  velocity_out_topic: /planner/nominal_joint_velocity
+unpause_after_certified_cbf_hold:
+  command_type: none
+  controller_name: certified_cbf_velocity_controller
+  expected_models:
+  - table
+  - red_cube
+  - brown_box
+  - panda
+use_sim_time: true
+viapoint_detour:
+  activation_min_progress: 0.03
+  activation_stuck_time: 4.0
+  block_margin: 0.1
+  commit_clear_time: 20.0
+  enabled: false
+  input_topic: /planner/raw_nominal_trajectory
+  leg_margin: 0.09
+  limit_margin_rad: 0.05
+  obs_topic: /perception/cleaned_obstacles
+  output_topic: /planner/nominal_trajectory
+  publish_viz: true
+  retime_joint_speed: 0.3
+  sing_min_sigma: 0.04
+  stall_min_progress: 0.02
+  stall_tabu_ttl: 12.0
+  stall_timeout: 4.0
+  tcp_link: panda_TCP
+  urdf_path: /home/flanthier/Github/src/vision_processing/urdf/panda_pickplace.xacro
+  via_margin: 0.15

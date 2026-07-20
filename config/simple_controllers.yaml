@@ -49,6 +49,46 @@ joint_group_velocity_controller:
   max_abs_velocity: 0.70
   max_position_lead: 0.05
 
+# Opt-in hard-real-time consumer for the asynchronous GPU CBF.  Launch files
+# overwrite the certificate parameters below from the active CBF arguments so
+# the QP and reflex use one set of constants.
+certified_cbf_velocity_controller:
+  type: vision_processing/CertifiedCbfVelocityController
+  joints:
+    - panda_joint1
+    - panda_joint2
+    - panda_joint3
+    - panda_joint4
+    - panda_joint5
+    - panda_joint6
+    - panda_joint7
+  certified_command_topic: /cbf_safety/certified_command
+  command_timeout: 0.10
+  max_abs_velocity: 0.70
+  # Integrate the certified velocity through the gravity-holding position
+  # servo, matching the working runPP1030 controller configuration.
+  max_position_lead: 0.05
+  nominal_period: 0.001
+  tick_decay: 0.98
+  release_tau: 0.05
+  status_divisor: 20
+  timing_divisor: 10
+  # Epsilon calibration evaluates every 1 kHz tick and publishes only the
+  # worst projected mismatch in each 10-tick window (~100 Hz).
+  epsilon_sample_divisor: 10
+  epsilon_normal_alpha_threshold: 0.90
+  epsilon_motion_threshold: 0.0001
+  h_stop: 0.0
+  h_activate: 0.04
+  grad_lipschitz: 10.0
+  exp_kappa: 25.0
+  recovery_speed: 0.05
+  recovery_depth: 0.015
+  recovery_slack: 0.5
+  issf_epsilon: 0.025
+  issf_rho: 0.0
+  issf_veto_hold: 0.05
+
 gazebo_ros_control:
   pid_gains:
     panda_joint1: {p: 600.0, i: 0.0, d: 30.0, i_clamp: 10000.0}

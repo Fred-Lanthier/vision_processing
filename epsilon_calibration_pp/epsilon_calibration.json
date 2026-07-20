@@ -1,0 +1,402 @@
+{
+  "assumption": "The N seeded trajectories and the future trajectory are exchangeable; controller ticks within a trajectory are not treated as independent.",
+  "braking_execution": {
+    "epsilon": 0.1732343990768708,
+    "finite_target_bound_available": true,
+    "minimum_runs_for_target": 19,
+    "rank_coverage": 0.95,
+    "requested_order": 19,
+    "sample_count": 19,
+    "selected_order": 19,
+    "target_coverage": 0.95
+  },
+  "completed_utc": "2026-07-20T02:30:21.933730+00:00",
+  "global_execution": {
+    "epsilon": 0.1732343990768708,
+    "finite_target_bound_available": true,
+    "minimum_runs_for_target": 19,
+    "rank_coverage": 0.95,
+    "requested_order": 19,
+    "sample_count": 19,
+    "selected_order": 19,
+    "target_coverage": 0.95
+  },
+  "method": "trajectory-maximum conformal order statistic",
+  "normal_execution": {
+    "epsilon": 0.09188775711417614,
+    "finite_target_bound_available": true,
+    "minimum_runs_for_target": 19,
+    "rank_coverage": 0.95,
+    "requested_order": 19,
+    "sample_count": 19,
+    "selected_order": 19,
+    "target_coverage": 0.95
+  },
+  "observed_global_max": 0.1732343990768708,
+  "recommended_cbf_issf_epsilon": 0.1732343990768708,
+  "run_count": 19,
+  "runs": [
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_001_seed_1001/epsilon.bag",
+      "braking_max": 0.09301335639800527,
+      "braking_windows": 1273,
+      "capture_wall_seconds": 32.36066426988691,
+      "complete": true,
+      "epsilon_windows": 2303,
+      "global_max": 0.09301335639800527,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.05760363239358053,
+      "normal_windows": 1039,
+      "run": 1,
+      "seed": 1001
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_002_seed_1002/epsilon.bag",
+      "braking_max": 0.09995112297677719,
+      "braking_windows": 1486,
+      "capture_wall_seconds": 35.212198172695935,
+      "complete": true,
+      "epsilon_windows": 2538,
+      "global_max": 0.09995112297677719,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.03325051581185212,
+      "normal_windows": 1126,
+      "run": 2,
+      "seed": 1002
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_003_seed_1003/epsilon.bag",
+      "braking_max": 0.10543970504856907,
+      "braking_windows": 1299,
+      "capture_wall_seconds": 32.67076434660703,
+      "complete": true,
+      "epsilon_windows": 2255,
+      "global_max": 0.10543970504856907,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.050749050875869985,
+      "normal_windows": 978,
+      "run": 3,
+      "seed": 1003
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_004_seed_1005/epsilon.bag",
+      "braking_max": 0.09109516605485726,
+      "braking_windows": 1360,
+      "capture_wall_seconds": 32.69554603099823,
+      "complete": true,
+      "epsilon_windows": 2329,
+      "global_max": 0.09109516605485726,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.03694881621861616,
+      "normal_windows": 987,
+      "run": 4,
+      "seed": 1005
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_005_seed_1006/epsilon.bag",
+      "braking_max": 0.11253965345567792,
+      "braking_windows": 1337,
+      "capture_wall_seconds": 31.948855774477124,
+      "complete": true,
+      "epsilon_windows": 2332,
+      "global_max": 0.11253965345567792,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.06715678651884764,
+      "normal_windows": 1028,
+      "run": 5,
+      "seed": 1006
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_006_seed_1007/epsilon.bag",
+      "braking_max": 0.0697436732970665,
+      "braking_windows": 1301,
+      "capture_wall_seconds": 32.09001915156841,
+      "complete": true,
+      "epsilon_windows": 2312,
+      "global_max": 0.0697436732970665,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.04809264469445484,
+      "normal_windows": 1024,
+      "run": 6,
+      "seed": 1007
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_007_seed_1008/epsilon.bag",
+      "braking_max": 0.07791442752022239,
+      "braking_windows": 1506,
+      "capture_wall_seconds": 41.9322427213192,
+      "complete": true,
+      "epsilon_windows": 2913,
+      "global_max": 0.07791442752022239,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.03426725895609304,
+      "normal_windows": 1434,
+      "run": 7,
+      "seed": 1008
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_008_seed_1009/epsilon.bag",
+      "braking_max": 0.10734232017396313,
+      "braking_windows": 1246,
+      "capture_wall_seconds": 31.36229353584349,
+      "complete": true,
+      "epsilon_windows": 2321,
+      "global_max": 0.10734232017396313,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.050859465594329266,
+      "normal_windows": 1090,
+      "run": 8,
+      "seed": 1009
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_009_seed_1010/epsilon.bag",
+      "braking_max": 0.12551260820440507,
+      "braking_windows": 1141,
+      "capture_wall_seconds": 31.512266675941646,
+      "complete": true,
+      "epsilon_windows": 2256,
+      "global_max": 0.12551260820440507,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.038367571280484,
+      "normal_windows": 1124,
+      "run": 9,
+      "seed": 1010
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_010_seed_1011/epsilon.bag",
+      "braking_max": 0.08730267039165246,
+      "braking_windows": 1284,
+      "capture_wall_seconds": 32.189070601947606,
+      "complete": true,
+      "epsilon_windows": 2277,
+      "global_max": 0.08730267039165246,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.022463469548125593,
+      "normal_windows": 996,
+      "run": 10,
+      "seed": 1011
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_011_seed_1012/epsilon.bag",
+      "braking_max": 0.0833009797253417,
+      "braking_windows": 1429,
+      "capture_wall_seconds": 38.45355953741819,
+      "complete": true,
+      "epsilon_windows": 2695,
+      "global_max": 0.0833009797253417,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.046892545266387566,
+      "normal_windows": 1285,
+      "run": 11,
+      "seed": 1012
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_012_seed_1013/epsilon.bag",
+      "braking_max": 0.12015733032554785,
+      "braking_windows": 1418,
+      "capture_wall_seconds": 38.953511209227145,
+      "complete": true,
+      "epsilon_windows": 2631,
+      "global_max": 0.12015733032554785,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.04663404913221455,
+      "normal_windows": 1238,
+      "run": 12,
+      "seed": 1013
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_013_seed_1015/epsilon.bag",
+      "braking_max": 0.08049388166475095,
+      "braking_windows": 1253,
+      "capture_wall_seconds": 32.67405067477375,
+      "complete": true,
+      "epsilon_windows": 2313,
+      "global_max": 0.08049388166475095,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.04344160719977795,
+      "normal_windows": 1081,
+      "run": 13,
+      "seed": 1015
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_014_seed_1017/epsilon.bag",
+      "braking_max": 0.10995943202782567,
+      "braking_windows": 1354,
+      "capture_wall_seconds": 32.66563695855439,
+      "complete": true,
+      "epsilon_windows": 2342,
+      "global_max": 0.10995943202782567,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.042472290346129184,
+      "normal_windows": 1004,
+      "run": 14,
+      "seed": 1017
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_015_seed_1018/epsilon.bag",
+      "braking_max": 0.1152128603169982,
+      "braking_windows": 1278,
+      "capture_wall_seconds": 31.967439797706902,
+      "complete": true,
+      "epsilon_windows": 2231,
+      "global_max": 0.1152128603169982,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.09188775711417614,
+      "normal_windows": 968,
+      "run": 15,
+      "seed": 1018
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_016_seed_1019/epsilon.bag",
+      "braking_max": 0.1732343990768708,
+      "braking_windows": 1291,
+      "capture_wall_seconds": 33.059305461123586,
+      "complete": true,
+      "epsilon_windows": 2314,
+      "global_max": 0.1732343990768708,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.06465125615462491,
+      "normal_windows": 1039,
+      "run": 16,
+      "seed": 1019
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_017_seed_1021/epsilon.bag",
+      "braking_max": 0.11212977774790989,
+      "braking_windows": 1285,
+      "capture_wall_seconds": 32.55251220241189,
+      "complete": true,
+      "epsilon_windows": 2317,
+      "global_max": 0.11212977774790989,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.07263849389600989,
+      "normal_windows": 1041,
+      "run": 17,
+      "seed": 1021
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_018_seed_1024/epsilon.bag",
+      "braking_max": 0.10021042208031411,
+      "braking_windows": 1243,
+      "capture_wall_seconds": 34.05671275127679,
+      "complete": true,
+      "epsilon_windows": 2379,
+      "global_max": 0.10021042208031411,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.04823235355523795,
+      "normal_windows": 1148,
+      "run": 18,
+      "seed": 1024
+    },
+    {
+      "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_019_seed_1025/epsilon.bag",
+      "braking_max": 0.12007592279142987,
+      "braking_windows": 1251,
+      "capture_wall_seconds": 31.453465592116117,
+      "complete": true,
+      "epsilon_windows": 2297,
+      "global_max": 0.12007592279142987,
+      "grasp_states": [
+        "PRE_GRASP",
+        "CLOSING",
+        "GRASPED",
+        "RELEASED"
+      ],
+      "normal_max": 0.04722627601595965,
+      "normal_windows": 1063,
+      "run": 19,
+      "seed": 1025
+    }
+  ],
+  "warnings": []
+}

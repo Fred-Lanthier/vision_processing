@@ -48,11 +48,18 @@ class UnpauseAfterControllerHold:
             msg_type = JointTrajectory
         elif self.command_type in ("group_position", "group_velocity"):
             msg_type = Float64MultiArray
+        elif self.command_type == "none":
+            # A custom controller may establish its hold directly in
+            # starting().  In that case this node only waits for the scene and
+            # running controller before unpausing; no synthetic command is
+            # necessary (or type-safe).
+            msg_type = None
         else:
             raise ValueError(
                 f"Unsupported homing command_type: {self.command_type}")
 
-        self.pub = rospy.Publisher(self.command_topic, msg_type, queue_size=1)
+        self.pub = (None if msg_type is None else
+                    rospy.Publisher(self.command_topic, msg_type, queue_size=1))
 
     def wait_for_models(self):
         if not self.expected_models:
@@ -111,6 +118,8 @@ class UnpauseAfterControllerHold:
         return msg
 
     def publish_hold(self):
+        if self.pub is None:
+            return
         for _ in range(max(self.publish_repeats, 1)):
             msg = self.hold_message()
             self.pub.publish(msg)
@@ -147,7 +156,7 @@ class UnpauseAfterControllerHold:
             self.pause()
             return
 
-        rospy.loginfo("Publishing homing hold to %s.", self.command_topic)
+        rospy.loginfo("Establishing startup hold for %s.", self.controller_name)
         self.publish_hold()
         rospy.loginfo("Gazebo startup completed with the homing hold active.")
 

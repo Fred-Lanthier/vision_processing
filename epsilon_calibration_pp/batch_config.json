@@ -1,0 +1,16 @@
+{
+  "created_utc": "2026-07-20T01:49:57.141360+00:00",
+  "estimation_deferred_until_all_runs_exist": true,
+  "launch_arguments": [],
+  "launch_file": "green_cube_feeding_casf_pp.launch",
+  "max_active_wall_seconds": 45.0,
+  "max_attempts": 38,
+  "minimal_bag_topics": [
+    "/cbf_reflex/epsilon_sample",
+    "/pp_grasp/state"
+  ],
+  "package": "vision_processing",
+  "requested_runs": 19,
+  "seed_start": 1000,
+  "target_coverage": 0.95
+}

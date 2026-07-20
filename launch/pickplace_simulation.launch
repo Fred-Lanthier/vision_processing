@@ -12,6 +12,22 @@
   <!-- Pick-and-place uses the CBF velocity-controller path by default. -->
   <arg name="use_direct_group_position_controller" default="false"/>
   <arg name="use_direct_group_velocity_controller" default="true"/>
+  <!-- Replaces the Float64 velocity subscriber + Python reflex with the
+       atomic certified-command C++ controller.  Off by default until the
+       opt-in path has been validated against the Python reference. -->
+  <arg name="use_certified_cbf_controller" default="false"/>
+  <arg name="certified_max_joint_velocity" default="0.7"/>
+  <arg name="certified_h_stop" default="0.0"/>
+  <arg name="certified_h_activate" default="0.04"/>
+  <arg name="certified_grad_lipschitz" default="10"/>
+  <arg name="certified_exp_kappa" default="25.0"/>
+  <arg name="certified_recovery_speed" default="0.05"/>
+  <arg name="certified_recovery_depth" default="0.015"/>
+  <arg name="certified_issf_epsilon" default="0.025"/>
+  <arg name="certified_issf_rho" default="0.0"/>
+  <arg name="certified_epsilon_sample_divisor" default="10"/>
+  <arg name="certified_epsilon_normal_alpha_threshold" default="0.90"/>
+  <arg name="certified_epsilon_motion_threshold" default="0.0001"/>
   <arg name="launch_sam3_server" default="true"/>
   <arg name="obstacle_enabled" default="true"/>
   <arg name="obstacle_shape" default="cylinder"/>
@@ -120,6 +136,42 @@
   <rosparam if="$(eval arg('use_direct_group_position_controller') or arg('use_direct_group_velocity_controller'))"
             file="$(find vision_processing)/config/simple_controllers.yaml"
             command="load"/>
+  <param name="certified_cbf_velocity_controller/max_abs_velocity"
+         value="$(arg certified_max_joint_velocity)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/h_stop"
+         value="$(arg certified_h_stop)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/h_activate"
+         value="$(arg certified_h_activate)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/grad_lipschitz"
+         value="$(arg certified_grad_lipschitz)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/exp_kappa"
+         value="$(arg certified_exp_kappa)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/recovery_speed"
+         value="$(arg certified_recovery_speed)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/recovery_depth"
+         value="$(arg certified_recovery_depth)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/issf_epsilon"
+         value="$(arg certified_issf_epsilon)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/issf_rho"
+         value="$(arg certified_issf_rho)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/epsilon_sample_divisor"
+         value="$(arg certified_epsilon_sample_divisor)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/epsilon_normal_alpha_threshold"
+         value="$(arg certified_epsilon_normal_alpha_threshold)"
+         if="$(arg use_certified_cbf_controller)"/>
+  <param name="certified_cbf_velocity_controller/epsilon_motion_threshold"
+         value="$(arg certified_epsilon_motion_threshold)"
+         if="$(arg use_certified_cbf_controller)"/>
 
   <!-- franka_gripper = FrankaGripperSim (config in franka_hw_sim.yaml): serves the
        grasp/move actions and publishes real finger joint states. Spawned in every
@@ -133,9 +185,13 @@
         respawn="false" output="screen"
         args="franka_state_controller joint_group_position_controller franka_gripper"/>
   <node name="controller_spawner_direct_velocity" pkg="controller_manager" type="spawner"
-        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))"
+        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller') and not arg('use_certified_cbf_controller'))"
         respawn="false" output="screen"
         args="franka_state_controller joint_group_velocity_controller franka_gripper"/>
+  <node name="controller_spawner_certified_cbf" pkg="controller_manager" type="spawner"
+        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller') and arg('use_certified_cbf_controller'))"
+        respawn="false" output="screen"
+        args="franka_state_controller certified_cbf_velocity_controller franka_gripper"/>
 
   <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"
         respawn="true" output="screen"/>
@@ -153,13 +209,21 @@
   <node name="unpause_after_velocity_controller_hold"
         pkg="vision_processing" type="unpause_after_controller_hold.py"
         output="screen"
-        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))">
+        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller') and not arg('use_certified_cbf_controller'))">
     <param name="controller_name" value="joint_group_velocity_controller"/>
     <param name="command_topic" value="/joint_group_velocity_controller/command"/>
     <param name="command_type" value="group_velocity"/>
     <rosparam param="expected_models">[table, red_cube, brown_box, panda]</rosparam>
     <param name="publish_repeats" value="20"/>
     <param name="publish_period" value="0.05"/>
+  </node>
+  <node name="unpause_after_certified_cbf_hold"
+        pkg="vision_processing" type="unpause_after_controller_hold.py"
+        output="screen"
+        if="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller') and arg('use_certified_cbf_controller'))">
+    <param name="controller_name" value="certified_cbf_velocity_controller"/>
+    <param name="command_type" value="none"/>
+    <rosparam param="expected_models">[table, red_cube, brown_box, panda]</rosparam>
   </node>
   <node name="unpause_after_group_controller_hold"
         pkg="vision_processing" type="unpause_after_controller_hold.py"

@@ -1,0 +1,15 @@
+{
+  "method": "trajectory-maximum conformal order statistic, estimator v2 semantics (timeouts included)",
+  "trajectories": 26,
+  "completed": 19,
+  "timeout": 7,
+  "coverage": 0.9629629629629629,
+  "normal_epsilon": 0.09188775711417614,
+  "braking_epsilon": 0.1732343990768708,
+  "global_epsilon": 0.1732343990768708,
+  "deployed_epsilon": 0.025,
+  "normal_windows": 31094,
+  "normal_windows_exceeding_deployed": 647,
+  "braking_windows": 37417,
+  "braking_windows_exceeding_deployed": 3906
+}

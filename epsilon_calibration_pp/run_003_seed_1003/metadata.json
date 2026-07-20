@@ -1,0 +1,67 @@
+{
+  "accepted": true,
+  "attempt": 4,
+  "bag_summary": {
+    "bag": "/home/flanthier/Github/src/vision_processing/epsilon_calibration_pp/run_003_seed_1003/epsilon.bag",
+    "braking_max": 0.10543970504856907,
+    "braking_windows": 1299,
+    "capture_wall_seconds": 32.67076434660703,
+    "complete": true,
+    "epsilon_windows": 2255,
+    "global_max": 0.10543970504856907,
+    "grasp_states": [
+      "PRE_GRASP",
+      "CLOSING",
+      "GRASPED",
+      "RELEASED"
+    ],
+    "normal_max": 0.050749050875869985,
+    "normal_windows": 978,
+    "run": 3,
+    "seed": 1003
+  },
+  "capture_wall_seconds": 32.67076434660703,
+  "finished_utc": "2026-07-20T01:56:19.029999+00:00",
+  "launch_command": [
+    "roslaunch",
+    "vision_processing",
+    "green_cube_feeding_casf_pp.launch",
+    "gui:=false",
+    "launch_rviz:=false",
+    "use_cpp_certified_controller:=true",
+    "planner_fm_noise_seed:=1003"
+  ],
+  "max_active_wall_seconds": 45.0,
+  "minimal_bag_topics": [
+    "/cbf_reflex/epsilon_sample",
+    "/pp_grasp/state"
+  ],
+  "released_live": true,
+  "ros_parameters": {
+    "/cbf_safety_Bernstein/cbf_h_activate": 0.04,
+    "/cbf_safety_Bernstein/cbf_issf_epsilon": 0.0603,
+    "/cbf_safety_Bernstein/cbf_issf_rho": 0.0,
+    "/cbf_safety_Bernstein/cbf_link_names": [
+      "panda_link2",
+      "panda_link3",
+      "panda_link4",
+      "panda_link5",
+      "panda_link6",
+      "panda_link7",
+      "panda_hand",
+      "panda_rightfinger",
+      "panda_leftfinger"
+    ],
+    "/certified_cbf_velocity_controller/epsilon_motion_threshold": 0.0001,
+    "/certified_cbf_velocity_controller/epsilon_normal_alpha_threshold": 0.9,
+    "/certified_cbf_velocity_controller/epsilon_sample_divisor": 10,
+    "/certified_cbf_velocity_controller/epsilon_velocity_tau": 0.08,
+    "/certified_cbf_velocity_controller/h_activate": 0.04,
+    "/certified_cbf_velocity_controller/issf_epsilon": 0.0603,
+    "/certified_cbf_velocity_controller/issf_rho": 0.0,
+    "/safe_generative_planner/fm_noise_seed": 1003
+  },
+  "seed": 1003,
+  "stop_reason": "released",
+  "trajectory_started_utc": "2026-07-20T01:55:40.313680+00:00"
+}

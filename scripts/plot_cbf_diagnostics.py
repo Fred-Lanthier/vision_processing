@@ -45,6 +45,8 @@ REFLEX_STATUS_TOPIC = "/cbf_reflex/status"
 TIMING_NS = "/pipeline/timing/"
 PANDA_JOINTS = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4',
                 'panda_joint5', 'panda_joint6', 'panda_joint7']
+PANDA_FINGER_JOINTS = ['panda_finger_joint1', 'panda_finger_joint2']
+PANDA_KINEMATIC_JOINTS = PANDA_JOINTS + PANDA_FINGER_JOINTS
 
 
 def load_bag(path):
@@ -84,31 +86,70 @@ def load_bag(path):
     return t, series, t0
 
 
+def _interpolate_joint_samples(target_t, source_t, source_values):
+    """Interpolate asynchronous joint samples, keeping the last duplicate.
+
+    ROS may publish the arm and gripper in separate JointState messages.  This
+    aligns the measured fingers to each arm timestamp without ever inventing a
+    closed-gripper zero. Endpoint values are held, matching ``numpy.interp``.
+    """
+    target_t = np.asarray(target_t, dtype=np.float64)
+    source_t = np.asarray(source_t, dtype=np.float64)
+    source_values = np.asarray(source_values, dtype=np.float64)
+    if source_values.ndim == 1:
+        source_values = source_values[:, None]
+    if len(source_t) != len(source_values) or len(source_t) == 0:
+        raise ValueError("source joint samples must be non-empty and aligned")
+    order = np.argsort(source_t, kind="stable")
+    source_t = source_t[order]
+    source_values = source_values[order]
+    # Keep the last message at a duplicate timestamp.
+    keep = np.r_[source_t[1:] != source_t[:-1], True]
+    source_t = source_t[keep]
+    source_values = source_values[keep]
+    return np.stack([
+        np.interp(target_t, source_t, source_values[:, j])
+        for j in range(source_values.shape[1])
+    ], axis=1)
+
+
 def load_motion(path, t0):
     """Read joint trajectory and obstacle clouds, on the diagnostics timebase.
 
-    Returns (t_q, q, obs_t, obs_clouds) where obs_clouds is a list of [Ni,3]
-    arrays (base frame) and obs_t their timestamps. Used to recompute the true
-    geometric clearance offline. Empty arrays if the topics were not recorded.
+    Returns (t_q, q, obs_t, obs_clouds). When both finger joints were recorded,
+    q has columns [arm joints 1--7, finger joints 1--2] and therefore shape
+    [T,9]. Arm-only legacy bags return [T,7]; the pick-place clearance overlay
+    rejects those bags rather than silently assuming closed fingers.
     """
     import sensor_msgs.point_cloud2 as pc2
-    t_q, q, obs_t, obs = [], [], [], []
+    t_q, q_arm, t_finger, q_finger, obs_t, obs = [], [], [], [], [], []
     with rosbag.Bag(path) as bag:
         for topic, msg, t in bag.read_messages(
                 topics=[JOINTS_TOPIC, OBSTACLES_TOPIC]):
             ts = t.to_sec() - t0
             if topic == JOINTS_TOPIC:
                 pos = dict(zip(msg.name, msg.position))
+                if all(j in pos for j in PANDA_FINGER_JOINTS):
+                    t_finger.append(ts)
+                    q_finger.append([pos[j] for j in PANDA_FINGER_JOINTS])
                 if all(j in pos for j in PANDA_JOINTS):
                     t_q.append(ts)
-                    q.append([pos[j] for j in PANDA_JOINTS])
+                    q_arm.append([pos[j] for j in PANDA_JOINTS])
             else:
                 pts = np.array(list(pc2.read_points(
                     msg, field_names=("x", "y", "z"), skip_nans=True)),
                     dtype=np.float32)
                 obs_t.append(ts)
                 obs.append(pts.reshape(-1, 3))
-    return np.asarray(t_q), np.asarray(q), np.asarray(obs_t), obs
+    t_q = np.asarray(t_q, dtype=np.float64)
+    q_arm = np.asarray(q_arm, dtype=np.float64)
+    if len(t_q) and len(t_finger):
+        fingers_at_arm = _interpolate_joint_samples(
+            t_q, t_finger, q_finger)
+        q = np.concatenate((q_arm, fingers_at_arm), axis=1)
+    else:
+        q = q_arm
+    return t_q, q, np.asarray(obs_t), obs
 
 
 def load_extras(path, t0, velocity_source="fd"):
@@ -323,12 +364,12 @@ def print_bag_summary(path):
     print()
 
 
-def real_clearance_series(path, t0, t, dummy, samples_per_link):
+def real_clearance_series(path, t0, t, dummy, samples_per_link,
+                          robot_variant="pickplace"):
     """Offline true min distance robot->obstacles, aligned to diagnostics time t.
 
-    Returns an array the same length as t (NaN where it cannot be computed), or
-    None if the inputs/dependencies are missing. Best-effort: any failure logs a
-    warning and returns None so the rest of the figure still renders.
+    Returns ``(distance, details)`` aligned to t, or ``None`` if inputs are
+    unavailable. ``details['link']`` identifies the closest protected mesh.
     """
     try:
         import real_distance as rdist
@@ -337,15 +378,34 @@ def real_clearance_series(path, t0, t, dummy, samples_per_link):
             print("[real_distance] joint_states / persistent_obstacles missing "
                   "from bag; skipping real-clearance overlay.")
             return None
+        if q.ndim != 2 or q.shape[1] != len(PANDA_KINEMATIC_JOINTS):
+            print("[real_distance] both measured Panda finger joints are "
+                  "required for the physical pick-place overlay; this bag "
+                  f"contains q with shape {q.shape}. Skipping instead of "
+                  "assuming closed fingers.")
+            return None
         # Joint angles interpolated onto the diagnostics timestamps.
-        q_at_t = np.stack([np.interp(t, t_q, q[:, j]) for j in range(7)], axis=1)
+        q_at_t = np.stack([
+            np.interp(t, t_q, q[:, j]) for j in range(q.shape[1])
+        ], axis=1)
         # Nearest obstacle message per diagnostics step.
         obs_index = np.abs(obs_t[None, :] - t[:, None]).argmin(axis=1)
-        rc = rdist.RealClearance(samples_per_link=samples_per_link)
+        rc = rdist.RealClearance(
+            samples_per_link=samples_per_link,
+            robot_variant=robot_variant)
         print(f"[real_distance] protected meshes: {rc.found_links}")
-        d = rc.clearance(q_at_t, obs, obs_index)
+        d, details = rc.clearance(
+            q_at_t, obs, obs_index, return_details=True)
         d[dummy] = np.nan
-        return d
+        details["link"][dummy] = None
+        valid = np.isfinite(d)
+        if valid.any():
+            valid_indices = np.flatnonzero(valid)
+            min_index = valid_indices[np.argmin(d[valid])]
+            print("[real_distance] global minimum: "
+                  f"{d[min_index]:.4f} m on {details['link'][min_index]} "
+                  f"at t={t[min_index]:.2f} s")
+        return d, details
     except Exception as e:
         print(f"[real_distance] skipped real-clearance overlay: {e!r}")
         return None
@@ -402,6 +462,10 @@ def main():
     ap.add_argument("--real-samples", type=int, default=1500,
                     help="surface samples per protected link for the offline "
                          "true-clearance overlay on h_evolution")
+    ap.add_argument("--real-robot", choices=("pickplace", "feeding"),
+                    default="pickplace",
+                    help="robot geometry used by offline true clearance "
+                         "(default: pickplace with live Panda fingers)")
     ap.add_argument("--no-real-distance", action="store_true",
                     help="skip the offline true-clearance overlay on h_evolution")
     ap.add_argument("--measured-velocity", choices=("fd", "field"),
@@ -525,17 +589,27 @@ def main():
 
     # Offline ground-truth barrier value: true min distance of the protected
     # meshes to the FULL obstacle cloud, shifted by d_safe so it lives on the
-    # same axis as h. The gap to h_soft is the combined effect of the soft-min
-    # bias, the basis-SDF approximation and the runtime obstacle pruning.
+    # same axis as h. The gap to the learned barrier combines basis-SDF error,
+    # surface sampling and runtime obstacle pruning (plus soft-min bias in soft
+    # mode).
     h_real = None
+    real_details = None
     if not args.no_real_distance:
-        d_real = real_clearance_series(args.bag, t0, t, dummy, args.real_samples)
-        if d_real is not None:
+        real_result = real_clearance_series(
+            args.bag, t0, t, dummy, args.real_samples, args.real_robot)
+        if real_result is not None:
+            d_real, real_details = real_result
             h_real = d_real - args.d_safe
 
     # 1. Barrier value -----------------------------------------------------
+    hard_value_mode = (
+        "h_hard" in s
+        and np.isfinite(s["h_hard"]).any()
+        and np.nanmax(np.abs(s["h"] - s["h_hard"])) < 1e-6
+    )
+    learned_h_label = r"$h_{\min}$" if hard_value_mode else r"$h_{\mathrm{soft}}$"
     fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))
-    ax.plot(t, s["h"], color=ts.BLUE, label=r"$h_{\mathrm{soft}}$", lw=1.0)
+    ax.plot(t, s["h"], color=ts.BLUE, label=learned_h_label, lw=1.0)
     if h_real is not None:
         ax.plot(t, h_real, color=ts.ORANGE, lw=1.0,
                 label=r"$h_{\mathrm{réel}}$ (maillages, nuage complet)")
@@ -1138,6 +1212,11 @@ def main():
             summary["median_abs_gap_h_real_soft"] = float(np.median(gap))
             summary["p95_abs_gap_h_real_soft"] = float(np.percentile(gap, 95))
             summary["max_abs_gap_h_real_soft"] = float(np.max(gap))
+            valid_indices = np.flatnonzero(both)
+            min_index = valid_indices[np.argmin(h_real[both])]
+            if real_details is not None:
+                summary["min_h_real_link"] = str(
+                    real_details["link"][min_index])
     if "real_hdot" in s and not np.all(np.isnan(s["real_hdot"])):
         act = cbf_active & valid
         if act.any():

@@ -1,0 +1,19 @@
+{
+  "created_utc": "2026-07-20T03:20:32.041665+00:00",
+  "epsilon_estimator_version": 2,
+  "estimation_deferred_until_all_runs_exist": true,
+  "launch_arguments": [],
+  "launch_file": "green_cube_feeding_casf_pp.launch",
+  "max_active_wall_seconds": 45.0,
+  "max_attempts": 2,
+  "minimal_bag_topics": [
+    "/cbf_reflex/epsilon_sample",
+    "/pp_grasp/state"
+  ],
+  "package": "vision_processing",
+  "requested_runs": 1,
+  "seed_start": 2000,
+  "target_coverage": 0.5,
+  "task_timeout_is_valid_calibration_data": true,
+  "velocity_measurement": "ros_control JointHandle.getVelocity at tick k minus the applied command saved at tick k-1"
+}
