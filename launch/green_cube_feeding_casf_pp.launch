@@ -31,7 +31,28 @@
   <arg name="use_gt_cube" default="false"/>
   <arg name="pickplace_model_name" default="best_fm_model_pickplace_10D_1024_rdn.ckpt"/>
   <arg name="condition_num_points" default="1024"/>
+  <!-- Self-filter on the projector obstacle cloud. The fork pipeline only ever
+       carved a 5 mm shell around fork_tip.stl (fork_filter.py — a static
+       KD-tree, valid only because fork and wrist camera are both rigid on
+       panda_TCP). true applies the SAME shell to every protected link, with
+       each link's surface tree posed per frame from TF, so depth points landing
+       on the arm/hand/fingers are dropped before they can become obstacles.
+       Surfaces come from the URDF <collision> geometry on /robot_description.
+       Obstacle cloud only — the target cloud is the object being grasped.
+       NOTE for this launch: both projectors' obstacle outputs are remapped to
+       /perception/obstacles_{cube,box}, nothing subscribes to them (the CBF
+       cloud here is the synthetic static_cylinder_obstacle_pp one), and the
+       obstacle branch is subscriber-gated. So this is INERT until something
+       subscribes to those topics. -->
+  <arg name="projector_robot_self_filter" default="true"/>
+  <arg name="projector_robot_self_filter_margin" default="0.005"/>
   <arg name="planner_rate_hz" default="3"/>
+  <!-- Flow-matching ODE resolution: number of explicit Euler steps taken to
+       integrate the velocity field from t=0 (noise) to t=1 (trajectory chunk),
+       i.e. one velocity_net forward per step at t = 0, 1/n, ..., (n-1)/n.
+       Cost is linear in this (~15-20 ms per forward with fm_use_torch_compile),
+       so it trades chunk fidelity against the planner's replan latency. -->
+  <arg name="planner_n_pred" default="5"/>
   <!-- Exposed so epsilon-calibration runs are independent policy samples. -->
   <arg name="planner_fm_noise_seed" default="7"/>
   <!-- Via-point detour router (A/B toggle). true = insert a deterministic
@@ -210,7 +231,7 @@
        (replay_reflex_alpha.py). Strictly tightens the constraint (m > 0
        implies the certified condition a fortiori); costs 5 mm of standoff
        in tight corridors. -->
-  <arg name="cbf_constraint_margin" default="0.001"/>
+  <arg name="cbf_constraint_margin" default="0.00"/>
   <!-- Sampled-data (ZOH) QP margin, A/B toggle. true = the constraint bound
        is tightened by the STATE-DEPENDENT term of the sampled-data CBF
        condition (Breeden, Garg & Panagou, L-CSS 2022) instead of relying on
@@ -685,6 +706,10 @@
         <param name="enable_fork_sam3_mask" value="false"/>
         <param name="fork_sdf_filter" value="false"/>
         <param name="enable_fork_filter" value="false"/>
+        <param name="robot_self_filter" value="$(arg projector_robot_self_filter)"/>
+        <param name="robot_self_filter_margin" value="$(arg projector_robot_self_filter_margin)"/>
+        <!-- Same protected set as the CBF node below. -->
+        <rosparam param="robot_self_filter_links">['panda_link2', 'panda_link3', 'panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
         <remap from="/perception/target" to="/perception/target_cube"/>
         <remap from="/perception/obstacles" to="/perception/obstacles_cube"/>
   </node>
@@ -700,6 +725,9 @@
         <param name="enable_fork_sam3_mask" value="false"/>
         <param name="fork_sdf_filter" value="false"/>
         <param name="enable_fork_filter" value="false"/>
+        <param name="robot_self_filter" value="$(arg projector_robot_self_filter)"/>
+        <param name="robot_self_filter_margin" value="$(arg projector_robot_self_filter_margin)"/>
+        <rosparam param="robot_self_filter_links">['panda_link2', 'panda_link3', 'panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
         <remap from="/perception/target" to="/perception/target_box"/>
         <remap from="/perception/obstacles" to="/perception/obstacles_box"/>
   </node>
@@ -755,6 +783,7 @@
              CBF escape lift (cbf_escape_lift_gain) instead. -->
         <param name="enable_casf_correction" value="$(arg enable_casf_correction)"/>
         <param name="planner_rate_hz" value="$(arg planner_rate_hz)"/>
+        <param name="n_pred" value="$(arg planner_n_pred)"/>
         <param name="fm_noise_seed" value="$(arg planner_fm_noise_seed)"/>
         <param name="trajectory_retime_mode" value="$(arg trajectory_retime_mode)"/>
         <param name="trajectory_retime_joint_speed" value="$(arg trajectory_retime_joint_speed)"/>

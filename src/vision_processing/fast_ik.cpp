@@ -85,7 +85,7 @@ public:
         Eigen::VectorXd q = q_start;
         const double eps = 1e-5; // Tolérance
         const int IT_MAX = 50;   // Max itérations
-        const double damp = 1e-6; // Facteur de damping (DLS)
+        const double damp = 1e-3; // Facteur de damping (DLS)
 
         if (!target_pose_mat.allFinite() || !q_start.allFinite()) {
             return q_start;

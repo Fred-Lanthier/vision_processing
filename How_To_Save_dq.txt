@@ -47,13 +47,13 @@ Full PP recording (one line). Adds vs the old list:
 (topics that don't exist in a given config, e.g. pre_reflex with the reflex
 disabled, simply record nothing — the regex is safe either way)
 
-rosbag record --lz4 -O runPP1029.bag -e '/cbf_safety/diagnostics(_layout)?$|/cbf_safety/issf_monitor$|/cbf_safety/certified_command$|/
+rosbag record --lz4 -O runPP1034.bag -e '/cbf_safety/diagnostics(_layout)?$|/cbf_safety/issf_monitor$|/cbf_safety/certified_command$|/
   cbf_safety/pre_reflex_command$|/cbf_safety/reflex_state$|/cbf_reflex/status$|/joint_states$|/planner/nominal_joint_velocity$|/planner/
   nominal_joint_command$|/planner/(raw_)?nominal_trajectory$|/joint_group_velocity_controller/command$|/perception/persistent_obstacles$|/
   perception/cleaned_obstacles$|/pipeline/timing/.*'
 When it is done, run :
 
-python3 scripts/plot_cbf_diagnostics.py runPP1026.bag --csv for the plots of one bag
+python3 scripts/plot_cbf_diagnostics.py runPP1034.bag --csv for the plots of one bag
 
 For comparison : 
 

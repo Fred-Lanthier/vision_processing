@@ -15,6 +15,7 @@ from scipy.spatial.transform import Rotation
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from fork_filter import ForkFilter
+from robot_self_filter import RobotSelfFilter
 
 import rospkg
 _pkg = rospkg.RosPack().get_path('vision_processing')
@@ -62,6 +63,25 @@ class PointCloudProjectorNode:
         _fork_mesh_default = os.path.join(
             _pkg, "src/vision_processing/diffusion_model_train/fork_tip.stl")
         self._fork_mesh_path = rospy.get_param("~fork_mesh_path", _fork_mesh_default)
+
+        # Same 5 mm surface shell as the fork backup below, but around every
+        # protected link instead of only the fork. Obstacle cloud only: the
+        # target cloud is the object being grasped and must survive contact.
+        self.robot_self_filter = None
+        if bool(rospy.get_param("~robot_self_filter", False)):
+            robot_xml = rospy.get_param(
+                rospy.get_param("~robot_description_param", "robot_description"), "")
+            self.robot_self_filter = RobotSelfFilter(
+                robot_xml   = robot_xml,
+                link_names  = list(rospy.get_param(
+                    "~robot_self_filter_links",
+                    ['panda_link2', 'panda_link3', 'panda_link4', 'panda_link5',
+                     'panda_link6', 'panda_link7', 'panda_hand',
+                     'panda_rightfinger', 'panda_leftfinger'])),
+                margin      = float(rospy.get_param("~robot_self_filter_margin", 0.005)),
+                resolution  = float(rospy.get_param("~robot_self_filter_resolution", 0.0)),
+                logger      = lambda msg: rospy.loginfo("[robot_self_filter] " + msg),
+            )
 
         # Geometric fallback params (used only if SAM3 permanently unavailable)
         self.fork_filter = ForkFilter(
@@ -125,6 +145,23 @@ class PointCloudProjectorNode:
             self._geometric_mask_pending = True
             if self.log_events:
                 rospy.loginfo("✅ Point Cloud Projector ready. Geometric fork mask pending CameraInfo.")
+
+    def _link_pose_lookup(self, stamp):
+        """Return lookup(link) -> (R, t) placing a link in the CAMERA frame."""
+        def lookup(link):
+            try:
+                tr = self.tf_buffer.lookup_transform(
+                    self.camera_frame, link, stamp,
+                    rospy.Duration(self.tf_timeout))
+            except Exception as e:
+                rospy.logwarn_throttle(
+                    10, f"[robot_self_filter] TF {self.camera_frame}<-{link} "
+                        f"failed ({e}); link not filtered this frame.")
+                return None
+            t, r = tr.transform.translation, tr.transform.rotation
+            return (Rotation.from_quat([r.x, r.y, r.z, r.w]).as_matrix(),
+                    np.array([t.x, t.y, t.z]))
+        return lookup
 
     # ── Incoming data caches ───────────────────────────────────────────────────
 
@@ -366,7 +403,9 @@ class PointCloudProjectorNode:
             f"{(time.perf_counter() - total_start) * 1000.0:.2f} ms | "
             f"decode={stages['decode']:.2f} tf={stages['tf']:.2f} "
             f"target={stages['target']:.2f} obs_deproj={stages['obs_deproj']:.2f} "
-            f"fork_filter={stages['fork_filter']:.2f} publish={stages['publish']:.2f} ms | "
+            f"fork_filter={stages['fork_filter']:.2f} "
+            f"self_filter={stages['self_filter']:.2f} "
+            f"publish={stages['publish']:.2f} ms | "
             f"obs_in={obs_in} obs_pub={obs_pub} target_pub={target_pub}"
         )
 
@@ -396,6 +435,7 @@ class PointCloudProjectorNode:
             "target": 0.0,
             "obs_deproj": 0.0,
             "fork_filter": 0.0,
+            "self_filter": 0.0,
             "publish": 0.0,
         }
 
@@ -482,6 +522,14 @@ class PointCloudProjectorNode:
         if obs_pts_cam is not None and use_3d_fork_backup:
             obs_pts_cam = self.fork_filter.filter_camera_frame_points(obs_pts_cam)
         stages["fork_filter"] = self._elapsed_ms(time.perf_counter(), t_stage)
+        # ──────────────────────────────────────────────────────────────────────
+
+        # ── Same shell, every protected link (TF-posed, so it follows the arm) ─
+        t_stage = time.perf_counter()
+        if obs_pts_cam is not None and self.robot_self_filter is not None:
+            obs_pts_cam = self.robot_self_filter.filter_points(
+                obs_pts_cam, self._link_pose_lookup(stamp))
+        stages["self_filter"] = self._elapsed_ms(time.perf_counter(), t_stage)
         # ──────────────────────────────────────────────────────────────────────
 
         obs_pub = 0
