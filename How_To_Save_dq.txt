@@ -53,7 +53,7 @@ rosbag record --lz4 -O runPP1034.bag -e '/cbf_safety/diagnostics(_layout)?$|/cbf
   perception/cleaned_obstacles$|/pipeline/timing/.*'
 When it is done, run :
 
-python3 scripts/plot_cbf_diagnostics.py runPP1034.bag --csv for the plots of one bag
+python3 scripts/plot_cbf_diagnostics.py runPP1035.bag --csv for the plots of one bag
 
 For comparison : 
 

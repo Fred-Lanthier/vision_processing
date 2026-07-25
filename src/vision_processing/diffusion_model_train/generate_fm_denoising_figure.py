@@ -48,6 +48,8 @@ from Train_Fork_FlowMP_9D import FlowMatchingAgent       # noqa: E402
 from Data_Loader_Fork_FlowMP_9D import rotation_matrix_to_ortho6d  # noqa: E402
 
 OUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'thesis_fm_figures')
+# Données de la tâche feeding (déplacées hors du package sur le disque /data).
+DATA_ROOT = '/data/datas'
 CKPT_NAME = 'best_fm_model_9D_dynamics_1024.ckpt'
 
 # --- scene selection (self-contained: robot joints + scene + trajectory all
@@ -127,7 +129,7 @@ def build_sample(traj_id, state_idx, num_points=1024,
     the returned agent_pos/action live in the same fork-tip frame as the stored
     Merged_Fork conditioning cloud, and scene_world/curr_pos let the figure bring
     the captured scene and the FK robot into that frame too."""
-    base = os.path.join(_PKG, 'datas', 'Trajectories_preprocess', f'Trajectory_{traj_id}')
+    base = os.path.join(DATA_ROOT, 'Trajectories_preprocess', f'Trajectory_{traj_id}')
     states = json.load(open(os.path.join(base, f'trajectory_{traj_id}.json')))['states']
     assert state_idx - obs_horizon + 1 >= 0 and state_idx + pred_horizon <= len(states), \
         f'state_idx {state_idx} out of range for {len(states)} states'

@@ -1,0 +1,4 @@
+classe,support,mae,precision_pct,rappel_pct,f1_pct
+Pince ouverte,28800,0.008860,98.8866,99.2986,99.0922
+Pince fermée (saisie),35200,0.010965,99.4242,99.0852,99.2544
+Global,64000,0.010018,99.1823,99.1813,99.1814

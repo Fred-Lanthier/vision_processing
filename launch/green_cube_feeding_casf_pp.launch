@@ -405,7 +405,7 @@
   <!-- Raised with the h_activate reduction: band slope 0.5/0.04 = 12.5 1/s
        (see the TIGHTNESS comment at cbf_h_activate). -->
   <arg name="cbf_max_inward_speed" default="0.5"/>
-  <arg name="cbf_recovery_speed" default="0.05"/>
+  <arg name="cbf_recovery_speed" default="0.5"/>
   <arg name="cbf_recovery_depth" default="0.015"/>
   <!-- Raised from 0.3: the task-metric correction has larger joint-space
        norms, and the dynamic-hdot bound needs correction authority scaling
@@ -556,13 +556,18 @@
   <arg name="cbf_escape_probe_reentry_window" default="0.0"/>
   <!-- Exact hard-min barrier VALUE (Softmin keeps supplying the gradient):
        the PP obstacle clouds are dense/synthetic, so the Softmin crowding
-       bias otherwise under-reports clearance by ~alpha*log(N) = 9.2 mm.
-       REQUIRED by the certified reflex (assumption (iii) in
-       cbf_reflex_node.py): runPP1009 ran soft and the reflex braked 77% of
-       cycles (median alpha 0.37) on a phantom h~0.5 mm graze whose unbiased
-       clearance was ~9 mm; replayed hard, the same per-link constants brake
-       36% at median alpha 1.0 (replay_reflex_alpha.py). + time-varying CBF
-       tightening for a moving sphere (inert while sphere velocity is 0). -->
+       bias otherwise under-reports clearance by alpha*log(M_eff), bounded by
+       alpha*log(N) = 8.3 mm at alpha = 0.002 and cbf_graph_points = 64 (N is
+       per GROUP: the point set is partitioned robot | grasped target, so each
+       row's bound is smaller still). Required by the certified reflex
+       (assumption (iii) in cbf_reflex_node.py): under soft the reflex brakes
+       on phantom near-zero h values whose unbiased clearance is millimetres
+       larger, which the exact value removes.
+       NOTE: the hard value is what the QP band and every safety claim use.
+       h_corr = h_soft + alpha*log(N) is an ANALYSIS quantity only (it is the
+       single function whose value and gradient are consistent, hence the one
+       the invariance theorem applies to); it OVERSHOOTS the true hard min and
+       is optimistic, so it must never be used to state a clearance. -->
   <arg name="cbf_barrier_value_mode" default="hard"/>
   <arg name="cbf_dynamic_hdot_enabled" default="true"/>
   <arg name="cbf_dynamic_hdot_tau" default="0.05"/>

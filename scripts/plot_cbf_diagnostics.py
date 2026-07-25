@@ -521,7 +521,11 @@ def main():
     # the barrier was evaluated against it regardless of the bookkeeping.
     dummy |= np.nan_to_num(s["h"], nan=0.0) > 5.0
     if dummy.any():
-        for k in ("h", "h_corr", "lam", "constr_pre", "constr_final",
+        # h_hard / softmin_gap / h_food are barrier-derived too: they sit at the
+        # 100 m placeholder on these cycles exactly like h, and left unmasked
+        # the startup spike alone sets the y-range of the h figure.
+        for k in ("h", "h_corr", "h_hard", "softmin_gap", "h_food",
+                  "lam", "constr_pre", "constr_final",
                   "grad_h_norm", "cap_active", "recovery_used",
                   "grad_degenerate", "repair_applied", "min_obs_dist",
                   "cmd_hdot", "real_hdot", "real_constr", "h_rate",
@@ -610,6 +614,24 @@ def main():
     learned_h_label = r"$h_{\min}$" if hard_value_mode else r"$h_{\mathrm{soft}}$"
     fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))
     ax.plot(t, s["h"], color=ts.BLUE, label=learned_h_label, lw=1.0)
+    # HARD minimum of the barrier over the selected set. In soft-min mode the
+    # "h" field above is the softmin surrogate the QP actually constrains, which
+    # sits BELOW the true minimum by softmin_gap; h_hard is the value that says
+    # whether the robot was really clear. Drawn only when it differs from "h"
+    # (in multi_projected mode the two are the same series and one trace,
+    # already labelled h_min, is enough).
+    h_hard = np.asarray(s["h_hard"], dtype=float) if "h_hard" in s else None
+    if h_hard is not None and np.isfinite(h_hard).any() and not hard_value_mode:
+        ax.plot(t, h_hard, color=ts.GREY, lw=1.0,
+                label=r"$h_{\min}$ (min dur)")
+    # Bias-compensated barrier, on the same axis: h_corr is the same quantity as
+    # h with the soft-min crowding bias removed, so the three traces read as
+    # one family (surrogate contraint -> corrigé -> vrai minimum). Identical to
+    # h in multi_projected mode, where drawing it would only duplicate a curve.
+    h_corr = np.asarray(s["h_corr"], dtype=float) if "h_corr" in s else None
+    if (h_corr is not None and np.isfinite(h_corr).any()
+            and np.nanmax(np.abs(s["h"] - h_corr)) > 1e-6):
+        ax.plot(t, h_corr, color=ts.SKY, lw=1.0, label=r"$h_{\mathrm{corr}}$")
     if h_real is not None:
         ax.plot(t, h_real, color=ts.ORANGE, lw=1.0,
                 label=r"$h_{\mathrm{réel}}$ (maillages, nuage complet)")
@@ -619,6 +641,22 @@ def main():
     shade_active(ax, t, escape, ts.PURPLE, "échappement")
     ax.set_xlabel("t [s]")
     ax.set_ylabel("h [m]")
+    # Minima annotés : c'est le chiffre que porte une affirmation de sécurité.
+    stats_lines = []
+    if h_hard is not None and np.isfinite(h_hard).any():
+        stats_lines.append(r"min $h_{\min}$ = %.1f mm" % (np.nanmin(h_hard) * 1e3))
+    if not hard_value_mode:
+        stats_lines.append(r"min $h_{\mathrm{soft}}$ = %.1f mm"
+                           % (np.nanmin(s["h"]) * 1e3))
+    if (h_corr is not None and np.isfinite(h_corr).any()
+            and np.nanmax(np.abs(s["h"] - h_corr)) > 1e-6):
+        stats_lines.append(r"min $h_{\mathrm{corr}}$ = %.1f mm"
+                           % (np.nanmin(h_corr) * 1e3))
+    if h_real is not None and np.isfinite(h_real).any():
+        stats_lines.append(r"min $h_{\mathrm{réel}}$ = %.1f mm"
+                           % (np.nanmin(h_real) * 1e3))
+    if stats_lines:
+        ts.stats_box(ax, "\n".join(stats_lines), loc="upper left")
     ts.legend_top(ax)
     fig.tight_layout()
     ts.save(fig, outdir, "h_evolution")

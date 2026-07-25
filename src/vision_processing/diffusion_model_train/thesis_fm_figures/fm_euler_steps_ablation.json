@@ -1,0 +1,95 @@
+{
+  "configuration": {
+    "checkpoint": "best_fm_model_9D_dynamics_1024.ckpt",
+    "appareil": "NVIDIA GeForce RTX 3090",
+    "lot": 1,
+    "horizon_prediction": 16,
+    "precision": "fp32",
+    "velocity_net": "torch.compile(mode='reduce-overhead') — graphe CUDA",
+    "encodage": "encode_obs appele une seule fois par rollout (etage fm_encode)",
+    "etage_mesure": "fm_generation = somme des N passes velocity_net",
+    "note_synchronisation": "fm_generation_ms est synchronise (cout GPU reel, trace dans la figure). fm_generation_cpu_sans_sync_ms reproduit le compteur du noeud, qui n'appelle pas torch.cuda.synchronize() et ne mesure donc que la mise en file cote CPU : c'est la grandeur rapportee par la §5.6.",
+    "fenetres_validation": 60,
+    "predictions_par_fenetre": 3
+  },
+  "par_N": [
+    {
+      "N": 1,
+      "dtw_moyenne_cm": 0.9036626560176353,
+      "dtw_ecart_type_cm": 0.5262970839660545,
+      "dtw_mediane_cm": 0.8108683812573534,
+      "dtw_q25_cm": 0.44088651946477675,
+      "dtw_q75_cm": 1.250860563399465,
+      "fm_generation_ms": 1.8843511678278446,
+      "fm_generation_par_pas_ms": 1.8843511678278446,
+      "fm_generation_cpu_sans_sync_ms": 0.3118274360895157,
+      "fm_encode_ms": 0.3788679465651512,
+      "n_echantillons": 180
+    },
+    {
+      "N": 2,
+      "dtw_moyenne_cm": 0.865660772670454,
+      "dtw_ecart_type_cm": 0.5685589706427242,
+      "dtw_mediane_cm": 0.734108341229754,
+      "dtw_q25_cm": 0.36373837251515206,
+      "dtw_q75_cm": 1.2206712922738139,
+      "fm_generation_ms": 3.470625411719084,
+      "fm_generation_par_pas_ms": 1.735312705859542,
+      "fm_generation_cpu_sans_sync_ms": 0.8115554787218571,
+      "fm_encode_ms": 0.38147829473018646,
+      "n_echantillons": 180
+    },
+    {
+      "N": 3,
+      "dtw_moyenne_cm": 0.8388084109120495,
+      "dtw_ecart_type_cm": 0.5758863679970977,
+      "dtw_mediane_cm": 0.6821320624166871,
+      "dtw_q25_cm": 0.34051444897548094,
+      "dtw_q75_cm": 1.2190137935874812,
+      "fm_generation_ms": 5.17774123698473,
+      "fm_generation_par_pas_ms": 1.7259137456615765,
+      "fm_generation_cpu_sans_sync_ms": 0.8914751559495926,
+      "fm_encode_ms": 0.4961783625185489,
+      "n_echantillons": 180
+    },
+    {
+      "N": 5,
+      "dtw_moyenne_cm": 0.9107257957866293,
+      "dtw_ecart_type_cm": 0.6390197235272014,
+      "dtw_mediane_cm": 0.7617678679099504,
+      "dtw_q25_cm": 0.3719773936133166,
+      "dtw_q75_cm": 1.3595158570096193,
+      "fm_generation_ms": 8.691502828150988,
+      "fm_generation_par_pas_ms": 1.7383005656301975,
+      "fm_generation_cpu_sans_sync_ms": 1.6164539195597172,
+      "fm_encode_ms": 0.43246617540717125,
+      "n_echantillons": 180
+    },
+    {
+      "N": 10,
+      "dtw_moyenne_cm": 0.9304591885396966,
+      "dtw_ecart_type_cm": 0.6634566432625479,
+      "dtw_mediane_cm": 0.759548708044304,
+      "dtw_q25_cm": 0.3492554692482487,
+      "dtw_q75_cm": 1.3867348780385458,
+      "fm_generation_ms": 17.26732298731804,
+      "fm_generation_par_pas_ms": 1.726732298731804,
+      "fm_generation_cpu_sans_sync_ms": 2.891661264002323,
+      "fm_encode_ms": 0.38590483367443085,
+      "n_echantillons": 180
+    },
+    {
+      "N": 20,
+      "dtw_moyenne_cm": 0.9333241213704049,
+      "dtw_ecart_type_cm": 0.6296093797377402,
+      "dtw_mediane_cm": 0.7903920051622895,
+      "dtw_q25_cm": 0.3716938874139183,
+      "dtw_q75_cm": 1.4280888400288627,
+      "fm_generation_ms": 34.732079580426216,
+      "fm_generation_par_pas_ms": 1.7366039790213108,
+      "fm_generation_cpu_sans_sync_ms": 6.385652273893356,
+      "fm_encode_ms": 0.4456588253378868,
+      "n_echantillons": 180
+    }
+  ]
+}

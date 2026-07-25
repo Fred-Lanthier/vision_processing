@@ -1,0 +1,165 @@
+{
+  "tache": "feeding",
+  "checkpoint": "best_fm_model_9D_dynamics_1024.ckpt",
+  "pas_euler_compares": [
+    1,
+    2,
+    3,
+    5,
+    10,
+    20
+  ],
+  "point_de_fonctionnement": 5,
+  "graine_bruit_initial": 1234,
+  "multimodalite_xy": {
+    "scene_validation": 25,
+    "1": {
+      "dispersion_dtw_moyenne_cm": 0.6220354996416941,
+      "dispersion_dtw_mediane_cm": 0.6106196228272971,
+      "n_paires": 276
+    },
+    "2": {
+      "dispersion_dtw_moyenne_cm": 0.5628879123601725,
+      "dispersion_dtw_mediane_cm": 0.49627533670554513,
+      "n_paires": 276
+    },
+    "3": {
+      "dispersion_dtw_moyenne_cm": 0.6402702238502036,
+      "dispersion_dtw_mediane_cm": 0.5474333912957237,
+      "n_paires": 276
+    },
+    "5": {
+      "dispersion_dtw_moyenne_cm": 0.7620244316985998,
+      "dispersion_dtw_mediane_cm": 0.6639842153907978,
+      "n_paires": 276
+    },
+    "10": {
+      "dispersion_dtw_moyenne_cm": 0.8766291761141617,
+      "dispersion_dtw_mediane_cm": 0.7944047683253527,
+      "n_paires": 276
+    },
+    "20": {
+      "dispersion_dtw_moyenne_cm": 0.9476939503005312,
+      "dispersion_dtw_mediane_cm": 0.8692745280377308,
+      "n_paires": 276
+    }
+  },
+  "dispersion_vs_pas": {
+    "definition": "DTW moyenne par paires entre G generations issues de la meme observation, seule X_0 variant ; en cm",
+    "n_scenes": 40,
+    "n_generations_par_scene": 24,
+    "n_paires_par_scene": 276,
+    "par_N": {
+      "1": {
+        "mediane_cm": 0.5918151492663916,
+        "moyenne_cm": 0.6222395541044285,
+        "q25_cm": 0.459305221470103,
+        "q75_cm": 0.7875845323643436,
+        "min_cm": 0.4042980177950024,
+        "max_cm": 0.8676741618511721,
+        "ratio_a_expert": 0.5688426240436824,
+        "rugosite_mediane_cm": 0.806347270851645,
+        "rugosite_q25_cm": 0.7885873005831439,
+        "rugosite_q75_cm": 0.8370848390586059,
+        "rugosite_ratio_aux_demos": 6.886191102517642,
+        "longueur_relative_mediane": 1.6524748627582873,
+        "longueur_relative_q25": 1.1783252998348988,
+        "longueur_relative_q75": 3.1184966421320164
+      },
+      "2": {
+        "mediane_cm": 0.4387669526059766,
+        "moyenne_cm": 0.5050660641133193,
+        "q25_cm": 0.2864447511380816,
+        "q75_cm": 0.7286527253619381,
+        "min_cm": 0.22378602943336512,
+        "max_cm": 0.9488328136174768,
+        "ratio_a_expert": 0.42173530869127346,
+        "rugosite_mediane_cm": 0.4450735818001796,
+        "rugosite_q25_cm": 0.42668117348914325,
+        "rugosite_q75_cm": 0.4678341017139182,
+        "rugosite_ratio_aux_demos": 3.800920335131809,
+        "longueur_relative_mediane": 1.2712010366579116,
+        "longueur_relative_q25": 1.0429945425859475,
+        "longueur_relative_q75": 1.7524773892584302
+      },
+      "3": {
+        "mediane_cm": 0.44419915938500154,
+        "moyenne_cm": 0.5499888117488207,
+        "q25_cm": 0.2706767150885829,
+        "q75_cm": 0.8911389102791532,
+        "min_cm": 0.18320855911982376,
+        "max_cm": 1.1568997005517705,
+        "ratio_a_expert": 0.4269566531640516,
+        "rugosite_mediane_cm": 0.35690972063569437,
+        "rugosite_q25_cm": 0.3396028541204445,
+        "rugosite_q75_cm": 0.37650462647726646,
+        "rugosite_ratio_aux_demos": 3.0480025560795405,
+        "longueur_relative_mediane": 1.128420361874829,
+        "longueur_relative_q25": 0.9976438273630831,
+        "longueur_relative_q75": 1.439812951934629
+      },
+      "5": {
+        "mediane_cm": 0.5025866419082541,
+        "moyenne_cm": 0.6292372448879818,
+        "q25_cm": 0.29586994647187725,
+        "q75_cm": 1.027232533857975,
+        "min_cm": 0.16177343580165746,
+        "max_cm": 1.3374583980690666,
+        "ratio_a_expert": 0.48307770516990595,
+        "rugosite_mediane_cm": 0.2619146740346395,
+        "rugosite_q25_cm": 0.2429439335449408,
+        "rugosite_q75_cm": 0.27273306383039986,
+        "rugosite_ratio_aux_demos": 2.2367465770067394,
+        "longueur_relative_mediane": 1.0632193853758432,
+        "longueur_relative_q25": 0.941878360701258,
+        "longueur_relative_q75": 1.2842914854477259
+      },
+      "10": {
+        "mediane_cm": 0.5918559819748171,
+        "moyenne_cm": 0.738358629407809,
+        "q25_cm": 0.34874450839866294,
+        "q75_cm": 1.1745497930303082,
+        "min_cm": 0.17274905282635697,
+        "max_cm": 1.529107635168739,
+        "ratio_a_expert": 0.5688818717463415,
+        "rugosite_mediane_cm": 0.18089292312296146,
+        "rugosite_q25_cm": 0.1635977768727349,
+        "rugosite_q75_cm": 0.19049344013896577,
+        "rugosite_ratio_aux_demos": 1.544822290279602,
+        "longueur_relative_mediane": 1.0255590611545724,
+        "longueur_relative_q25": 0.884050761858704,
+        "longueur_relative_q75": 1.2643168056443705
+      },
+      "20": {
+        "mediane_cm": 0.658405197462903,
+        "moyenne_cm": 0.8233823178008454,
+        "q25_cm": 0.41631141383053627,
+        "q75_cm": 1.2754055540971851,
+        "min_cm": 0.20843132301522554,
+        "max_cm": 1.654724263895253,
+        "ratio_a_expert": 0.6328478422241457,
+        "rugosite_mediane_cm": 0.12674655556599898,
+        "rugosite_q25_cm": 0.10913999299208801,
+        "rugosite_q75_cm": 0.15572009056881955,
+        "rugosite_ratio_aux_demos": 1.082413291101622,
+        "longueur_relative_mediane": 1.012874659775704,
+        "longueur_relative_q25": 0.8129636856698969,
+        "longueur_relative_q75": 1.1483110297338834
+      }
+    },
+    "structure": {
+      "definition": "rugosite = ||p[k+1]-2p[k]+p[k-1]|| moyenne le long de l'horizon (cm) ; longueur_relative = longueur d'arc generee / longueur d'arc de la demonstration",
+      "rugosite_demonstrations_mediane_cm": 0.1170962668400008,
+      "longueur_demonstrations_mediane_cm": 5.542284820103891
+    },
+    "experts": {
+      "definition": "DTW moyenne par paires sur G segments de demonstration de configurations comparables (G-1 plus proches voisins dans global_cond standardise, trajectoire d'origine exclue) ; en cm",
+      "n_scenes": 40,
+      "mediane_cm": 1.0403846762737405,
+      "moyenne_cm": 1.1284520972718828,
+      "q25_cm": 0.49260153971899534,
+      "q75_cm": 1.6930255748815413
+    },
+    "n_trajectoires_validation": 12
+  }
+}

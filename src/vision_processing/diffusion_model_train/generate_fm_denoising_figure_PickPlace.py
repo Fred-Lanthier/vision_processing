@@ -41,10 +41,11 @@ from scipy.spatial.transform import Rotation as R  # noqa: E402
 
 # --- 9D model + data (PICK-AND-PLACE) ----------------------------------------
 from Train_PickPlace import FlowMatchingAgent       # noqa: E402
-from Data_Loader_PickPlace import rotation_matrix_to_ortho6d  # noqa: E402
+from Data_Loader_PickPlace import (rotation_matrix_to_ortho6d,  # noqa: E402
+                                   get_gripper_open_label)
 
 OUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'thesis_pickplace_figures')
-CKPT_NAME = 'best_fm_model_pickplace_9D_1024.ckpt'
+CKPT_NAME = 'best_fm_model_pickplace_10D_1024_rdn.ckpt'
 
 # --- scene selection ----------------------------------------------------------
 TRAJ_ID = 1            # recorded trajectory folder (datas/PickAndPlace_preprocess)
@@ -57,6 +58,7 @@ FM_SEED = 7            # noise seed
 ARROW_FRAC = 0.095     # flow arrow length as a fraction of the view extent
 VIEW_ZOOM = 1.06       # >1 pads the view box around the content
 SHELF_Y_THRESH = -0.20  # Merged_Fork points with y < this are the shelf (place target)
+GRIP = 9                # index of the gripper (open/close) dim in the 10D action
 
 # colours
 TOOL_GREY = '#8a929c'   # gripper + cube cluster (near origin)
@@ -79,9 +81,11 @@ def seed_everything(seed=42):
 # Self-contained sample (mirrors Data_Loader_PickPlace centering)
 # ==============================================================================
 
-def _pose9(pos, quat):
+def _pose10(pos, quat, gripper_open):
+    """Pose 10D : position(3) + ortho6d(6) + commande gripper(1)."""
     mat = R.from_quat(quat).as_matrix()
-    return np.concatenate([pos, rotation_matrix_to_ortho6d(mat)]).astype(np.float32)
+    return np.concatenate([pos, rotation_matrix_to_ortho6d(mat),
+                           [gripper_open]]).astype(np.float32)
 
 
 def _sample_to(pc, n):
@@ -105,8 +109,8 @@ def build_sample(traj_id, state_idx, num_points=1024,
 
     def pose_at(i):
         s = states[i]
-        return _pose9(np.array(s['fork_tip_position'], dtype=np.float32),
-                      s['fork_tip_orientation'])
+        return _pose10(np.array(s['fork_tip_position'], dtype=np.float32),
+                       s['fork_tip_orientation'], get_gripper_open_label(s))
 
     curr = np.array(states[state_idx]['fork_tip_position'], dtype=np.float32)
     obs = np.stack([pose_at(i) for i in range(state_idx - obs_horizon + 1, state_idx + 1)])
@@ -295,8 +299,12 @@ def fig_denoising_scene(model, sample, device,
     figure_name = f'{canonical_name}_{TRAJ_ID}_{STATE_IDX}'
     fig.savefig(os.path.join(OUTDIR, canonical_name + '.svg'))
     fig.savefig(os.path.join(OUTDIR, canonical_name + '.png'))
+    # Image 4 (Annexe I, optionnelle) : nom canonique demandé dans le mémoire.
+    fig.savefig(os.path.join(OUTDIR, 'fm_denoising_pick_place.svg'))
+    fig.savefig(os.path.join(OUTDIR, 'fm_denoising_pick_place.png'))
     ts.save(fig, OUTDIR, figure_name)
     print(f"  -> {os.path.join(OUTDIR, canonical_name)}.svg / .png")
+    print(f"  -> {os.path.join(OUTDIR, 'fm_denoising_pick_place')}.svg / .png")
     print(f"  -> {os.path.join(OUTDIR, figure_name)}.svg / .png")
 
 
@@ -314,7 +322,7 @@ def main():
     ckpt = torch.load(ckpt_path, map_location=device)
     stats = ckpt.get('stats', None)
     model = FlowMatchingAgent(
-        obs_dim=9, action_dim=9, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON,
+        obs_dim=10, action_dim=10, obs_horizon=OBS_HORIZON, pred_horizon=PRED_HORIZON,
         encoder_output_dim=64, diffusion_step_embed_dim=256,
         down_dims=[256, 512, 1024], kernel_size=5, n_groups=8, stats=stats).to(device)
     weights = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt))

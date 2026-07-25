@@ -54,10 +54,10 @@ ARROW_LEN = 0.035        # m
 # two extend the shoulder/elbow (joints 2 and 4) so the arm silhouette — and the
 # SDF shell that follows it — is clearly different in each panel.
 POSES = [
-    ("(a)", V.DEFAULT_Q.copy()),
-    ("(b)", V.DEFAULT_Q + np.array([0.5, 0.55, 0.0, 1.05, 0.0, -0.55, 0.0], np.float32)),
+    V.DEFAULT_Q.copy(),
+    V.DEFAULT_Q + np.array([0.5, 0.55, 0.0, 1.05, 0.0, -0.55, 0.0], np.float32),
     # forward-leaning reach with an open elbow (a plausible reach-to-plate config)
-    ("(c)", V.DEFAULT_Q + np.array([0.3, 0.90, 0.0, 1.20, 0.0, -0.60, 0.0], np.float32)),
+    V.DEFAULT_Q + np.array([0.3, 0.90, 0.0, 1.20, 0.0, -0.60, 0.0], np.float32),
 ]
 
 
@@ -87,18 +87,22 @@ def compute_pose(core, rl, links, q7, args, dev):
     return dict(robot=robot_mesh, verts=verts, faces=faces, gpts=gpts, grad=grad)
 
 
-def draw_pose(ax, data):
+ROBOT_GREY = "#7d848d"   # neutral slate: reads as "hardware", never competes with
+SHELL = "#2E86C1"        # the hero blue of the learned shell nor the orange field
+
+
+def draw_pose(ax, data, bounds):
     # Robot surface (grey, ground truth) — full mesh, fairly opaque so it stays
     # visible through the translucent shell drawn over it.
-    rc = Poly3DCollection(data["robot"].triangles, facecolor="#9aa0a8",
-                          edgecolor="none", alpha=0.9)
+    rc = Poly3DCollection(data["robot"].triangles, facecolor=ROBOT_GREY,
+                          edgecolor="none", alpha=0.92)
     rc.set_rasterized(True)
     ax.add_collection3d(rc)
 
     # d_safe isosurface (blue hero shell) — the FULL closed marching-cubes
     # surface, kept translucent so the robot inside shows through.
-    sc = Poly3DCollection(data["verts"][data["faces"]], facecolor=ts.BLUE,
-                          edgecolor="none", alpha=0.13)
+    sc = Poly3DCollection(data["verts"][data["faces"]], facecolor=SHELL,
+                          edgecolor="none", alpha=0.16)
     sc.set_rasterized(True)
     ax.add_collection3d(sc)
 
@@ -106,20 +110,24 @@ def draw_pose(ax, data):
     p, g = data["gpts"], data["grad"]
     q = ax.quiver(p[:, 0], p[:, 1], p[:, 2], g[:, 0], g[:, 1], g[:, 2],
                   length=ARROW_LEN, normalize=True, color=ts.ORANGE,
-                  linewidth=0.7, arrow_length_ratio=0.45)
+                  linewidth=0.8, arrow_length_ratio=0.45)
     q.set_rasterized(True)
 
-    # Equal-aspect cube centred on the content.
-    pts = np.vstack([data["verts"], data["robot"].vertices])
-    ctr = (pts.min(0) + pts.max(0)) / 2.0
-    half = (pts.max(0) - pts.min(0)).max() / 2.0 * 1.02
+    # Bounds are SHARED by the three panels, so the arm is drawn at one scale and the
+    # poses stay comparable. The box aspect is the true extent rather than a cube: the
+    # arm is a diagonal band and a cube would spend most of each panel on empty space.
+    # Equal-aspect cube on a SHARED centre/half-extent so the three poses are drawn at
+    # one scale and stay comparable. A cube (not the raw extents) keeps the isometric
+    # foreshortening equal on every axis; zoom 1.4 fills the panel without the arm's
+    # rotated diagonal running past the edge (higher zooms crop it).
+    lo, hi = bounds
+    ctr = (lo + hi) / 2.0
+    half = (hi - lo).max() / 2.0
     ax.set_xlim(ctr[0] - half, ctr[0] + half)
     ax.set_ylim(ctr[1] - half, ctr[1] + half)
     ax.set_zlim(ctr[2] - half, ctr[2] + half)
-    # zoom>1 enlarges the 3D content within its axes box, removing most of the
-    # whitespace 3D axes leave around the plot.
     try:
-        ax.set_box_aspect((1, 1, 1), zoom=1.4)
+        ax.set_box_aspect((1, 1, 1), zoom=1.6)
     except TypeError:                  # older matplotlib without the zoom kwarg
         ax.set_box_aspect((1, 1, 1))
     ax.view_init(elev=ELEV, azim=AZIM)
@@ -156,21 +164,26 @@ def main():
     print(f"[sdf-iso] links: {', '.join(links)}")
     rl, _, core = V.build_sdf_stack(dev, links)
 
-    fig = plt.figure(figsize=(ts.TEXTWIDTH, 2.6))
-    for col, (label, q7) in enumerate(POSES):
-        print(f"[sdf-iso] pose {label} ...")
-        data = compute_pose(core, rl, links, np.asarray(q7, np.float32), args, dev)
+    poses = []
+    for col, q7 in enumerate(POSES):
+        print(f"[sdf-iso] pose {col + 1}/{len(POSES)} ...")
+        poses.append(compute_pose(core, rl, links, np.asarray(q7, np.float32), args, dev))
+
+    allpts = np.vstack([np.vstack([d["verts"], d["robot"].vertices]) for d in poses])
+    lo, hi = allpts.min(0), allpts.max(0)
+    pad = 0.02 * (hi - lo).max()
+    bounds = (lo - pad, hi + pad)
+
+    fig = plt.figure(figsize=(ts.TEXTWIDTH, 3.0))
+    for col, data in enumerate(poses):
         ax = fig.add_subplot(1, len(POSES), col + 1, projection="3d")
-        draw_pose(ax, data)
-        # panel label inside the panel (no title -> no gap to the legend)
-        ax.text2D(0.5, 0.96, fr"$\mathbf{{{label}}}$", transform=ax.transAxes,
-                  ha="center", va="top", fontsize=9)
+        draw_pose(ax, data, bounds)
 
     handles = [
-        Patch(facecolor="#b8b8b8", alpha=0.5, label="Surface du robot"),
-        Patch(facecolor=ts.BLUE, alpha=0.45,
+        Patch(facecolor=ROBOT_GREY, alpha=0.85, label="Surface du robot"),
+        Patch(facecolor=SHELL, alpha=0.45,
               label=r"Isosurface $d_{\mathrm{safe}}$ (%.1f cm)" % (args.level * 100)),
-        Line2D([], [], color=ts.ORANGE, lw=1.4,
+        Line2D([], [], color=ts.ORANGE, lw=1.6,
                label=r"Gradient $\nabla h$"),
     ]
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.0),
