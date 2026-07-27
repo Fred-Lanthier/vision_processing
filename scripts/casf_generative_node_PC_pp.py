@@ -107,6 +107,7 @@ if scripts_path not in sys.path:
     sys.path.insert(0, scripts_path)
 sys.path.append(os.path.join(pkg_path, 'src', 'vision_processing', 'diffusion_model_train'))
 from pipeline_timing import TimingPublisher
+from episode_control import EpisodeControl
 
 # Checkpoint families share the same U-Net architecture but use different
 # normalizers:
@@ -451,6 +452,16 @@ class CASFGenerativeNode:
         )
         self.last_pose_source_log = 0.0
 
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        # fm_noise_seed is the ONLY tier-1 knob here and it is genuinely free:
+        # initial_fm_noise() seeds inside torch.random.fork_rng per call, so
+        # sampling carries no RNG state between episodes and re-seeding is an
+        # attribute write. Nothing here touches the checkpoint or the compiled
+        # velocity net -- the torch.compile warmup must survive the campaign.
+        self.episode = EpisodeControl(
+            on_reset=self._episode_reset,
+            on_reconfigure=self._episode_reconfigure)
+
         # 4.5 Compile + CUDA-graph the FM velocity net (shrinks the planner's
         # GPU burst so the shared GPU is free for the 150 Hz CBF loop).
         self._setup_fm_compile()
@@ -461,6 +472,11 @@ class CASFGenerativeNode:
         rospy.Subscriber('/perception/persistent_obstacles', PointCloud2, self.obstacle_callback)
         rospy.Subscriber('/vision/merged_cloud', PointCloud2, self.cloud_callback)
         rospy.Subscriber('/cbf_safety/ready', Bool, self.cbf_ready_callback)
+        # Episode gate (ablation campaign). Latched by episode_director: False
+        # while an episode is being armed, True once it starts. Defaults True so
+        # the planner behaves exactly as before outside the campaign.
+        self.episode_active = True
+        rospy.Subscriber('/ablation/episode', Bool, self._episode_active_cb)
         from std_msgs.msg import Float32
         rospy.Subscriber('/vision/fork_food_distance', Float32, self.dist_callback)
         
@@ -558,6 +574,47 @@ class CASFGenerativeNode:
                 "FM torch.compile warmup failed (%s); using eager velocity_net.",
                 e)
             self.fm_agent.velocity_net = self._velocity_net_eager
+
+    # ----- episode lifecycle (ablation campaign; see episode_control.py) -----
+
+    def _episode_active_cb(self, msg):
+        active = bool(msg.data)
+        if active != self.episode_active:
+            rospy.loginfo("Episode gate -> %s", "ACTIVE" if active else "HELD")
+        self.episode_active = active
+
+    def _episode_reset(self):
+        """Clear the planner's per-episode state.
+
+        The ensembler buffer and the commit/publish latches are what make one
+        episode's plans visible to the next; the cached conditioning cloud is
+        dropped so the first plan of a new episode cannot be conditioned on the
+        previous scene."""
+        self.ensembler.buffer.clear()
+        self.plan_published = False
+        self.is_committed = False
+        self.plan_seq = 0
+        self.fork_food_distance = float('inf')
+        self.latest_cloud_gpu = None
+        self.latest_cloud_stamp = None
+        return "planner state cleared (ensembler, commit latch, cloud)"
+
+    def _episode_reconfigure(self):
+        """Re-read the tier-1 planner knobs. No graph, no reload, no warmup."""
+        changed = []
+        for name, cast in (("fm_noise_seed", int),
+                           ("planner_rate_hz", float),
+                           ("n_pred", int),
+                           ("use_temporal_ensembler", bool),
+                           ("trajectory_retime_joint_speed", float)):
+            if not rospy.has_param("~" + name):
+                continue
+            new = cast(rospy.get_param("~" + name))
+            attr = "n_pred" if name == "n_pred" else name
+            if getattr(self, attr, None) != new:
+                setattr(self, attr, new)
+                changed.append(f"{name}={new}")
+        return ("; ".join(changed)) if changed else "no change"
 
     def cbf_ready_callback(self, msg):
         if msg.data and not self.cbf_ready:
@@ -788,6 +845,16 @@ class CASFGenerativeNode:
             
         if self.is_committed:
             # We already published the open-loop strike, do not replan.
+            return
+
+        if not self.episode_active:
+            # Ablation campaign: the episode is being armed (world rewinding,
+            # arm homing). Planning through that would immediately drive the
+            # arm back off the home configuration -- measured 0.69 rad away
+            # from home within 10 s, because the policy simply resumes the
+            # task from wherever it believes it is. Always True outside the
+            # campaign, so this is inert in normal operation.
+            rospy.loginfo_throttle(5.0, "Episode not active; planner holding.")
             return
 
         if not self.cbf_ready:

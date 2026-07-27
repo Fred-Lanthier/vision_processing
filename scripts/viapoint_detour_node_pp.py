@@ -34,6 +34,13 @@ from visualization_msgs.msg import Marker
 
 from vision_processing import fast_ik_module
 
+import sys
+import rospkg
+_pkg_path = rospkg.RosPack().get_path('vision_processing')
+if _pkg_path not in sys.path:
+    sys.path.insert(0, _pkg_path)
+from episode_control import EpisodeControl
+
 
 # ---------------------------------------------------------------------------
 # Pure geometry helpers (unit-testable without ROS)
@@ -374,9 +381,28 @@ class ViapointDetourNode:
                          queue_size=1)
         rospy.Subscriber(self.in_topic, JointTrajectory, self._traj_cb,
                          queue_size=1)
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+
         rospy.loginfo("viapoint_detour: %s -> %s (enabled=%s, block_margin="
                       "%.2f, via_margin=%.2f)", self.in_topic, self.out_topic,
                       self.enabled, self.block_margin, self.via_margin)
+
+    def _episode_reset(self):
+        """Forget the committed homotopy class and the route tabu list.
+
+        Both are deliberate hysteresis (commit_clear_time, stall_tabu_ttl), so
+        they survive across plans by design -- and would survive across episodes
+        too, biasing which side the router picks in the next trial."""
+        route = self._via_name or "none"
+        self._vias = None
+        self._via_name = ""
+        self._last_blocked_t = 0.0
+        self._route_tabu = {}
+        self._stall_t0 = None
+        self._stall_best = None
+        self.cloud = None
+        return f"router uncommitted (was route {route}), tabu cleared"
 
     # ------------------------------------------------------------------ io
     def _obs_cb(self, msg):

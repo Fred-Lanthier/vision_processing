@@ -34,6 +34,7 @@ _pkg = rospkg.RosPack().get_path('vision_processing')
 if _pkg not in sys.path:
     sys.path.insert(0, _pkg)
 from pipeline_timing import TimingPublisher
+from episode_control import EpisodeControl
 
 
 # ── Shared helper ─────────────────────────────────────────────────────────────
@@ -342,6 +343,31 @@ class PersistentCloudNode:
                 self.moving_sphere_radius * 1000.0,
                 self.moving_sphere_num_points,
                 self.world_frame)
+
+        # Ablation campaign hook. This node holds the single most dangerous
+        # piece of cross-episode state in the campaign: the persistent voxel
+        # map IS the world model the barrier reads, so a map surviving into the
+        # next episode would silently shift every h* recorded afterwards --
+        # without any error, and in the direction that flatters the persistent
+        # arm. Inert unless ~enable_episode_control is set.
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+
+    def _episode_reset(self):
+        """Forget the accumulated world: voxel maps, live fallbacks, derived
+        estimates, and the moving-sphere clock."""
+        obs_n, tgt_n = self.obs_world.count(), self._tgt_world.count()
+        self.obs_world.clear()
+        self._tgt_world.clear()
+        self._live_obs = np.empty((0, 3), dtype=np.float32)
+        self._live_target = np.empty((0, 3), dtype=np.float32)
+        # Derived state fitted from the (now discarded) history.
+        self._tgt_centroid = None
+        self._floor_z_filtered = None
+        self._floor_z_stamp = None
+        self._last_pub_stamp = None
+        # Restart the synthetic sphere's trajectory at t=0 for the new episode.
+        self._moving_sphere_start_time = None
+        return f"voxel map cleared (obs {obs_n} -> 0, target {tgt_n} -> 0)"
 
     # ── Robot link position helper ────────────────────────────────────────────
 

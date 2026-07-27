@@ -182,6 +182,7 @@ catkin_install_python(PROGRAMS
   scripts/calibrate_issf_epsilon.py
   scripts/fork_grasp_node.py
   scripts/sam3_server.py
+  scripts/episode_director.py
   test_novelty/cbf_safety_node_Bernstein.py
   test_novelty/cbf_safety_node_Bernstein_multicbf.py
   test_novelty/sam3_sam2_node.py

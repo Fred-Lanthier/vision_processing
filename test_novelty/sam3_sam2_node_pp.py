@@ -39,6 +39,8 @@ if muggled_sam_path not in sys.path:
 if pkg_path not in sys.path:
     sys.path.insert(0, pkg_path)
 
+from episode_control import EpisodeControl
+
 try:
     from muggled_sam.make_sam import make_sam_from_state_dict
     from muggled_sam.demo_helpers.video_data_storage import SAMVideoObjectResults
@@ -94,6 +96,14 @@ class Sam3Sam2NodePP:
         self.latest_frame = None
         self.frame_lock = threading.Lock()
 
+        # Ablation campaign: dropping the SAM2 memory banks re-runs the SAM3
+        # prompt on the next frame (~1 SAM3 service call), which is the whole
+        # per-episode cost -- the SAM2 weights loaded above stay resident. The
+        # flag is serviced inside ai_worker so the tracker is never mutated
+        # mid-step. Inert unless ~enable_episode_control is set.
+        self._episode_reset_pending = False
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+
         rospy.loginfo("✅ Nœud DUAL-TARGET SAM3+SAM2 (cube + box) prêt.")
         self.ai_thread = threading.Thread(target=self.ai_worker)
         self.ai_thread.daemon = True
@@ -137,6 +147,11 @@ class Sam3Sam2NodePP:
         msg.header.frame_id = self.camera_frame
         obj.pub.publish(msg)
 
+    def _episode_reset(self):
+        """Drop both SAM2 memory banks; ai_worker re-prompts SAM3 next frame."""
+        self._episode_reset_pending = True
+        return "sam2 tracker memory dropped; SAM3 re-init on next frame"
+
     def ai_worker(self):
         rate = rospy.Rate(max(self.tracking_rate_hz, 0.1))
         while not rospy.is_shutdown():
@@ -147,6 +162,15 @@ class Sam3Sam2NodePP:
                 rate.sleep(); continue
             rgb_cv, frame_time = frame_data
             shape = (rgb_cv.shape[0], rgb_cv.shape[1])
+
+            if self._episode_reset_pending:
+                # Serviced here, between steps: dropping obj.mem underneath
+                # step_video_masking would tear the tracker state.
+                self._episode_reset_pending = False
+                for o in self.objects:
+                    o.mem = None
+                self.frame_idx = 0
+                self.next_init_time = 0.0
 
             if any(o.mem is None for o in self.objects):
                 if time.time() >= self.next_init_time:

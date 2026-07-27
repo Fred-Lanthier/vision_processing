@@ -31,6 +31,13 @@ import sensor_msgs.point_cloud2 as pc2
 from std_msgs.msg import String
 from std_srvs.srv import Trigger, TriggerResponse
 
+import sys
+import rospkg
+_pkg_path = rospkg.RosPack().get_path('vision_processing')
+if _pkg_path not in sys.path:
+    sys.path.insert(0, _pkg_path)
+from episode_control import EpisodeControl
+
 try:
     from franka_gripper.msg import (GraspAction, GraspGoal, GraspEpsilon,
                                     MoveAction, MoveGoal)
@@ -121,11 +128,39 @@ class GripperGraspNodePP:
         rospy.Service("/pp_grasp/grab", Trigger, lambda r: self._srv(self.start_grasp))
         rospy.Service("/pp_grasp/release", Trigger, lambda r: self._srv(self.release))
 
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+
         rospy.loginfo("gripper_grasp_node_pp ready: close on %s, weld near finger=%.3f, "
                       "then hold width=%.3f. force=%.1fN auto=%s.",
                       self.cube_model, self.contact_weld_finger, self.hold_width,
                       self.grasp_force, self.auto)
         rospy.Timer(rospy.Duration(1.0 / max(self.rate_hz, 1.0)), self._tick)
+
+    def _episode_reset(self):
+        """Re-arm the grasp FSM: detach the weld and reopen the hand.
+
+        The weld is the piece that MUST be undone before the director moves the
+        cube: with red_cube still attached to panda_hand, a set_model_state on
+        the cube fights the attacher joint and the scene reset silently fails."""
+        was = self.state
+        if self._detach_srv is not None and self.state in ("GRASPED", "CLOSING"):
+            try:
+                self._detach_srv(self._attach_request())
+            except rospy.ServiceException as e:
+                rospy.logwarn("episode reset: detach failed (%s)", e)
+        if self._move_client is not None:
+            self._move_client.send_goal(
+                MoveGoal(width=self.open_width, speed=self.grasp_speed))
+        self._set_state("PRE_GRASP")
+        self.grasp_count = 0
+        self.release_count = 0
+        self.close_time = 0.0
+        self.grasp_time = 0.0
+        self.prev_tcp_z = None
+        self.cube_pts = None; self.cube_stamp = 0.0
+        self.box_pts = None;  self.box_stamp = 0.0
+        return f"grasp FSM re-armed ({was} -> PRE_GRASP, weld detached, hand open)"
 
     # -- franka_gripper action clients --------------------------------------
     def _connect_gripper(self):

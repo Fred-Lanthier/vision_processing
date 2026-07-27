@@ -32,6 +32,11 @@ from std_msgs.msg import Header, Float32, String
 import sensor_msgs.point_cloud2 as pc2
 from scipy.spatial.transform import Rotation as R
 
+_pkg_path = rospkg.RosPack().get_path('vision_processing')
+if _pkg_path not in sys.path:
+    sys.path.insert(0, _pkg_path)
+from episode_control import EpisodeControl
+
 # ---- Gripper geometry (panda_hand), TCP frame. Mirrors build_tool_cloud_tcp. ----
 TCP_FROM_HAND_Z = 0.1034
 FINGER_BASE_Z_HAND = 0.0584
@@ -118,8 +123,28 @@ class ConditionPcdPickPlace:
         rospy.Subscriber('/pp_grasp/state', String, self._grasp_state_cb)
 
         self.rate = rospy.Rate(30)
+
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+
         rospy.loginfo("🚀 Condition PCD PickPlace (gripper + cube + box) ready "
                       f"[cube <- {self.cube_topic}]")
+
+    def _episode_reset(self):
+        """Drop the cached conditioning clouds and the carried-cube snapshot.
+
+        cube_tcp_snapshot is the cube frozen in TCP frame at grasp time: left
+        alive it would follow the hand into the next episode and be merged into
+        the very cloud the policy is conditioned on."""
+        self.cube_cloud = None; self.cube_stamp = None
+        self.box_cloud = None;  self.box_stamp = None
+        self.cube_tcp_snapshot = None
+        self.grasp_state = "PRE_GRASP"
+        # Same generator seed as construction, so the subsampling of the
+        # conditioning cloud is reproducible per episode rather than dependent
+        # on how many episodes ran before it.
+        self.rng = np.random.default_rng(0)
+        return "conditioning clouds + carried-cube snapshot cleared"
 
     # -- callbacks --------------------------------------------------------- #
     def _read_xyz(self, msg):

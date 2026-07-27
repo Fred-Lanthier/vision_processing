@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import json
+import threading
 import torch
 import numpy as np
 import struct
@@ -34,6 +35,7 @@ rospack = rospkg.RosPack()
 pkg_path = rospack.get_path('vision_processing')
 sys.path.insert(0, pkg_path)
 from pipeline_timing import TimingPublisher
+from episode_control import EpisodeControl
 
 from third_party.SafeFlowMatcher.diffuser.models.rdf_cbf import RDF_CBF # Le solveur CBF est conservé
 from third_party.RDF.urdf_layer import URDFLayer # Le module de cinématique est conservé pour l'Autograd
@@ -1284,8 +1286,12 @@ class CBFSafetyNode:
         rospy.Subscriber('/planner/nominal_trajectory', JointTrajectory, self.trajectory_timing_callback)
         rospy.Subscriber('/planner/nominal_joint_command', Float64MultiArray, self.nominal_command_callback)
         rospy.Subscriber(self.nominal_velocity_topic, Float64MultiArray, self._nominal_vel_cb)
-        obs_topic = rospy.get_param("~obs_topic", "/perception/persistent_obstacles")
-        rospy.Subscriber(obs_topic, PointCloud2, self.obs_callback)
+        # Handle retained so the persistence ablation (persistent map vs
+        # instantaneous cloud) can switch the world model the shield reads
+        # WITHOUT restarting the node: see _resubscribe_obs_topic. The weights
+        # and the CUDA graph are independent of which topic feeds the cloud.
+        self.obs_topic = rospy.get_param("~obs_topic", "/perception/persistent_obstacles")
+        self._obs_sub = rospy.Subscriber(self.obs_topic, PointCloud2, self.obs_callback)
         if self.cbf_grasp_enabled:
             grasp_cloud_topic = rospy.get_param("~grasp_cloud_topic", "/fork_grasp/grasped_cloud")
             rospy.Subscriber(grasp_cloud_topic, PointCloud2, self._grasp_cloud_cb,
@@ -1296,9 +1302,17 @@ class CBFSafetyNode:
         if self.publish_controller_command:
             self.pos_cmd_pub = rospy.Publisher('/joint_group_position_controller/command', Float64MultiArray, queue_size=1)
         self.velocity_cmd_pub = None
+        # Topic is a param (default = the historical hardcoded name, so launch
+        # <remap> keeps working identically). Exposed because crossing the
+        # reflex arm -- Python reflex on /cbf_safety/pre_reflex_command vs the
+        # C++ certified controller -- is a remap in the launch, and remaps are
+        # frozen at process start: an episode-level A/B needs to re-create the
+        # publisher instead. See _episode_reconfigure.
+        self.velocity_command_topic = str(rospy.get_param(
+            "~velocity_command_topic", "/joint_group_velocity_controller/command"))
         if self.publish_velocity_controller_command:
             self.velocity_cmd_pub = rospy.Publisher(
-                '/joint_group_velocity_controller/command',
+                self.velocity_command_topic,
                 Float64MultiArray,
                 queue_size=1)
             rospy.on_shutdown(self._stop_velocity_controller)
@@ -1455,9 +1469,275 @@ class CBFSafetyNode:
             self.cbf_passthrough_when_inactive,
             self.publish_yellow_points,
             self.publish_debug_topics, self.profile_sync)
+        # Opt-in episode lifecycle hooks for the ablation campaign. Inert unless
+        # ~enable_episode_control is set, so the feeding launches carry this
+        # without being able to reach it.
+        # Staged for the control thread (see _run_in_control_thread): the loop
+        # in run() is the main thread, service callbacks are not, and mutating
+        # graph-resident buffers underneath a replay would corrupt a cycle.
+        self._episode_request = None
+        self._episode_result = None
+        self._episode_done = threading.Event()
+        # Escape hatch for the in-place CUDA re-capture. Default OFF: measured
+        # to leave the node degraded (see _episode_reconfigure_impl).
+        self.allow_unsafe_graph_rebuild = _bool_param(
+            "~allow_unsafe_graph_rebuild", False)
+        self.episode = EpisodeControl(
+            on_reset=lambda: self._run_in_control_thread(self._episode_reset_impl),
+            on_reconfigure=lambda: self._run_in_control_thread(
+                self._episode_reconfigure_impl))
+
         # /cbf_safety/ready is announced from the control loop once verified
         # joint states (and, unless waived, a first obstacle cloud) have been
         # received -- not here at the end of initialization.
+
+    # ---- episode lifecycle (ablation campaign; see episode_control.py) -----
+
+    # Parameters whose value is BAKED INTO the CUDA graph (as a Python constant
+    # inside a captured closure) or into the buffer shapes. Changing one needs a
+    # re-capture -- ~1-3 s, because URDFLayer and the nine Bernstein SDF models
+    # stay resident. Everything else in the node is read at use time.
+    _EPISODE_GRAPH_PARAMS = (
+        "barrier_alpha", "cbf_kappa", "cbf_recovery_kappa", "cbf_h_activate",
+        "cbf_active_constraints", "cbf_constraint_margin", "cbf_monitor_only",
+        "cbf_barrier_value_mode", "cbf_enforce_final_constraint",
+        "cbf_repair_all_rows", "cbf_repair_sweeps", "cbf_dynamic_hdot_enabled",
+        "cbf_sampled_data_margin", "cbf_issf_epsilon", "cbf_issf_rho",
+        "cbf_max_inward_speed", "cbf_recovery_speed", "cbf_recovery_depth",
+        "cbf_max_correction_speed", "cbf_projection_metric",
+    )
+
+    # Applied by direct attribute write; no capture involved.
+    _EPISODE_EAGER_PARAMS = (
+        "cbf_nullspace_clearance_gain", "cbf_nullspace_clearance_h_activate",
+        "cbf_escape_enabled", "cbf_escape_lift_gain", "cbf_tracking_feedback_mode",
+        "cbf_task_metric_lambda", "cbf_task_metric_rot_weight",
+        "cbf_diagnostics_decimation",
+    )
+
+    def _resubscribe_obs_topic(self, topic):
+        """Switch the world model the shield reads, live (persistence ablation).
+
+        Costs nothing but a resubscription: no weights and no graph depend on
+        which topic supplies the cloud. The stale cloud MUST be dropped with the
+        subscriber -- otherwise the first cycles after the switch filter against
+        the previous topic's points, i.e. exactly the quantity the persistence
+        ablation is measuring."""
+        if topic == self.obs_topic:
+            return False
+        if self._obs_sub is not None:
+            self._obs_sub.unregister()
+        self.obs_points = torch.empty((0, 3), dtype=torch.float32,
+                                      device=self.device)
+        self.obs_topic = topic
+        self._obs_sub = rospy.Subscriber(topic, PointCloud2, self.obs_callback)
+        return True
+
+    def _run_in_control_thread(self, fn, timeout=2.0):
+        """Execute ``fn`` at the top of a control cycle, not in the caller.
+
+        The 100 Hz loop lives in the main thread and replays a CUDA graph over
+        buffers this code mutates; running a reset from the service thread would
+        race it. The request is staged, the loop services it between cycles, and
+        the result comes back here.
+
+        The fallback matters for the campaign: the director pauses Gazebo before
+        resetting, which freezes /clock, so the loop parks in rospy.Rate.sleep()
+        and can no longer service anything. Executing inline is CORRECT in that
+        state -- a parked loop is not a racing loop -- and the timeout only has
+        to outlast the one in-flight cycle (~10 ms) that pausing can interrupt.
+        Hence seconds, not tens of seconds: this runs ~290 times per campaign."""
+        self._episode_done.clear()
+        self._episode_request = fn
+        if self._episode_done.wait(timeout):
+            result = self._episode_result
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        # Loop is not servicing requests; take it back and run inline.
+        self._episode_request = None
+        rospy.logwarn("episode hook: control loop idle after %.1fs, "
+                      "applying directly", timeout)
+        return fn()
+
+    def _service_episode_request(self):
+        """Called by the control loop between cycles. Cheap when idle."""
+        fn = self._episode_request
+        if fn is None:
+            return
+        self._episode_request = None
+        try:
+            self._episode_result = fn()
+        except BaseException as exc:                   # noqa: BLE001 - relayed
+            self._episode_result = exc
+        finally:
+            self._episode_done.set()
+
+    def _episode_reset_impl(self):
+        """Clear PER-EPISODE state. Runs ~290 times, so it must stay cheap.
+
+        Everything zeroed here is state that evolves during a run and would
+        otherwise leak into the next episode: the barrier/velocity filter
+        memories, the cross-cycle Dykstra multipliers, the escape gate and its
+        committed direction/tabu, the contact latch, and the cached obstacle
+        cloud. Model weights, the URDF layer and the CUDA graph are deliberately
+        untouched -- that is the entire point."""
+        # Filter memories (output low-pass / in-projection smoothing).
+        self._dq_safe_filtered = None
+        self.dq_nom_filtered = None
+        if getattr(self, "_graph_dq_filtered", None) is not None:
+            self._graph_dq_filtered.zero_()
+        # Cross-cycle Dykstra warm start: multipliers are graph-resident and
+        # would otherwise start the next episode mid-solve.
+        if getattr(self, "_dykstra_lam_links", None) is not None:
+            self._dykstra_lam_links.zero_()
+        if getattr(self, "_dykstra_lam_food", None) is not None:
+            self._dykstra_lam_food.zero_()
+        # Tracking / feedback memory.
+        self.last_nominal_q = None
+        self.last_nominal_tangent_dir = None
+        self.last_h_value_for_feedback = float("inf")
+        self.last_q_safe = None
+        self.last_cbf_position_delta = None
+        # Escape stack: gate, commitment and tabu are explicitly designed to
+        # persist across cycles (hysteresis), so they must be cleared here.
+        self._escape_was_active = False
+        self._escape_release_t = None
+        self._escape_release_e = None
+        self._escape_gate = 0.0
+        self._escape_probe_e = None
+        # Contact latch.
+        self._contact_counter = 0
+        self._contact_stopped = False
+        self._contact_q = None
+        # Cached world model.
+        self.obs_points = torch.empty((0, 3), dtype=torch.float32,
+                                      device=self.device)
+        # Timing bookkeeping so the first cycle does not see a huge dt.
+        self.last_time = rospy.get_time()
+        self.comp_times = []
+        self.preprocess_times = []
+        return "cbf state cleared (filters, duals, escape, contact, cloud)"
+
+    def _episode_reconfigure_impl(self):
+        """Re-read the ablation knobs from the param server and rebuild.
+
+        The param server stays the source of truth: the director writes params,
+        then calls this. Only the whitelisted knobs above are honoured -- an
+        unlisted parameter is reported back rather than silently ignored, so a
+        cell can never be recorded under a setting that never took effect."""
+        changed_graph, changed_eager, notes = [], [], []
+
+        for name in self._EPISODE_EAGER_PARAMS:
+            if not rospy.has_param("~" + name):
+                continue
+            new = rospy.get_param("~" + name)
+            old = getattr(self, name, None)
+            if isinstance(old, bool):
+                new = bool(new)
+            elif isinstance(old, float):
+                new = float(new)
+            elif isinstance(old, int):
+                new = int(new)
+            if new != old:
+                setattr(self, name, new)
+                changed_eager.append(f"{name}={new}")
+
+        for name in self._EPISODE_GRAPH_PARAMS:
+            if not rospy.has_param("~" + name):
+                continue
+            new = rospy.get_param("~" + name)
+            old = getattr(self, name, None)
+            if isinstance(old, bool):
+                new = bool(new)
+            elif isinstance(old, float):
+                new = float(new)
+            elif isinstance(old, int) and not isinstance(old, bool):
+                new = int(new)
+            if new != old:
+                setattr(self, name, new)
+                changed_graph.append(f"{name}={new}")
+
+        # Live world-model switch (persistence ablation): no capture needed.
+        if rospy.has_param("~obs_topic"):
+            if self._resubscribe_obs_topic(str(rospy.get_param("~obs_topic"))):
+                notes.append(f"obs_topic={self.obs_topic}")
+
+        # Reflex arm: the publisher is re-created because a launch <remap>
+        # cannot be changed in a running process.
+        if rospy.has_param("~velocity_command_topic"):
+            topic = str(rospy.get_param("~velocity_command_topic"))
+            if topic != self.velocity_command_topic and self.velocity_cmd_pub is not None:
+                self.velocity_cmd_pub.unregister()
+                self.velocity_command_topic = topic
+                self.velocity_cmd_pub = rospy.Publisher(
+                    topic, Float64MultiArray, queue_size=1)
+                notes.append(f"velocity_command_topic={topic}")
+
+        if changed_graph:
+            if not self.allow_unsafe_graph_rebuild:
+                # MEASURED UNSAFE (2026-07-26). An in-place re-capture is only
+                # ~1.2 s, but it is not correct: setup_cuda_graph and
+                # finalize_cuda_graph are called ~650 lines apart in __init__,
+                # with a great deal of buffer construction in between, and
+                # re-running just the two of them (while the preprocess thread
+                # is live on its own stream) leaves the node subtly degraded.
+                # Isolated back-to-back in the smoke test: 3/3 episode resets
+                # passed BEFORE a re-capture, 2/3 failed immediately after it,
+                # same scene and seeds. A silently-degraded barrier is the worst
+                # possible outcome in a SAFETY ablation, so refuse and let the
+                # caller restart the node (38 s, models reloaded, no risk).
+                raise RuntimeError(
+                    "graph parameters changed (" + ", ".join(changed_graph) +
+                    ") -- these are baked into the CUDA capture and require a "
+                    "node RESTART, not a live reconfigure. In-place re-capture "
+                    "is measurably unsafe; set ~allow_unsafe_graph_rebuild to "
+                    "override (not recommended).")
+            # The soft-min temperature lives on the barrier object as well as
+            # inside the captured closures, so it must be refreshed before the
+            # re-capture (this is the ablation_softmin variable).
+            self.barrier.alpha = self.barrier_alpha
+            self.barrier.d_safe = self.d_safe
+            self._rebuild_cuda_graph()
+
+        parts = []
+        if changed_graph:
+            parts.append("graph[" + ", ".join(changed_graph) + "]")
+        if changed_eager:
+            parts.append("eager[" + ", ".join(changed_eager) + "]")
+        if notes:
+            parts.append("live[" + ", ".join(notes) + "]")
+        return "; ".join(parts) if parts else "no change"
+
+    def _rebuild_cuda_graph(self):
+        """Re-capture the control-step graph with the current parameters.
+
+        ~1-3 s: the expensive startup work (URDFLayer, the nine Bernstein SDF
+        models, the voxel meshes) is NOT repeated -- only the capture is. The
+        derived gates below are recomputed exactly as __init__ computes them,
+        because both cbf_monitor_only and cbf_enforce_final_constraint decide
+        whether the graphed control step exists at all."""
+        t0 = time.time()
+        self._graph_control_step = (
+            _bool_param("~cbf_graphed_control_step", False)
+            and self.enable_cbf
+            and not self.cbf_monitor_only
+            and self.cbf_integrate_from_current
+            and self.cbf_command_dt > 0.0
+            and not self.publish_controller_command
+            and self.cbf_enforce_final_constraint
+        )
+        self._graphed_active_constraints = (
+            max(1, min(self.cbf_active_constraints, self.bernstein_core.K))
+            if self.cbf_solver_mode == "multi_graphed" else 0)
+        self.setup_cuda_graph(batch_size=1, n_points=self.cbf_graph_points)
+        self.finalize_cuda_graph()
+        self._episode_reset_impl()
+        rospy.logwarn(
+            "CBF graph re-captured in %.2f s (graphed_control_step=%s, "
+            "active_constraints=%d, monitor_only=%s)",
+            time.time() - t0, self._graph_control_step,
+            self.cbf_active_constraints, self.cbf_monitor_only)
 
     def _log_cuda_memory(self, label):
         if self.device.type != 'cuda' or not torch.cuda.is_available():
@@ -2180,6 +2460,11 @@ class CBFSafetyNode:
         warm_dykstra = use_dykstra and self.cbf_dykstra_warmstart
         dykstra_lam_links = torch.zeros(max(n_robot, 1), device=self.device)
         dykstra_lam_food = torch.zeros(1, device=self.device)
+        # Same tensors, also bound to self: they are graph-resident and carry
+        # multipliers ACROSS cycles, so they carry across episodes too unless
+        # an episode reset zeroes them (see _episode_reset).
+        self._dykstra_lam_links = dykstra_lam_links
+        self._dykstra_lam_food = dykstra_lam_food
         # Row export for the all-rows final repair (~cbf_repair_all_rows):
         # h / grad / env of every robot solve row, frozen from this cycle's
         # evaluate, so the repair can re-project the post-filter command
@@ -5062,6 +5347,12 @@ class CBFSafetyNode:
             torch.cuda.set_stream(self._ctrl_stream)
 
         while not rospy.is_shutdown():
+            # Episode reset / re-capture requests are serviced HERE, between
+            # cycles, so they never mutate graph-resident buffers underneath a
+            # replay. No-op (one attribute load) when nothing is pending.
+            if self._episode_request is not None:
+                self._service_episode_request()
+
             current_time = rospy.get_time()
             dt = current_time - self.last_time
             self.last_time = current_time

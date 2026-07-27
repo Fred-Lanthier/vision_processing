@@ -16,6 +16,13 @@ from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker
 
+import sys
+import rospkg
+_pkg_path = rospkg.RosPack().get_path('vision_processing')
+if _pkg_path not in sys.path:
+    sys.path.insert(0, _pkg_path)
+from episode_control import EpisodeControl
+
 
 def yaw_quat(yaw):
     return 0.0, 0.0, math.sin(0.5 * yaw), math.cos(0.5 * yaw)
@@ -343,6 +350,54 @@ class StaticObstaclePP:
                 self.moving_sphere_radius,
                 len(self._moving_sphere_offsets),
             )
+
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        self.episode = EpisodeControl(on_reset=self._episode_reset,
+                                      on_reconfigure=self._episode_reconfigure)
+
+    def _episode_reconfigure(self):
+        """Re-read the scenario knobs. Nothing here is compiled or captured, so
+        the whole tier-3 scene change is a param write plus this call."""
+        changed = []
+        for name, cast in (("moving_sphere_enabled", bool),
+                           ("moving_sphere_radius", float),
+                           ("moving_sphere_num_points", int),
+                           ("num_points", int)):
+            if not rospy.has_param("~" + name):
+                continue
+            new = cast(rospy.get_param("~" + name))
+            if getattr(self, name, None) != new:
+                setattr(self, name, new)
+                changed.append(f"{name}={new}")
+        for axis in ("x", "y", "z"):
+            for group, attr in (("initial", "moving_sphere_initial_position"),
+                                ("velocity", "moving_sphere_velocity")):
+                key = f"~moving_sphere_{group}_{axis}"
+                if not rospy.has_param(key):
+                    continue
+                idx = "xyz".index(axis)
+                new = float(rospy.get_param(key))
+                vec = getattr(self, attr)
+                if float(vec[idx]) != new:
+                    vec[idx] = new
+                    changed.append(f"moving_sphere_{group}_{axis}={new}")
+        if changed:
+            # Sphere geometry changed -> rebuild its offsets and restart
+            # its clock so the new configuration starts from t=0.
+            if self.moving_sphere_enabled:
+                self._moving_sphere_offsets = _fibonacci_sphere_offsets(
+                    self.moving_sphere_radius, self.moving_sphere_num_points)
+            self._moving_sphere_start_time = None
+        return ("; ".join(changed)) if changed else "no change"
+
+    def _episode_reset(self):
+        """Rewind the synthetic moving sphere to its initial position.
+
+        The sphere's pose is a function of elapsed time since its first tick, so
+        without this the next episode starts with the sphere wherever the last
+        one left it -- a different scenario under the same cell name."""
+        self._moving_sphere_start_time = None
+        return "moving sphere rewound to t=0"
 
     def _sphere_mirror_sdf(self):
         r = self.moving_sphere_radius

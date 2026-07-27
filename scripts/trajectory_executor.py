@@ -8,12 +8,21 @@ waypoint closest to the current robot state and anchoring the clock there.
 Publishes linearly-interpolated joint positions at a fixed rate.
 A monotone guard prevents backward jumps within a trajectory.
 """
+import os
+import sys
+
 import rospy
+import rospkg
 import numpy as np
 import threading
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
-from std_msgs.msg import Float64MultiArray, Float32MultiArray
+from std_msgs.msg import Bool, Float64MultiArray, Float32MultiArray
+
+_pkg_path = rospkg.RosPack().get_path('vision_processing')
+if _pkg_path not in sys.path:
+    sys.path.insert(0, _pkg_path)
+from episode_control import EpisodeControl
 
 JOINT_NAMES = [f'panda_joint{i}' for i in range(1, 8)]
 
@@ -87,9 +96,73 @@ class TrajectoryExecutor:
             self.velocity_out_topic, Float64MultiArray, queue_size=1)
         rospy.Timer(rospy.Duration(1.0 / self.rate_hz), self._control_loop)
 
+        # Episode gate (ablation campaign). Latched by episode_director: False
+        # while an episode is armed, True once it starts. Defaults True so the
+        # executor behaves exactly as before outside the campaign.
+        self.episode_active = True
+        # Explicit hold target used while the gate is closed (see _control_loop).
+        self._hold_pose = None
+        rospy.Subscriber('/ablation/episode', Bool, self._episode_active_cb,
+                         queue_size=1)
+        rospy.Subscriber('/ablation/hold_pose', Float64MultiArray,
+                         self._hold_pose_cb, queue_size=1)
+
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+
         if self.log_events:
             rospy.loginfo('trajectory_executor ready → %s and %s at %.0f Hz',
                           self.out_topic, self.velocity_out_topic, self.rate_hz)
+
+    def _hold_pose_cb(self, msg):
+        """Explicit hold target for the armed state (director publishes home)."""
+        if len(msg.data) >= 7:
+            with self._state_lock:
+                self._hold_pose = np.array(msg.data[:7], dtype=np.float64)
+
+    def _episode_active_cb(self, msg):
+        """Closing the gate also DROPS the in-flight plan.
+
+        Clearing the flag alone is not enough: `_traj_cb` would stop accepting
+        new plans, but the loop would keep tracking the one already loaded.
+        While gated, `_control_loop` re-latches the hold on the current pose
+        every tick, so the arm stays wherever the director puts it."""
+        active = bool(msg.data)
+        if active == self.episode_active:
+            return
+        self.episode_active = active
+        with self._state_lock:
+            self.traj_pts = None
+            self.t_start = None
+            self._min_t = 0.0
+            self._exec_t = 0.0
+            self._active_plan = None
+            if active:
+                # Episode starting: forget the armed-state target and re-latch
+                # on the (now homed) pose until the first plan arrives.
+                self._hold_pose = None
+                self.q_hold = None
+
+    def _episode_reset(self):
+        """Drop the active trajectory and rewind the progress clock.
+
+        Without this the executor would keep advancing the previous episode's
+        plan through the reset, commanding the arm away from the home
+        configuration the director just set."""
+        with self._state_lock:
+            self.traj_pts = None
+            self.t_start = None
+            self.q_hold = None
+            self._min_t = 0.0
+            self._exec_t = 0.0
+            self._active_plan = None
+            self._local_plan_seq = 0
+            self._last_control_stamp = None
+            self._holding_logged = False
+            self._logged_first_traj = False
+            self._logged_first_publish = False
+            self._cbf_h_value = float('inf')
+        return "executor trajectory + progress clock cleared"
 
     # ── callbacks ──────────────────────────────────────────────────────────
 
@@ -173,6 +246,11 @@ class TrajectoryExecutor:
 
     def _traj_cb(self, msg):
         if not msg.points:
+            return
+        if not self.episode_active:
+            # Ablation campaign: an episode is being armed. Accepting a plan
+            # here would resume tracking mid-reset and drive the arm off the
+            # home configuration. Inert outside the campaign (always True).
             return
         pts = [(p.time_from_start.to_sec(),
                 np.array(p.positions[:7], dtype=np.float64))
@@ -291,6 +369,27 @@ class TrajectoryExecutor:
     # ── control loop ───────────────────────────────────────────────────────
 
     def _control_loop(self, event):
+        if not self.episode_active:
+            # Episode being armed: command an EXPLICIT hold target, not "stay
+            # where you are". The director publishes the home configuration on
+            # /ablation/hold_pose after teleporting, so the downstream position
+            # feedback (cbf_kp) actively holds it. Two things this avoids:
+            #   * latching the PRE-reset pose at gate-close, which drives the
+            #     arm back out of home after the unpause;
+            #   * re-latching the current pose every tick, which zeroes the
+            #     position error and lets the arm settle wherever gravity puts
+            #     it (measured: j1/j3/j5 exact, every pitch joint sagging
+            #     0.04-0.07 rad, and the sag then locked in).
+            # Falls back to the latched pose if no target was published.
+            with self._state_lock:
+                target = (self._hold_pose if self._hold_pose is not None
+                          else self.q_hold)
+                target = None if target is None else target.copy()
+            if target is not None:
+                self.pub.publish(Float64MultiArray(data=target.tolist()))
+                self.vel_pub.publish(Float64MultiArray(data=[0.0] * 7))
+            return
+
         with self._state_lock:
             q_current = None if self.q_current is None else self.q_current.copy()
             q_hold = None if self.q_hold is None else self.q_hold.copy()

@@ -70,6 +70,37 @@
   <arg name="control_rate_hz" default="100.0"/>
   <arg name="max_joint_velocity" default="0.7"/>
   <arg name="single_shot" default="false"/>
+  <!-- Ablation campaign mode. true advertises <node>/episode/reset (and
+       /episode/reconfigure where a node has re-readable knobs) on the pipeline
+       nodes, and starts episode_director, which rewinds the world in place so
+       a trial is an EPISODE inside one long-lived process tree instead of a
+       process lifecycle. Startup measured at ~150 s (Gazebo + controllers 12 s,
+       CBF URDFLayer + 9 Bernstein SDF models + graph capture 38 s, SAM3 ~45 s,
+       FM checkpoint + torch.compile on top); none of that varies across cells,
+       so a ~290-episode campaign spends ~70% of its wall clock reproducing
+       identical state. With this on, tier-1 episodes cost a world rewind
+       (~5 s) and tier-2 arms a CUDA-graph re-capture (~1-3 s).
+       false = completely inert: no services advertised, no director, and the
+       only non-additive changes in the nodes are a retained subscriber handle
+       and a topic name moved to a param with its historical default. -->
+  <arg name="enable_episode_control" default="false"/>
+  <!-- Per-episode uniform jitter half-widths [m] applied to the object poses on
+       every reset (0 = fixed poses, the default). Training randomized BOTH
+       objects (env_pick_place.py: CUBE_X/Y_RANGE, SHELF_X/Y_RANGE), so varying
+       them is in-distribution; fixed poses test a single point of a policy
+       trained over a region. Values matching the trained ranges:
+         cube  x 0.05  y 0.05
+         box   x 0.05  y 0.07   (0.07 not 0.11: the box is centred here at
+                                 y=-0.35 while training centred at -0.39, so
+                                 +/-0.11 would run past the trained edge at
+                                 -0.28; +/-0.07 gives -0.42..-0.28, inside.) -->
+  <arg name="randomize_cube_x" default="0.0"/>
+  <arg name="randomize_cube_y" default="0.0"/>
+  <arg name="randomize_box_x"  default="0.0"/>
+  <arg name="randomize_box_y"  default="0.0"/>
+  <!-- Seed for the POSE randomization stream. Independent of the planner's
+       fm_noise_seed: same seed here replays the same object poses. -->
+  <arg name="randomize_seed" default="0"/>
 
   <!-- Static PP CBF obstacle. Coordinates are in the robot/table frame; Gazebo
        spawn adds the table-top z offset internally. -->
@@ -98,7 +129,8 @@
        it is added to the published obstacle cloud without leaving a stale trail. -->
   <arg name="moving_sphere_enabled" default="true"/>
   <arg name="moving_sphere_initial_x" default="0.10"/>
-  <arg name="moving_sphere_initial_y" default="-0.190"/>
+  <!--arg name="moving_sphere_initial_y" default="-0.190"/-->
+  <arg name="moving_sphere_initial_y" default="-0.21"/>
   <arg name="moving_sphere_initial_z" default="0.55"/>
   <arg name="moving_sphere_velocity_x" default="0.0"/>
   <arg name="moving_sphere_velocity_y" default="0.0"/>
@@ -656,6 +688,7 @@
         type="static_cylinder_obstacle_pp.py" output="screen"
         if="$(arg obstacle_enabled)">
         <param name="frame_id" value="world"/>
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="shape" value="$(arg obstacle_shape)"/>
         <param name="topic" value="$(arg obstacle_cloud_topic)"/>
         <param name="extra_topic" value="$(arg obstacle_cloud_extra_topic)"/>
@@ -695,6 +728,7 @@
              dispatch in the 100 Hz CBF loop to ~80 us. -->
         <env name="OMP_NUM_THREADS" value="2"/>
         <param name="cube_prompt" value="$(arg cube_prompt)"/>
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="box_prompt"  value="$(arg box_prompt)"/>
         <param name="camera_frame" value="$(arg static_cam_frame)"/>
         <param name="rgb_topic" value="$(arg static_rgb_topic)"/>
@@ -756,6 +790,7 @@
   <!-- 3. Conditioning: gripper + cube + box -> /vision/merged_cloud (world) -->
   <node name="condition_pickplace" pkg="vision_processing" type="condition_pcd_pickplace.py" output="screen">
         <param name="num_points" value="$(arg condition_num_points)"/>
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="world_frame" value="world"/>
         <param name="tcp_frame" value="panda_TCP"/>
         <param name="cube_topic" value="/perception/target_cube_gt" if="$(arg use_gt_cube)"/>
@@ -775,6 +810,7 @@
         <!-- Same OMP cap as sam3_sam2_pp: keep CPU cores for the 100 Hz CBF loop. -->
         <env name="OMP_NUM_THREADS" value="2"/>
         <param name="model_name" value="$(arg pickplace_model_name)"/>
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
         <param name="controlled_link" value="panda_TCP"/>
         <rosparam param="cbf_link_names">['panda_link2', 'panda_link3', 'panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
@@ -821,6 +857,7 @@
         output="screen" cwd="node" if="$(arg enable_viapoint_detour)">
         <param name="enabled" value="false"/>
         <param name="input_topic" value="/planner/raw_nominal_trajectory"/>
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="output_topic" value="/planner/nominal_trajectory"/>
         <param name="obs_topic" value="$(arg obstacle_cloud_topic)"/>
         <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
@@ -869,6 +906,7 @@
   <node name="trajectory_executor" pkg="vision_processing" type="trajectory_executor.py" output="screen"
         if="$(arg execute)">
         <param name="rate_hz" value="$(arg control_rate_hz)"/>
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="out_topic" value="/planner/nominal_joint_command"/>
         <param name="velocity_out_topic" value="/planner/nominal_joint_velocity"/>
         <param name="hold_current_until_trajectory" value="true"/>
@@ -896,6 +934,7 @@
                value="$(eval arg('enable_cbf_reflex') and not arg('use_cpp_certified_controller'))"/>
         <param name="certified_command_publish"
                value="$(eval arg('enable_cbf_reflex') and arg('use_cpp_certified_controller'))"/>
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="urdf_path" value="$(find vision_processing)/urdf/panda_pickplace.xacro"/>
         <param name="controlled_link" value="panda_TCP"/>
         <rosparam param="cbf_link_names">['panda_link2', 'panda_link3', 'panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
@@ -1060,6 +1099,7 @@
   <node name="gripper_grasp_pp" pkg="vision_processing" type="gripper_grasp_node_pp.py"
         output="screen" if="$(arg grasp_enabled)">
         <param name="cube_model" value="red_cube"/>
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="tcp_frame" value="panda_TCP"/>
         <param name="gripper_ns" value="/franka_gripper"/>
         <param name="grasp_width" value="0.04"/>
@@ -1069,6 +1109,38 @@
         <param name="hold_width" value="0.04"/>
         <param name="open_width" value="0.08"/>
         <param name="release_z_clearance" value="0.10"/>
+  </node>
+
+  <!-- 5.9. Episode director (ablation campaign only). Rewinds the world in
+       place between episodes: pause -> node-state resets (which detach the
+       grasp weld) -> arm to home via set_model_configuration -> object poses
+       -> unpause -> wait for the perception chain to re-converge. It never
+       calls /gazebo/reset_simulation: that rewinds /clock, and with
+       use_sim_time every rospy timer, rospy.Rate and bag timestamp derives
+       from it. Reset services are discovered by name, so this same node works
+       unchanged for the feeding and xArm7 groups. -->
+  <node name="episode_director" pkg="vision_processing" type="episode_director.py"
+        output="screen" if="$(arg enable_episode_control)">
+        <param name="robot_model" value="panda"/>
+        <param name="settle_time" value="1.0"/>
+        <!-- Re-cleared after the unpause: while paused no joint states are
+             published, so these two still hold the PRE-reset pose and would
+             command the arm back out of home (measured 0.11 rad of drift). -->
+        <rosparam param="post_settle_services">['/trajectory_executor/episode/reset', '/cbf_safety_Bernstein/episode/reset']</rosparam>
+        <!-- Fail the episode rather than record one that silently started from
+             the previous episode's pose. [rad], 0 disables. -->
+        <param name="home_tolerance" value="0.05"/>
+        <rosparam param="ready_topics">['/vision/sam2_mask_cube', '/vision/merged_cloud']</rosparam>
+        <rosparam param="objects">
+          red_cube:  {x: 0.56,  y: -0.035, z: 0.77}
+          brown_box: {x: 0.515, y: -0.35,  z: 0.755}
+        </rosparam>
+        <!-- Per-episode uniform jitter half-widths [m] (tier 1: free). -->
+        <param name="seed" value="$(arg randomize_seed)"/>
+        <rosparam param="randomize" subst_value="true">
+          red_cube:  {x: $(arg randomize_cube_x), y: $(arg randomize_cube_y)}
+          brown_box: {x: $(arg randomize_box_x),  y: $(arg randomize_box_y)}
+        </rosparam>
   </node>
 
   <!-- 6. RViz: visualize /vision/merged_cloud + /planner/nominal_trajectory. -->
