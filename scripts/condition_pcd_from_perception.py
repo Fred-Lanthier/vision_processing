@@ -16,8 +16,11 @@ pkg_path = rospack.get_path('vision_processing')
 scripts_path = os.path.join(pkg_path, 'scripts')
 if scripts_path not in sys.path:
     sys.path.insert(0, scripts_path)
+if pkg_path not in sys.path:
+    sys.path.insert(0, pkg_path)
 
 from utils import compute_T_child_parent_xacro
+from episode_control import EpisodeControl
 try:
     from Compute_3D_point_cloud_from_mesh import RobotMeshLoaderOptimized
     LOADER_AVAILABLE = True
@@ -63,7 +66,30 @@ class ConditionPcdFromPerception:
         rospy.Subscriber('/joint_states', JointState, self.joint_callback)
         
         self.rate = rospy.Rate(30)
+
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+
         rospy.loginfo("🚀 Condition PCD from Perception Node PRÊT")
+
+    def _episode_reset(self):
+        """Drop the cached target cloud and the fork-geometry cache.
+
+        target_cloud is what the planner is conditioned on, and
+        hold_last_target_on_loss is designed to keep serving it after the target
+        leaves the field of view. That is the right behaviour inside an episode
+        and the wrong one across episodes: the first plan of a new episode would
+        be conditioned on the previous episode's food pose, held alive by the
+        very mechanism meant to survive an occlusion.
+
+        The fork cache is keyed on the joint hash and is a pure function of the
+        configuration, so clearing it changes no value; it is dropped anyway so
+        that no state at all crosses the episode boundary here."""
+        self.target_cloud = None
+        self.target_stamp = None
+        self.fork_cloud_cache = None
+        self.last_joint_hash = None
+        return "target conditioning cloud + fork cache cleared"
 
     def stable_sample(self, points, count):
         """Deterministic spatial sampling to avoid planner jitter from RNG."""

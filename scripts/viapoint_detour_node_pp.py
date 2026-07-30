@@ -296,6 +296,11 @@ class ViapointDetourNode:
         self.out_topic = gp("~output_topic", "/planner/nominal_trajectory")
         self.obs_topic = gp("~obs_topic", "/perception/cleaned_obstacles")
         self.tcp_link = gp("~tcp_link", "panda_TCP")
+        # Root of the kinematic chain ChainFK walks up to from ~tcp_link. It is
+        # a stop condition, not a frame: on a non-panda embodiment (xArm7:
+        # xarm7_link_base) the walk otherwise runs past the arm base into
+        # `world`, which has no parent joint, and the node dies at startup.
+        self.base_link = gp("~base_link", "panda_link0")
         urdf_path = gp("~urdf_path", "")
         # TCP-point clearance for "blocked": generous vs the CBF's whole-body
         # d_safe because this is a point check -- the hand needs ~a gripper
@@ -359,7 +364,7 @@ class ViapointDetourNode:
             f.write(urdf_xml)
         self.ik = fast_ik_module.FastIK(self._urdf_tmp, self.tcp_link)
         self.nq = int(self.ik.get_nq())
-        self.fkc = ChainFK(urdf_xml, self.tcp_link)
+        self.fkc = ChainFK(urdf_xml, self.tcp_link, base_link=self.base_link)
 
         self.cloud = None
         self.q_now = None

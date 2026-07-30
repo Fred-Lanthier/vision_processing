@@ -59,8 +59,11 @@ from std_msgs.msg import Bool, Float64MultiArray
 from std_srvs.srv import Empty, Trigger, TriggerResponse
 
 # Home configuration, matching the -J spawn arguments in
-# pickplace_simulation.launch. Kept here (not read from the launch) so a reset
-# cannot drift from what the campaign believes it reset to.
+# pickplace_simulation.launch. The DEFAULT lives here (not in the launch) so a
+# panda reset cannot drift from what the campaign believes it reset to; a
+# non-panda embodiment overrides it with ~arm_home / ~arm_joint_names /
+# ~arm_links (see green_cube_feeding_casf_pp_xarm.launch), which must then be
+# kept in sync with that sim's -J spawn arguments.
 PANDA_HOME = {
     "panda_joint1": 0.0,
     "panda_joint2": 0.188029,
@@ -72,12 +75,27 @@ PANDA_HOME = {
 }
 FINGER_HOME = {"panda_finger_joint1": 0.04, "panda_finger_joint2": 0.04}
 
+
+def _quaternion_from_rpy(roll, pitch, yaw):
+    """(x, y, z, w) from fixed-axis RPY, matching spawn_model's -R -P -Y.
+
+    Written out rather than pulled from tf.transformations so the director keeps
+    depending only on what it already imports."""
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    return (sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy)
+
 # TCP offset along the hand frame's approach axis (condition_pcd_pickplace.py).
 TCP_FROM_HAND_Z = 0.1034
 
 
 class EpisodeDirector:
-    # Links whose twist is zeroed after the teleport (_zero_link_velocities).
+    # Default links whose twist is zeroed after the teleport
+    # (_zero_link_velocities); overridable with ~arm_links.
     ARM_LINKS = [f"panda_link{i}" for i in range(8)] + [
         "panda_hand", "panda_leftfinger", "panda_rightfinger"]
 
@@ -95,7 +113,18 @@ class EpisodeDirector:
         # the tracker memory was dropped. Empty list = skip the wait.
         self.ready_topics = rospy.get_param(
             "~ready_topics", ["/vision/sam2_mask_cube", "/vision/merged_cloud"])
-        self.home = dict(PANDA_HOME)
+        # Arm identity. Defaults = the panda pick-and-place sim, so every
+        # existing launch behaves exactly as before; a cross-embodiment launch
+        # passes its own joint names / home pose / link list.
+        self.arm_joint_names = list(rospy.get_param(
+            "~arm_joint_names", [f"panda_joint{i}" for i in range(1, 8)]))
+        self.arm_home = dict(rospy.get_param("~arm_home", PANDA_HOME))
+        missing = [n for n in self.arm_joint_names if n not in self.arm_home]
+        if missing:
+            raise RuntimeError(
+                "~arm_home is missing a target for %s" % ", ".join(missing))
+        self.arm_links = list(rospy.get_param("~arm_links", self.ARM_LINKS))
+        self.home = dict(self.arm_home)
         self.home.update(FINGER_HOME if rospy.get_param("~reset_fingers", True)
                          else {})
         # Re-cleared after the unpause, once post-reset joint states exist: any
@@ -122,7 +151,14 @@ class EpisodeDirector:
         # grossly different posture is still a different episode -- hence a
         # bound rather than none.
         self.joint_tolerance = float(rospy.get_param("~joint_tolerance", 0.15))
-        self.home_timeout = float(rospy.get_param("~home_timeout", 10.0))
+        # Convergence budget. Short, because the check is non-fatal: it exits
+        # as soon as the arm is within tolerance, and waiting longer than this
+        # when it is NOT converging just burns wall clock for no information.
+        self.home_timeout = float(rospy.get_param("~home_timeout", 3.0))
+        # false = measure the start-pose deviation and record it; true = veto
+        # the episode when it exceeds tolerance. Non-fatal by default: vetoing
+        # discarded good episodes and cost 10 s per attempt near an obstacle.
+        self.home_strict = bool(rospy.get_param("~home_strict", False))
         # Log Gazebo's own joint positions/rates around the teleport.
         self.probe_joints = bool(rospy.get_param("~probe_joints", True))
         # Teleport passes. DEFAULT 1, on measurement: a second pass was tried to
@@ -144,13 +180,54 @@ class EpisodeDirector:
             "red_cube": {"x": 0.56, "y": -0.035, "z": 0.77},
             "brown_box": {"x": 0.515, "y": -0.35, "z": 0.755},
         })
-        # Per-episode uniform randomization half-widths [m], applied to the
-        # object poses above. Tier-1: costs nothing, changes every episode.
+        # Per-episode randomization. Two forms, per object and per axis:
+        #   ~randomize      {obj: {axis: half_width}}   centre +/- half_width,
+        #                                               centre = the pose above
+        #   ~object_ranges  {obj: {axis: [min, max]}}   absolute range, sampled
+        #                                               uniformly
+        # Ranges exist because the useful bounds are not symmetric about the
+        # deployed pose: the box's spawn y (-0.35) is the TOP of its allowed
+        # band, and the cube's (-0.035) is the BOTTOM of its. Expressing those
+        # as half-widths would silently sample outside the intended region.
+        # A range takes precedence over a half-width for the same axis.
         self.randomize = rospy.get_param("~randomize", {})
+        self.object_ranges = rospy.get_param("~object_ranges", {})
+        # {child: parent}. A child's pose is drawn as the parent's DRAWN pose
+        # plus the child's own nominal offset plus its own jitter, so a
+        # containment relation survives the randomization: the feeding food must
+        # stay inside the bowl however the bowl was placed. Without this the two
+        # are drawn independently and a wide enough bowl draw puts the food on
+        # the table next to it, which still reads as a valid episode.
+        # The `objects` entry of a child holds the OFFSET from its parent, not a
+        # world position.
+        self.object_relative_to = rospy.get_param("~object_relative_to", {})
+
+        # --- moving-sphere randomization ----------------------------------
+        # The sphere lives on the obstacle node, not in Gazebo's model list, so
+        # it is randomized by writing that node's params and asking it to
+        # reconfigure -- which regenerates the cloud and rewinds the sphere
+        # clock. The centre is read from whatever the launch configured, so the
+        # randomization is a delta around the deployed scene rather than a
+        # second source of truth for it.
+        self.sphere_node = rospy.get_param("~sphere_node", "/pp_static_obstacle")
+        self.sphere_randomize = rospy.get_param("~sphere_randomize", {})
+        # y CLAMP. Measured: the sphere overlaps the arm's clearance band at the
+        # home configuration as y approaches the robot, and at y = -0.19 the CBF
+        # commands 0.163 rad/s with a zero nominal (h = 0.0084, clearance
+        # 0.0234). -0.21 is the closest verified-good value, so a sample is
+        # never allowed nearer than this however the half-widths are set.
+        self.sphere_y_max = float(rospy.get_param("~sphere_y_max", -0.21))
+        self.sphere_center = None   # read lazily from the obstacle node
 
         self._home_tcp = None       # TCP sampled at the teleport, per reset
         self._lock = threading.RLock()
         self.episode_index = 0
+        # Re-seeded at the top of EVERY reset from ~seed (see _reset). Seeding
+        # once here was a silent pairing bug: the stream advanced across the
+        # whole campaign, so trial k of arm A and trial k of arm B shared an FM
+        # seed but drew DIFFERENT object poses. Nothing in the logs showed it;
+        # it would surface only as inflated variance read as scenario
+        # difficulty.
         self._rng = random.Random(int(rospy.get_param("~seed", 0)))
 
         self._pause = self._proxy("/gazebo/pause_physics", Empty)
@@ -274,15 +351,15 @@ class EpisodeDirector:
         if not self.probe_joints:
             return None
         pos, rate = [], []
-        for i in range(1, 8):
+        for name in self.arm_joint_names:
             try:
-                r = self._get_joint(f"panda_joint{i}")
+                r = self._get_joint(name)
                 pos.append(r.position[0] if r.position else float("nan"))
                 rate.append(r.rate[0] if r.rate else float("nan"))
             except Exception:                          # noqa: BLE001
                 return None
-        err = max(abs(p - PANDA_HOME[f"panda_joint{i + 1}"])
-                  for i, p in enumerate(pos))
+        err = max(abs(p - self.arm_home[n])
+                  for n, p in zip(self.arm_joint_names, pos))
         rate_max = max(abs(r) for r in rate)
         rospy.loginfo("  [probe %-16s] max|q-home|=%.4f rad  max|rate|=%.4f "
                       "rad/s  q=[%s]", label, err, rate_max,
@@ -331,7 +408,7 @@ class EpisodeDirector:
         with an explicitly zero twist removes the kick at its source (measured:
         4.35 -> ~0.95 rad/s), which is simpler and more direct than trying to
         absorb it afterwards."""
-        for link in self.ARM_LINKS:
+        for link in self.arm_links:
             try:
                 current = self._get_link(f"{self.robot_model}::{link}", "")
                 if not current.success:
@@ -345,21 +422,106 @@ class EpisodeDirector:
                 rospy.logwarn_throttle(30.0, "could not zero %s twist: %s",
                                        link, exc)
 
+    def _sample_axis(self, name, axis, nominal):
+        """Absolute range if one is configured, else centre +/- half-width."""
+        rng = self.object_ranges.get(name, {}).get(axis)
+        if rng is not None and len(rng) == 2:
+            lo, hi = float(rng[0]), float(rng[1])
+            if hi < lo:
+                lo, hi = hi, lo
+            return self._rng.uniform(lo, hi)
+        half = self.randomize.get(name, {}).get(axis, 0.0)
+        return nominal + self._jitter(half)
+
     def _place_objects(self):
         placed = []
-        for name, pose in self.objects.items():
-            jitter = self.randomize.get(name, {})
+        drawn = {}
+        # Parents first: a child's draw is an offset from its parent's DRAWN
+        # pose, so the parent must already have one. Two passes rather than a
+        # topological sort because the relation is one level deep by design
+        # (a container and what sits in it); a child naming another child is
+        # reported rather than silently placed at the wrong origin.
+        absolute = [n for n in self.objects if n not in self.object_relative_to]
+        relative = [n for n in self.objects if n in self.object_relative_to]
+        for name in relative:
+            parent = self.object_relative_to[name]
+            if parent in self.object_relative_to:
+                raise RuntimeError(
+                    f"object_relative_to: {name} -> {parent} -> "
+                    f"{self.object_relative_to[parent]}; only one level of "
+                    f"nesting is supported")
+            if parent not in self.objects:
+                raise RuntimeError(
+                    f"object_relative_to: {name} is relative to {parent}, "
+                    f"which is not in ~objects")
+
+        for name in absolute + relative:
+            pose = self.objects[name]
             state = ModelState()
             state.model_name = name
-            state.pose.position.x = pose["x"] + self._jitter(jitter.get("x", 0.0))
-            state.pose.position.y = pose["y"] + self._jitter(jitter.get("y", 0.0))
-            state.pose.position.z = pose["z"] + self._jitter(jitter.get("z", 0.0))
-            state.pose.orientation.w = 1.0
+            origin = drawn.get(self.object_relative_to.get(name),
+                               {"x": 0.0, "y": 0.0, "z": 0.0})
+            state.pose.position.x = origin["x"] + self._sample_axis(name, "x", pose["x"])
+            state.pose.position.y = origin["y"] + self._sample_axis(name, "y", pose["y"])
+            state.pose.position.z = origin["z"] + self._sample_axis(name, "z", pose["z"])
+            # Spawn orientation, when the model has one. The container spawns
+            # rolled by pi/2 and an identity quaternion would lay the bowl flat,
+            # emptying it -- a scene change that reads as a valid episode.
+            roll, pitch, yaw = (float(v) for v in pose.get("rpy", (0.0, 0.0, 0.0)))
+            (state.pose.orientation.x, state.pose.orientation.y,
+             state.pose.orientation.z, state.pose.orientation.w) = \
+                _quaternion_from_rpy(roll, pitch, yaw)
             state.reference_frame = "world"
             self._set_state(state)
+            drawn[name] = {"x": state.pose.position.x,
+                           "y": state.pose.position.y,
+                           "z": state.pose.position.z}
             placed.append(f"{name}@({state.pose.position.x:.3f},"
                           f"{state.pose.position.y:.3f})")
         return placed
+
+    def _randomize_sphere(self):
+        """Draw a new moving-sphere position for this episode.
+
+        Returns a short description, or None when sphere randomization is off.
+        The y coordinate is clamped to sphere_y_max: closer than that and the
+        sphere sits inside the arm's clearance band at home, so the CBF pushes
+        the arm off the start pose before the episode even begins."""
+        if not self.sphere_randomize:
+            return None
+        if self.sphere_center is None:
+            try:
+                self.sphere_center = {
+                    axis: float(rospy.get_param(
+                        f"{self.sphere_node}/moving_sphere_initial_{axis}"))
+                    for axis in ("x", "y", "z")
+                }
+            except Exception as exc:                   # noqa: BLE001
+                rospy.logwarn("sphere randomization off: cannot read %s params "
+                              "(%s)", self.sphere_node, exc)
+                self.sphere_randomize = {}
+                return None
+
+        drawn = {}
+        for axis in ("x", "y", "z"):
+            value = (self.sphere_center[axis]
+                     + self._jitter(self.sphere_randomize.get(axis, 0.0)))
+            if axis == "y":
+                value = min(value, self.sphere_y_max)
+            drawn[axis] = value
+            rospy.set_param(
+                f"{self.sphere_node}/moving_sphere_initial_{axis}", value)
+
+        # The obstacle node re-reads these and regenerates its cloud; without
+        # this the params would change while the published obstacle did not.
+        try:
+            response = rospy.ServiceProxy(
+                f"{self.sphere_node}/episode/reconfigure", Trigger)()
+            if not response.success:
+                raise RuntimeError(response.message)
+        except Exception as exc:                       # noqa: BLE001
+            raise RuntimeError(f"sphere reconfigure failed: {exc}")
+        return (f"sphere@({drawn['x']:.3f},{drawn['y']:.3f},{drawn['z']:.3f})")
 
     def _jitter(self, half_width):
         half_width = float(half_width)
@@ -383,7 +545,7 @@ class EpisodeDirector:
         msg = rospy.wait_for_message("/joint_states", JointState, timeout=5.0)
         by_name = dict(zip(msg.name, msg.position))
         worst, worst_joint = 0.0, ""
-        for joint, target in PANDA_HOME.items():
+        for joint, target in self.arm_home.items():
             if joint not in by_name:
                 continue
             error = abs(by_name[joint] - target)
@@ -392,31 +554,32 @@ class EpisodeDirector:
         return worst, worst_joint
 
     def _verify_home(self):
-        """Fail the episode only if the arm is not REALLY back at the start.
+        """Measure how far the arm is from the start pose, and RECORD it.
 
-        Two bounds, because joint angle alone is misleading. The CBF's
-        null-space clearance deliberately swivels the elbow WITHOUT moving the
-        TCP, so a 0.07 rad joint error can leave the gripper visibly in the same
-        place -- which is why this looked fine to the eye while a tight joint
-        tolerance kept failing episodes.
+        NON-FATAL by default (~home_strict false). It used to raise, which threw
+        away otherwise-good episodes and, with an obstacle near the start pose,
+        burned 10 s per attempt watching the CBF push the arm before failing.
+        The deviation is real information, so it is measured and reported into
+        the episode log rather than used to veto the run -- if a cell turns out
+        to have started noticeably off, that shows up in the recorded numbers
+        instead of silently costing you the trial.
 
-          * TCP position (tight): what the task and the policy actually see.
-          * joint angles (loose): still bounded, because the barrier is
-            whole-body, so a grossly different posture is a different episode
-            even at the same TCP.
+        Two quantities, because joint angle alone is misleading: the CBF's
+        null-space clearance swivels the elbow WITHOUT moving the TCP (measured:
+        0.13 rad of joint change for 3 mm of TCP change), so the gripper can be
+        exactly where it belongs while the joint metric looks bad.
 
-        A failure here is loud on purpose: a trial that silently starts from the
-        previous episode's pose looks valid and is not comparable, which is
-        worse than a missing trial."""
+        Set ~home_strict true to restore the old veto."""
         if self.home_tolerance <= 0.0:
-            return
+            return ""
         deadline = time.time() + self.home_timeout
         worst_j, worst_joint, worst_tcp = float("inf"), "", float("inf")
-        while time.time() < deadline:
+        while True:
             try:
                 worst_j, worst_joint = self._home_error()
             except Exception:
-                raise RuntimeError("cannot verify home: no /joint_states")
+                rospy.logwarn("cannot verify home: no /joint_states")
+                return "home unverified"
             tcp = self._tcp_position()
             worst_tcp = (float("inf") if (tcp is None or self._home_tcp is None)
                          else math.dist(tcp, self._home_tcp))
@@ -424,12 +587,19 @@ class EpisodeDirector:
             if tcp_ok and worst_j <= self.joint_tolerance:
                 rospy.loginfo("  home reached (TCP %.4f m, worst joint %.4f rad "
                               "on %s)", worst_tcp, worst_j, worst_joint)
-                return
+                return f"home TCP {worst_tcp:.4f}m joint {worst_j:.4f}rad"
+            if time.time() >= deadline:
+                break
             rospy.sleep(0.1)
-        raise RuntimeError(
-            f"arm never returned home: TCP off by {worst_tcp:.4f} m (max "
-            f"{self.tcp_tolerance}), {worst_joint} off by {worst_j:.4f} rad "
-            f"(max {self.joint_tolerance}) after {self.home_timeout:.1f}s")
+
+        summary = (f"home OFF by TCP {worst_tcp:.4f}m (max {self.tcp_tolerance}) "
+                   f"/ {worst_joint} {worst_j:.4f}rad (max {self.joint_tolerance})")
+        if self.home_strict:
+            raise RuntimeError(f"arm never returned home: {summary} after "
+                               f"{self.home_timeout:.1f}s")
+        rospy.logwarn("  %s -- recorded, NOT failing the episode "
+                      "(~home_strict to veto instead)", summary)
+        return summary
 
     def _wait_ready(self):
         """Wait for the pipeline to re-converge after the tracker memory drop.
@@ -480,6 +650,23 @@ class EpisodeDirector:
 
     def _reset(self):
         t0 = time.time()
+        # Re-seed from ~seed so the scene geometry is a pure function of the
+        # seed, not of how many resets have happened. This is what makes arms
+        # PAIRED: the runner writes the trial's seed here, so trial k is
+        # geometrically identical in every arm. A retry of the same trial also
+        # reproduces the same poses, which is what a retry should mean.
+        self._rng = random.Random(int(rospy.get_param("~seed", 0)))
+        # Object layout, re-read for the same reason the seed is. On a bench
+        # with no synthetic obstacle node -- the feeding scene, whose obstacles
+        # are the physical person, table and bowl seen by the wrist camera --
+        # WHERE the target sits is the only thing a scenario can vary, so the
+        # campaign's tier-3 layer writes these. Read once at construction they
+        # would silently ignore every scenario after the first.
+        self.objects = rospy.get_param("~objects", self.objects)
+        self.randomize = rospy.get_param("~randomize", self.randomize)
+        self.object_ranges = rospy.get_param("~object_ranges", self.object_ranges)
+        self.object_relative_to = rospy.get_param("~object_relative_to",
+                                                  self.object_relative_to)
         # CLOSE THE EPISODE GATE FIRST. The pipeline is a continuously running
         # closed loop: the FM planner replans at 3 Hz, the executor tracks, the
         # CBF drives the arm. Rewinding the world underneath a live policy just
@@ -508,11 +695,14 @@ class EpisodeDirector:
                 self._home_tcp = self._tcp_position()
                 if attempt == 1:
                     placed = self._place_objects()
+                    sphere = self._randomize_sphere()
+                    if sphere:
+                        placed.append(sphere)
                 # Published while still paused, so the executor's very first
                 # tick after the unpause already commands home rather than the
                 # pose the previous episode ended in.
                 self.hold_pose_pub.publish(Float64MultiArray(
-                    data=[PANDA_HOME[f"panda_joint{i}"] for i in range(1, 8)]))
+                    data=[self.arm_home[n] for n in self.arm_joint_names]))
             finally:
                 self._unpause()
 
@@ -531,13 +721,14 @@ class EpisodeDirector:
             if probe is not None and probe[0] <= self.joint_tolerance:
                 break
 
-        self._verify_home()
+        home_note = self._verify_home()
         self._wait_ready()
 
         self.episode_index += 1
         self.episode_pub.publish(Bool(data=True))
         return (f"episode {self.episode_index} armed in "
-                f"{time.time() - t0:.1f}s; placed {', '.join(placed)}")
+                f"{time.time() - t0:.1f}s; {home_note}; "
+                f"placed {', '.join(placed)}")
 
     def _srv_reconfigure(self, _req):
         """Push whatever the campaign wrote to the param server into the nodes.

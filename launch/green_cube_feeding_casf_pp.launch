@@ -67,7 +67,7 @@
        this layer owns the ONE decision neither the obstacle-blind FM nor a
        reactive filter can make: the homotopy class around a big obstacle. -->
   <arg name="enable_viapoint_detour" default="true"/>
-  <arg name="control_rate_hz" default="100.0"/>
+  <arg name="control_rate_hz" default="50.0"/>
   <arg name="max_joint_velocity" default="0.7"/>
   <arg name="single_shot" default="false"/>
   <!-- Ablation campaign mode. true advertises <node>/episode/reset (and
@@ -101,6 +101,39 @@
   <!-- Seed for the POSE randomization stream. Independent of the planner's
        fm_noise_seed: same seed here replays the same object poses. -->
   <arg name="randomize_seed" default="0"/>
+  <!-- Moving-sphere randomization half-widths [m], applied around whatever
+       moving_sphere_initial_* the launch configured. The sphere is not a Gazebo
+       model the director can move directly: it lives on pp_static_obstacle, so
+       the director writes that node's params and asks it to reconfigure, which
+       regenerates the cloud and rewinds the sphere clock.
+       randomize_sphere_y_max CLAMPS how close the draw may come to the robot.
+       Measured: at y = -0.19 the sphere sits inside the arm's clearance band at
+       the home configuration (h = 0.0084, clearance 0.0234) and the CBF commands
+       0.163 rad/s with a ZERO nominal, so the arm is pushed off the start pose
+       before the episode begins. -0.21 is the closest verified-good value. -->
+  <arg name="randomize_sphere_x" default="0.0"/>
+  <arg name="randomize_sphere_y" default="0.0"/>
+  <arg name="randomize_sphere_z" default="0.0"/>
+  <arg name="randomize_sphere_y_max" default="-0.21"/>
+  <!-- ABSOLUTE y ranges [m] for the two objects. Ranges, not half-widths,
+       because the useful bounds are not symmetric about the deployed pose:
+       the box spawns at its TOP bound (-0.35, may go to -0.40 but not -0.30)
+       and the cube at its BOTTOM bound (-0.035, may go up). Set min == max to
+       pin an axis.
+       The cube's upper bound is set by CAMERA VISIBILITY, not by the trained
+       region: at y = 0.2 the cube leaves the static camera's view entirely, so
+       there is no conditioning cloud and the episode tests nothing.
+       NOTE the cube range still EXCEEDS its trained region (env_pick_place.py
+       CUBE_Y_RANGE base-rel tops out at 0.015), so roughly two thirds of cube
+       draws are out-of-distribution and the monitor flags them. That is the
+       check working, not a bug, but those episodes test GENERALIZATION rather
+       than nominal performance. The box range [-0.40, -0.35] sits entirely
+       inside SHELF_Y_RANGE (-0.50, -0.28), so box draws are never OOD.
+       Set cube_y_max 0.015 for a fully in-distribution sweep. -->
+  <arg name="cube_y_min" default="-0.035"/>
+  <arg name="cube_y_max" default="0.1"/>
+  <arg name="box_y_min"  default="-0.40"/>
+  <arg name="box_y_max"  default="-0.35"/>
 
   <!-- Static PP CBF obstacle. Coordinates are in the robot/table frame; Gazebo
        spawn adds the table-top z offset internally. -->
@@ -129,11 +162,10 @@
        it is added to the published obstacle cloud without leaving a stale trail. -->
   <arg name="moving_sphere_enabled" default="true"/>
   <arg name="moving_sphere_initial_x" default="0.10"/>
-  <!--arg name="moving_sphere_initial_y" default="-0.190"/-->
-  <arg name="moving_sphere_initial_y" default="-0.21"/>
+  <arg name="moving_sphere_initial_y" default="-0.20"/>
   <arg name="moving_sphere_initial_z" default="0.55"/>
   <arg name="moving_sphere_velocity_x" default="0.0"/>
-  <arg name="moving_sphere_velocity_y" default="0.0"/>
+  <arg name="moving_sphere_velocity_y" default="0.10"/>
   <arg name="moving_sphere_velocity_z" default="0.0"/>
   <arg name="moving_sphere_radius" default="0.08"/>
   <arg name="moving_sphere_num_points" default="1000"/>
@@ -143,6 +175,14 @@
 
   <!-- Online CBF tuning, matching the tested feeding values where applicable. -->
   <arg name="enable_cbf" default="true"/>
+  <!-- /cbf_safety/ready normally waits for a first obstacle cloud, and the
+       planner waits on that (wait_for_cbf_ready). With obstacle_enabled:=false
+       the obstacle node is not launched at all, so no cloud ever arrives, the
+       CBF never announces ready and the planner never plans, so a no-obstacle
+       BASELINE would produce zero episodes. Waive the requirement for that
+       case only; leave it true whenever an obstacle source exists, since it is
+       what stops the shield running blind. -->
+  <arg name="cbf_watchdog_require_obstacles" default="true"/>
   <arg name="cbf_node_type" default="cbf_safety_node_Bernstein_multicbf.py"/>
   <arg name="cbf_graph_points" default="64"/>
   <arg name="cbf_preprocess_max_points" default="4096"/>
@@ -210,6 +250,15 @@
        waiting behind the whole-body SDF batches under SAM2/FM contention
        (runPP100: cbf_total p50 ~16 ms, loop at ~33 Hz effective). -->
   <arg name="cbf_separate_streams" default="true"/>
+  <!-- DIAGNOSTIC ONLY. One-shot CUDA kernel breakdown of the captured control
+       step, logged once on the Nth replay then disabled. cbf_gpu says how long
+       the graph runs on the device; this says which kernels and how many, which
+       is what separates "a few expensive kernels" from "hundreds of small
+       ones". Those look identical in cbf_gpu and have opposite fixes. The
+       profiled cycle forces a synchronise and therefore runs long, so never
+       leave this on for a campaign. -->
+  <arg name="cbf_profile_graph" default="false"/>
+  <arg name="cbf_profile_graph_after" default="200"/>
   <!-- Capture the ENTIRE per-cycle correction+command pipeline in the CUDA
        graph (escape/clearance compose, solve, dynamic hdot, repair,
        integration, command fill): one replay instead of ~90 eager ops. The
@@ -316,10 +365,22 @@
        "command" = legacy self-referential linearization. -->
   <arg name="cbf_sampled_data_linearization" default="executed"/>
   <arg name="cbf_sampled_data_vel_headroom" default="0.15"/>
+  <!-- T [s]: the zero-order-hold duration the sampled-data margin
+       mu = 0.5 * L * ||dq||^2 * T is dimensioned on. It must MAJORATE the real
+       interval between two published commands, since that is the span the
+       command is actually held over.
+       0 means auto, i.e. 1/rate_hz, and with rate_hz defaulting to 150 that
+       silently gave T = 6.67 ms. The measured inter-publish interval is
+       p50 ~10 ms and p95 ~21 ms, so auto was under the true hold by a factor of
+       three and the value was neither the nominal 10 ms nor anything measured.
+       Set explicitly to 20 ms: above the median, and the reflex brake covers
+       excursions past it using the elapsed time it measures per tick rather
+       than a nominal. -->
+  <arg name="cbf_sampled_data_T" default="0.00666666666"/>
   <!-- Per-link L for the sampled margin rows (cbf_link_names order, same
        constants as the reflex vector): arm links carry L 1.4-10 vs the
        global worst case 20, halving their standoff for free. -->
-  <arg name="cbf_sampled_data_L_links" default="1.0 4.3 4.7 9.6 21.8 32.0 19.7 5 5"/>
+  <arg name="cbf_sampled_data_L_links" default="1.0 4.3 4.7 9.6 21.8 32.0 19.7 20 20"/>
   <!-- Final repair over ALL solve rows, not the min-h row alone. runPP1022
        tail: arm pinched between link4/link5 (cos(g4,g5) = -0.30, both
        h ~ -0.1 mm); the critical-row repair fixed link4 exactly and thereby
@@ -601,7 +662,7 @@
        the invariance theorem applies to); it OVERSHOOTS the true hard min and
        is optimistic, so it must never be used to state a clearance. -->
   <arg name="cbf_barrier_value_mode" default="hard"/>
-  <arg name="cbf_dynamic_hdot_enabled" default="true"/>
+  <arg name="cbf_dynamic_hdot_enabled" default="false"/>
   <arg name="cbf_dynamic_hdot_tau" default="0.05"/>
   <arg name="cbf_dynamic_hdot_deadband" default="0.05"/>
   <arg name="cbf_dynamic_hdot_max" default="0.5"/>
@@ -618,7 +679,7 @@
        filter-then-repair seam; the repair stays as verification).
        Offline equivalence + seam proof: tests/test_smoothing_in_projection.py. -->
   <arg name="cbf_smoothing_mode" default="in_projection"/>
-  <arg name="cbf_diagnostics_decimation" default="4"/>
+  <arg name="cbf_diagnostics_decimation" default="3"/>
   <arg name="barrier_alpha" default="0.002"/>
   <arg name="d_safe" default="0.015"/>
 
@@ -939,6 +1000,7 @@
         <param name="controlled_link" value="panda_TCP"/>
         <rosparam param="cbf_link_names">['panda_link2', 'panda_link3', 'panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger']</rosparam>
         <param name="enable_cbf" value="$(arg enable_cbf)"/>
+        <param name="watchdog_require_obstacles" value="$(arg cbf_watchdog_require_obstacles)"/>
         <param name="model_override_dir" value="$(arg cbf_model_override_dir)"/>
         <param name="model_override_links" value="$(arg cbf_model_override_links)"/>
         <param name="cbf_passthrough_when_inactive" value="$(arg cbf_passthrough_when_inactive)"/>
@@ -959,6 +1021,8 @@
         <param name="cbf_solver_mode" value="$(arg cbf_solver_mode)"/>
         <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)"/>
         <param name="cbf_separate_streams" value="$(arg cbf_separate_streams)"/>
+        <param name="cbf_profile_graph" value="$(arg cbf_profile_graph)"/>
+        <param name="cbf_profile_graph_after" value="$(arg cbf_profile_graph_after)"/>
         <param name="cbf_graphed_control_step" value="$(arg cbf_graphed_control_step)"/>
         <param name="cbf_constraint_sweeps" value="$(arg cbf_constraint_sweeps)"/>
         <param name="cbf_qp_algorithm" value="$(arg cbf_qp_algorithm)"/>
@@ -988,6 +1052,7 @@
         <param name="cbf_issf_epsilon" value="$(arg cbf_issf_epsilon)"/>
         <param name="cbf_issf_rho" value="$(arg cbf_issf_rho)"/>
         <param name="cbf_sampled_data_linearization" value="$(arg cbf_sampled_data_linearization)"/>
+        <param name="cbf_sampled_data_T" value="$(arg cbf_sampled_data_T)"/>
         <param name="cbf_sampled_data_vel_headroom" value="$(arg cbf_sampled_data_vel_headroom)"/>
         <param name="cbf_sampled_data_L_links" value="$(arg cbf_sampled_data_L_links)"/>
         <param name="cbf_repair_all_rows" value="$(arg cbf_repair_all_rows)"/>
@@ -1137,6 +1202,15 @@
         </rosparam>
         <!-- Per-episode uniform jitter half-widths [m] (tier 1: free). -->
         <param name="seed" value="$(arg randomize_seed)"/>
+        <param name="sphere_node" value="/pp_static_obstacle"/>
+        <param name="sphere_y_max" value="$(arg randomize_sphere_y_max)"/>
+        <rosparam param="object_ranges" subst_value="true">
+          red_cube:  {y: [$(arg cube_y_min), $(arg cube_y_max)]}
+          brown_box: {y: [$(arg box_y_min),  $(arg box_y_max)]}
+        </rosparam>
+        <rosparam param="sphere_randomize" subst_value="true">
+          {x: $(arg randomize_sphere_x), y: $(arg randomize_sphere_y), z: $(arg randomize_sphere_z)}
+        </rosparam>
         <rosparam param="randomize" subst_value="true">
           red_cube:  {x: $(arg randomize_cube_x), y: $(arg randomize_cube_y)}
           brown_box: {x: $(arg randomize_box_x),  y: $(arg randomize_box_y)}

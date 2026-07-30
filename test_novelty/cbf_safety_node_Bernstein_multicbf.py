@@ -1204,6 +1204,26 @@ class CBFSafetyNode:
         self._prep_done_event = torch.cuda.Event()
         self._prep_pack = None
         self._prep_seq = 0
+        # GPU-time instrumentation for the control-step graph replay.
+        # cbf_d2h measures how long the CPU BLOCKS in .cpu(); it cannot say
+        # whether that time is the GPU executing or the GPU idle between
+        # dependent kernels. These events bracket the replay on the device, so
+        # cbf_gpu is execution time and (cbf_d2h - cbf_gpu) is the gap. The
+        # elapsed_time() read happens after the .cpu() has already
+        # synchronised, so this adds two stream markers and no extra sync.
+        self._gpu_ev_start = torch.cuda.Event(enable_timing=True)
+        self._gpu_ev_end = torch.cuda.Event(enable_timing=True)
+        self._gpu_ev_valid = False
+        # One-shot kernel breakdown of the captured control step. cbf_gpu says
+        # HOW LONG the graph runs on the device; this says WHICH kernels and how
+        # many. Off by default: the profiler stalls the cycle it runs on, so it
+        # is a diagnostic, never a deployed setting. Fires once, on the Nth
+        # replay, so the measurement lands in steady state rather than on the
+        # first cycle where allocation and warmup still dominate.
+        self._profile_graph = _bool_param("~cbf_profile_graph", False)
+        self._profile_graph_after = max(
+            1, int(rospy.get_param("~cbf_profile_graph_after", 200)))
+        self._graph_replays = 0
         self._adopted_seq = 0
         self._prep_skips = 0
         # Task-metric results are staged as fresh CPU tensors by the preprocess
@@ -1739,6 +1759,48 @@ class CBFSafetyNode:
             time.time() - t0, self._graph_control_step,
             self.cbf_active_constraints, self.cbf_monitor_only)
 
+    def _profile_graph_replay(self):
+        """One-shot CUDA kernel breakdown of the captured control step.
+
+        cbf_gpu answers HOW LONG the graph runs on the device. This answers
+        WHICH kernels and HOW MANY, which is what decides whether the cost is a
+        few expensive kernels (shrink the work) or hundreds of small ones (fuse
+        the loops that generated them). Both look identical in cbf_gpu.
+
+        The profiled cycle is deliberately abnormal: it forces a synchronise so
+        the kernels have completed before the table is built, so this cycle runs
+        long. That is why it fires exactly once and disables itself, and why the
+        param defaults to false. The barrier still constrains this cycle
+        normally; only the timing is perturbed.
+        """
+        try:
+            from torch.profiler import profile, ProfilerActivity
+        except ImportError:
+            rospy.logwarn("cbf_profile_graph requested but torch.profiler is "
+                          "unavailable; continuing without it.")
+            self._profile_graph = False
+            return
+        self._profile_graph = False        # one shot, whatever happens below
+        try:
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                self._gpu_ev_start.record()
+                self.graph.replay()
+                self._gpu_ev_end.record()
+                torch.cuda.synchronize()
+            self._gpu_ev_valid = True
+            events = prof.key_averages()
+            launches = sum(int(getattr(e, "count", 0)) for e in events)
+            table = events.table(sort_by="cuda_time_total", row_limit=30)
+        except Exception as exc:                       # noqa: BLE001
+            # Never take the node down for telemetry: the replay above already
+            # ran, so the control output for this cycle is valid either way.
+            rospy.logwarn("cbf_profile_graph failed: %s", exc)
+            return
+        rospy.logwarn(
+            "CBF graph kernel breakdown (one-shot, replay #%d): %d distinct "
+            "kernels, %d launches\n%s",
+            self._graph_replays, len(events), launches, table)
+
     def _log_cuda_memory(self, label):
         if self.device.type != 'cuda' or not torch.cuda.is_available():
             return
@@ -1855,12 +1917,40 @@ class CBFSafetyNode:
         return h_per_link.min(dim=1).values
 
     def _hardmin_h_value_no_grad(self, q, obs):
+        """Exact hard-min barrier, made COMPARABLE to the published ``h``.
+
+        ``h`` is the ROBOT/FORK group barrier at the group's own d_safe. This
+        used to min over get_whole_body_sdf_batch(return_per_link=False), which
+        appends the grasped object as an extra row (its own margin folded in via
+        grasp_dsafe_offset) whenever a grasp cloud is attached -- so with the
+        grasp separate constraint on, h_hard mixed two groups and could sit
+        BELOW h for a reason that had nothing to do with soft-vs-hard. Measured
+        on run1003: h_hard - h <= 0 on 100% of cycles, and the -5.7 mm minimum
+        was a robot link, not the food.
+
+        Dropping the grasped row when it has its own constraint makes the pair
+        like-for-like: same links, same margin, same q. What remains of the gap
+        is then exactly the POINT-SELECTION effect (top-k truncation, and the
+        grasp split budget handing the robot group's nearest point to the food
+        group), which is the thing worth reading off this series -- see the
+        h_hard/softmin_gap discussion in plot_cbf_diagnostics.py.
+        """
         if obs is None or int(obs.shape[0]) == 0:
             return torch.ones((q.shape[0],), dtype=torch.float32, device=self.device)
         pose = self.eye4.expand(q.shape[0], 4, 4)
-        sdf_value = self.bernstein_core.get_whole_body_sdf_batch(
-            obs, pose, q, return_per_link=False)
-        return sdf_value.min(dim=1).values - self.d_safe
+        drop_grasp_row = bool(
+            getattr(self, 'cbf_grasp_separate_constraint', False)
+            and getattr(self.bernstein_core, 'grasp_attach_link', None) is not None)
+        if not drop_grasp_row:
+            # Grasp folded into the single min (or no grasp at all): the whole
+            # body IS what h constrains, so the plain min stays correct.
+            sdf_value = self.bernstein_core.get_whole_body_sdf_batch(
+                obs, pose, q, return_per_link=False)
+            return sdf_value.min(dim=1).values - self.d_safe
+        _, sdf_per_link = self.bernstein_core.get_whole_body_sdf_batch(
+            obs, pose, q, return_per_link=True)
+        n_links = len(self.bernstein_core.used_links)
+        return sdf_per_link[:, :n_links, :].amin(dim=(1, 2)) - self.d_safe
 
     def _robot_constraint_bound(self, h):
         h_activate = max(self.cbf_h_activate, 1e-6)
@@ -2059,17 +2149,40 @@ class CBFSafetyNode:
                         sdf_grid, level=level, spacing=spacing)
                     vertices += lower.detach().cpu().numpy()
 
-                    # The isosurface vertices are already in the link/JOINT
-                    # frame: the Bernstein SDF is trained per link in that frame
-                    # (panda_rightfinger.stl bakes in the URDF visual rpy=pi, so
-                    # the pre-flipped geometry lives in the joint frame), and the
-                    # barrier evaluates it at _native_forward_kinematics poses,
-                    # which carry NO visual offset. The marker frame_id is the
-                    # same joint frame tf publishes. Applying visual_offset here
-                    # therefore double-rotated the right finger by 180deg (its
-                    # offset is rpy=pi; the left finger's is identity, so only the
-                    # right one showed the flip). Place the vertices directly.
-                    vertices_link = vertices
+                    # Place the isosurface where the BARRIER actually evaluates
+                    # it. bernstein_core._stack_used_link_transforms poses every
+                    # protected link at  T_world_joint @ T_visual  (it applies
+                    # the URDF <visual><origin> unconditionally), so the SDF
+                    # domain is the link's VISUAL/mesh frame. The marker
+                    # frame_id below is the JOINT frame tf publishes, so the
+                    # visual offset must be re-applied here; otherwise the drawn
+                    # envelope is rotated relative to the barrier it exists to
+                    # show.
+                    #
+                    # Only two links in panda_camera.xacro have a non-identity
+                    # visual origin: fork_tip (xyz -0.033 -0.02 0.0171,
+                    # rpy 0 27.5deg 0) and panda_rightfinger (rpy 0 0 pi);
+                    # everything else is identity and unaffected either way.
+                    #
+                    # An earlier revision dropped this transform for ALL links
+                    # because it flipped the right finger by 180deg. That was
+                    # the wrong generalisation: panda_rightfinger_w.pt is the
+                    # only PRE-FLIPPED (joint-frame) model in the set - its
+                    # centroid_offset is the left finger's with x,y negated,
+                    # i.e. Rz(pi) already baked in - whereas fork_tip_w.pt is a
+                    # plain MESH-frame model (its centroid_offset equals the
+                    # mesh bbox centre and its zero set matches the mesh at 0
+                    # deg). Skipping the offset therefore drew the fork envelope
+                    # 27.5deg off its own mesh. NOTE the corollary, which is a
+                    # real and separate issue: because the runtime applies
+                    # T_visual to every link, the right finger's BARRIER gets
+                    # Rz(pi) applied on top of an already-flipped model.
+                    info = self._find_visual_info(link_name)
+                    if info is None:
+                        vertices_link = vertices
+                    else:
+                        T_vis = info['visual_offset'].detach().cpu().numpy()
+                        vertices_link = vertices @ T_vis[:3, :3].T + T_vis[:3, 3]
 
                     marker = Marker()
                     marker.header.frame_id = link_name
@@ -3791,7 +3904,10 @@ class CBFSafetyNode:
                 self.static_issf_eps.copy_(
                     self.cbf_issf_epsilon + self.cbf_issf_rho * v_issf)
         if self.cbf_solver_mode in ("fast_tangent", "multi_graphed"):
+            self._gpu_ev_start.record()
             self.graph.replay()
+            self._gpu_ev_end.record()
+            self._gpu_ev_valid = True
             return self.static_dq_safe.detach()
         return self.solve_multicbf_projection(
             current_q, local_obs, dq_nom).detach()
@@ -4438,9 +4554,16 @@ class CBFSafetyNode:
             why.append("cluster_mode=%s (need topk)" % self.cbf_cluster_mode)
         if self.cbf_selection_sticky_points > 0:
             why.append("selection stickiness is on")
-        if self.cbf_grasp_enabled and self.cbf_grasp_separate_constraint \
-                and self.cbf_grasp_obstacle_points > 0:
-            why.append("grasp split-select is on")
+        # NOTE: the grasp split budget IS supported (see _build_selection_graph
+        # split_select). It used to bail here, which silently pinned the whole
+        # FEEDING rig to the legacy path -- feeding runs grasp_sdf_enabled +
+        # separate_constraint + 25 food points, so it never once used the graph
+        # and paid 45 ms mean / 22 ms median on critical_point_selection while
+        # the pick-place rig (grasp box off) paid 1.1 ms. The graph reproduces
+        # the split with fixed per-group budgets: two top-k's over disjoint
+        # index sets, the positional [robot | food] boundary taken from
+        # n_obs_robot_split, and the grasp_active gate applied as a device-side
+        # metric swap instead of a host branch.
         # NOTE: soft barrier value is supported. The graph emits a fixed k rows
         # padded with far dummies, so selected_count is k rather than the real
         # count; that is inert for the barrier (a dummy at 100 m contributes
@@ -4481,6 +4604,21 @@ class CBFSafetyNode:
         # fine: they live in the graph's private pool.
         self._sel_dummy_row = torch.full((1, 3), 100.0, device=self.device)
 
+        # Two-group budget, decided at CAPTURE time (pure config, so it is a
+        # Python branch, not a device predicate). Row layout must match
+        # n_obs_robot_split exactly -- the control graph slices the selection
+        # positionally as [robot ... | food ...], so this is taken FROM that
+        # attribute rather than recomputed, and the split is skipped when it
+        # would leave the food block empty.
+        split_n_robot = int(self.n_obs_robot_split)
+        split_n_food = int(self.cbf_graph_points) - split_n_robot
+        split_select = (
+            self.cbf_grasp_enabled
+            and self.cbf_grasp_separate_constraint
+            and self.cbf_grasp_obstacle_points > 0
+            and self.bernstein_core.grasp_attach_link is not None
+            and split_n_food > 0)
+
         def _select():
             link_poses = self.robot_layer._native_forward_kinematics_subset(
                 self._sel_static_q9, self.protected_fk_tree)
@@ -4499,13 +4637,47 @@ class CBFSafetyNode:
                 (sdf_all <= self.cbf_sdf_candidate_max_dist)
                 & (sdf_self_filter > self.cbf_sdf_self_filter_margin)
             )
-            score = torch.where(valid, sdf_all,
-                                torch.full_like(sdf_all, float('inf')))
-            # sorted=True (default) => scores ascend and the +inf rejects sort
-            # LAST, so the real points land in rows [0, n_real) and the dummy
-            # pad in [n_real, k): exactly the legacy _copy_fixed_obstacles
-            # layout, which is what lets selected_count keep its meaning.
-            sc, idx = torch.topk(score, k=self.cbf_graph_points, largest=False)
+            if split_select:
+                K = self.bernstein_core.K
+                # Rank each group by ITS OWN per-link SDF, exactly like
+                # _split_select_obstacles, so the food (smaller d_safe, always
+                # closest) cannot take every slot and starve the robot/fork
+                # constraint.
+                sdf_robot = sdf_per_link[0, :K, :].min(dim=0).values
+                sdf_food = sdf_per_link[0, K, :]
+                far = torch.full_like(sdf_robot, float('inf'))
+                sc_r, idx_r = torch.topk(
+                    torch.where(valid, sdf_robot, far),
+                    k=split_n_robot, largest=False)
+                # Legacy only splits while grasp_active > 0.5 and gives the WHOLE
+                # budget to the robot group otherwise. grasp_active is a device
+                # scalar, so reproduce that without a host branch (which a graph
+                # cannot have) by collapsing the food metric onto the robot
+                # metric: the food block then holds the next-best robot points,
+                # i.e. k robot-nearest points overall, bit-identical to the
+                # legacy no-grasp top-k.
+                food_metric = torch.where(
+                    self.bernstein_core.grasp_active > 0.5, sdf_food, sdf_robot)
+                # Food-nearest points that the robot group did not already take.
+                taken = torch.zeros_like(valid).index_fill(0, idx_r, True)
+                sc_f, idx_f = torch.topk(
+                    torch.where(valid & ~taken, food_metric, far),
+                    k=split_n_food, largest=False)
+                # NOT re-sorted: the boundary is positional. Rejects inside
+                # either block stay +inf and become dummy rows below, so a
+                # short block pads in place instead of shifting the boundary.
+                sc = torch.cat([sc_r, sc_f])
+                idx = torch.cat([idx_r, idx_f])
+            else:
+                # sorted=True (default) => scores ascend and the +inf rejects
+                # sort LAST, so the real points land in rows [0, n_real) and the
+                # dummy pad in [n_real, k): exactly the legacy
+                # _copy_fixed_obstacles layout, which is what lets
+                # selected_count keep its meaning.
+                sc, idx = torch.topk(
+                    torch.where(valid, sdf_all,
+                                torch.full_like(sdf_all, float('inf'))),
+                    k=self.cbf_graph_points, largest=False)
             sel = self._sel_static_pts[idx]
             finite = torch.isfinite(sc)
             # Fewer than k valid points: the tail of the top-k holds rejects.
@@ -4545,9 +4717,11 @@ class CBFSafetyNode:
         self._sel_graph = g
         rospy.loginfo(
             "CBF selection: graphed path ready (width=%d pts, k=%d, "
-            "max_dist=%.3f, self_margin=%.3f)",
+            "max_dist=%.3f, self_margin=%.3f, split=%s)",
             self.cbf_sdf_graph_points, self.cbf_graph_points,
-            self.cbf_sdf_candidate_max_dist, self.cbf_sdf_self_filter_margin)
+            self.cbf_sdf_candidate_max_dist, self.cbf_sdf_self_filter_margin,
+            ("robot %d | food %d" % (split_n_robot, split_n_food))
+            if split_select else "off")
 
     def _selection_broad_phase(self, pts, q9, n_keep):
         """Cloud wider than the graph: keep the n_keep nearest by link centre.
@@ -5595,7 +5769,20 @@ class CBFSafetyNode:
                                     self._dq_real_inst_norm)
                         self.static_scalars.copy_(self._scalar_pin,
                                                   non_blocking=True)
-                        self.graph.replay()
+                        # GPU-time brackets around the graphed control step.
+                        # This is the replay that runs when _graph_control_step
+                        # is true; the one in _run_velocity_cbf_solver covers
+                        # the eager path only.
+                        self._graph_replays += 1
+                        if (self._profile_graph
+                                and self._graph_replays
+                                == self._profile_graph_after):
+                            self._profile_graph_replay()
+                        else:
+                            self._gpu_ev_start.record()
+                            self.graph.replay()
+                            self._gpu_ev_end.record()
+                            self._gpu_ev_valid = True
                         self._queue_escape_state(self.static_dq_nom_cbf,
                                                  dq_out=self.static_dq_safe,
                                                  dq_nom_raw=self.static_dq_nom)
@@ -6146,6 +6333,22 @@ class CBFSafetyNode:
                 self.timing.publish('cbf_command', (t_q_cmd_done - t_cbf_done) * 1000.0)
                 self.timing.publish('cbf_d2h', (t_d2h_done - t_q_cmd_done) * 1000.0)
                 self.timing.publish('cbf_total', (t_pub_done - t_start) * 1000.0)
+                # Device-side execution time of the graph replay. Read here,
+                # AFTER the .cpu() above has drained the stream, so both events
+                # are complete and elapsed_time() returns without blocking.
+                # cbf_gpu vs cbf_d2h is the whole question: equal means the GPU
+                # is genuinely busy and the work must shrink; cbf_gpu much
+                # smaller means the time is gaps between dependent kernels and
+                # shrinking the problem cannot help.
+                if self._gpu_ev_valid:
+                    try:
+                        self.timing.publish(
+                            'cbf_gpu',
+                            self._gpu_ev_start.elapsed_time(self._gpu_ev_end))
+                    except RuntimeError:
+                        # Events not both recorded yet on this cycle; skip the
+                        # sample rather than force a synchronise for telemetry.
+                        pass
 
                 # diag_due / need_telemetry were decided before the hot
                 # section (see above) so diagnostics-only tensor math could be
@@ -6282,8 +6485,15 @@ class CBFSafetyNode:
                         valid_obs_count = max(0, min(
                             int(self._adopted_count), int(local_obs.shape[0])))
                         with torch.no_grad():
+                            # Same q the barrier used, not the live one. h comes
+                            # off the CUDA-graph step, which read static_q at
+                            # the top of the cycle; current_q has since advanced
+                            # by the whole solve+readback latency (cbf_d2h runs
+                            # 10 ms mean / 97 ms max on the feeding rig), and
+                            # that alone put several mm of spurious gap into
+                            # h_hard - h (corr(gap, q_lead) = -0.44 on run1003).
                             h_hard_tensor = self._hardmin_h_value_no_grad(
-                                current_q.detach(), local_obs[:valid_obs_count])
+                                self.static_q.detach(), local_obs[:valid_obs_count])
                         h_hard_val = float(h_hard_tensor.detach().view(-1)[0].cpu())
                         softmin_gap_val = h_hard_val - h_val
                     else:

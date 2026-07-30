@@ -7,12 +7,41 @@
   <arg name="launch_sam3_server" default="true" />
   <!-- Set gui:=false to run Gazebo headless (no gzclient / no X needed). -->
   <arg name="gui" default="true" />
-  <include file="$(find vision_processing)/launch/feeding_simulation_position_controller.launch">
-    <arg name="use_direct_group_position_controller" value="$(arg use_direct_group_position_controller)" />
-    <arg name="use_direct_group_velocity_controller" value="$(arg use_direct_group_velocity_controller)" />
-    <arg name="launch_sam3_server" value="$(arg launch_sam3_server)" />
-    <arg name="gui" value="$(arg gui)" />
-  </include>
+  <!-- NOTE: the Gazebo include now sits AFTER the parameter block (section 1.9),
+       because it forwards the CBF's own reflex/ISSf constants down to the
+       certified C++ controller and roslaunch resolves $(arg ...) in document
+       order. -->
+
+  <!-- ===================================================================
+       CBF STACK PARITY WITH green_cube_feeding_casf_pp.launch.
+       Every knob the pick-and-place launch exposes is now declared here too,
+       and each is set to the PICK-AND-PLACE VALUE, so the two rigs run the
+       same CBF stack:
+         cbf_selection_mode:=graphed            (was legacy: this alone is the
+             50x on /pipeline/timing/critical_point_selection)
+         cbf_qp_algorithm:=dykstra   cbf_dykstra_warmstart:=true
+         cbf_smoothing_mode:=in_projection
+         cbf_repair_all_rows:=true   cbf_repair_sweeps:=24
+                                     cbf_repair_grad_min:=0.03
+         cbf_joint_limit_margin:=0.15
+         cbf_sampled_data_margin:=true   cbf_sampled_data_linearization:=executed
+         cbf_issf_epsilon:=0.025
+         cbf_barrier_value_mode:=hard    cbf_reflex_mode:=certified
+         use_cpp_certified_controller:=true
+         cbf_model_override_dir:=.../nfunc12_candidate
+       Two of these are a PAIR: the certified reflex assumes an unbiased h, so
+       cbf_barrier_value_mode:=hard and cbf_reflex_mode:=certified are flipped
+       together or not at all.
+       Values deliberately NOT copied from PP, because they are feeding-tuned
+       rather than stack-level: cbf_h_activate (0.1 vs 0.08),
+       cbf_max_inward_speed (0.20 vs 0.5), cbf_constraint_margin (0.01 vs 0),
+       cbf_preprocess_rate_hz (30 vs 100, with cbf_task_metric_update_every 1
+       vs 3 — those two must move together), cbf_graph_points (100 vs 64).
+       WATCH on the first runs: sampled_data_margin, issf_epsilon and
+       joint_limit_margin all ADD standoff, and feeding legitimately operates
+       at h ~ 0 inside the bowl, so if the fork stops reaching the food these
+       three are the first suspects.
+       =================================================================== -->
 
   <!-- 1. General Parameters -->
   <arg name="target_prompt" default="green cube" />
@@ -35,6 +64,43 @@
   <!-- Obstacle source for the CBF. Default = persistent memory map. Override to
        /perception/cleaned_obstacles for the memoryless (live-FOV only) ablation. -->
   <arg name="cbf_obs_topic" default="/perception/persistent_obstacles" />
+  <!-- Ablation campaign mode. true = every node advertising an episode hook
+       exposes <node>/episode/reset, and episode_director rewinds the world in
+       place so a trial is an EPISODE inside one long-lived process tree rather
+       than a process lifecycle. Startup of this bench is dominated by state that
+       is identical in every cell of the matrix (SAM3 server, the FM checkpoint,
+       the CBF's URDFLayer + 9 Bernstein SDF models + CUDA-graph capture), so
+       relaunching per trial pays that cost once per trial instead of once.
+       false = completely inert: no services advertised, no director, no gate,
+       and no behavioural change anywhere in the pipeline. -->
+  <arg name="enable_episode_control" default="false"/>
+  <!-- Per-episode uniform jitter half-widths [m]. The BOWL is drawn in world
+       coordinates and the FOOD is drawn as an offset from wherever the bowl
+       landed (see object_relative_to below), so the food is always in the bowl
+       however wide the bowl's own draw is.
+       The food half-width is bounded by the bowl, and the bound is on the
+       distance from the food's NOMINAL spot, not from the bowl axis: the food
+       already sits 20 mm off the container model's origin, so a square draw
+       around the axis would reach hypot(20+h, h) and clip the wall long before
+       h looks large. Other_container_collision.stl (scale 0.003/0.003/0.002) is
+       a 62 mm-radius well and the food is a 30 mm cube (21 mm half-diagonal),
+       so 10 mm keeps the worst corner draw 14 mm from nominal, comfortably
+       clear whatever the exact well centre is.
+       TWO THINGS TO CONFIRM AT THE SMOKE TEST, both of which fail quietly:
+         * the container is <static>true</static> in its xacro, so verify
+           set_model_state actually moves it rather than reporting success and
+           leaving the bowl where it spawned;
+         * 20 mm on the bowl is a conservative guess at the region the feeding
+           demonstrations covered, not a measured bound. A bowl drawn outside it
+           tests extrapolation of the policy rather than the filter, and a bowl
+           drawn far enough moves the target out of the wrist camera's framing
+           at the start pose. -->
+  <arg name="randomize_bowl_x" default="0.02"/>
+  <arg name="randomize_bowl_y" default="0.02"/>
+  <arg name="randomize_food_x" default="0.01"/>
+  <arg name="randomize_food_y" default="0.01"/>
+  <!-- Seed for the POSE randomization stream, independent of fm_noise_seed. -->
+  <arg name="randomize_seed" default="0"/>
   <arg name="cbf_prism_margin" default="0.02" />
   <arg name="cbf_link_filter_radius" default="0.35" />
   <arg name="cbf_link_prefilter_points" default="2048" />
@@ -45,6 +111,37 @@
   <arg name="cbf_sdf_prefilter_max_points" default="2048" />
   <arg name="cbf_selection_metric" default="sdf" />
   <arg name="cbf_cluster_mode" default="topk" />
+  <!-- Critical-point selection path (A/B toggle; legacy = the old code).
+       graphed = ONE fixed-width CUDA-graph replay does FK + whole-body SDF +
+       self-filter + top-k. It replaces three dynamic-shape passes over the
+       cloud (cdist prefilter -> chunked eager SDF -> boolean keep_mask -> cat
+       -> topk), whose mask-index forced a D2H sync in the preprocess thread.
+       Bit-exact vs the eager path over random q / cloud sizes. Measured on the
+       pick-place twin (/pipeline/timing/critical_point_selection, ms):
+         legacy  562  40.52  37.92  73.43  100.78
+         graphed 737   1.05   0.52   3.59   16.60
+       i.e. p50 73x, p95 20x — most of the legacy cost is not arithmetic but
+       the mask-index D2H sync waiting behind SAM2/FM work in the shared GPU
+       queue, which only exists in the full system. Works with
+       cbf_barrier_value_mode hard AND soft. If the selection silently reverts
+       to legacy timings, check the startup log: an unsupported config (e.g.
+       cbf_selection_metric != sdf) falls back with a warning. -->
+  <arg name="cbf_selection_mode" default="graphed" />
+  <!-- Fixed graph width. Must cover the WHOLE cloud, else the cdist broad
+       phase re-engages to choose which points survive (truncating a cloud
+       would drop real obstacles). Measured feeding cloud: 2573 pts, so 4096
+       covers it with headroom. Cost tracks the padded width, not the real
+       cloud: 2048 -> 0.68 ms, 4096 -> 0.90 ms, 10000 -> 1.72 ms. Raise it only
+       if the persistent map actually grows past it. -->
+  <arg name="cbf_sdf_graph_points" default="4096" />
+  <!-- DIAGNOSTIC ONLY. One-shot CUDA kernel breakdown of the captured control
+       step, logged once on the Nth replay then disabled. cbf_gpu says how long
+       the graph runs on the device; this says WHICH kernels and how many,
+       which is what separates "a few expensive kernels" from "hundreds of
+       small ones" — identical in cbf_gpu, opposite fixes. The profiled cycle
+       forces a synchronise and runs long, so never leave it on for a run. -->
+  <arg name="cbf_profile_graph" default="false" />
+  <arg name="cbf_profile_graph_after" default="200" />
   <arg name="cbf_fork_mesh_selection_points" default="512" />
   <arg name="cbf_publish_yellow_points" default="false" />
   <arg name="cbf_selected_obstacle_hold_time" default="0.1" />
@@ -63,18 +160,26 @@
   <arg name="casf_alpha" default="10.0" />
   <arg name="enable_casf_correction" default="false" />
   <arg name="fm_noise_seed" default="7" />
-  <arg name="use_temporal_ensembler" default="true" />
+  <arg name="use_temporal_ensembler" default="false" />
   <arg name="planner_single_shot" default="false" />
   <arg name="planner_wait_for_cbf_ready" default="true" />
   <arg name="ensembler_buffer_size" default="1" />
   <arg name="ensembler_decay" default="0.1" />
-  <!-- Dynamic-scene ensembler gate: blend only while the CBF reports a moving
-       obstacle closing on the robot (/cbf_safety/env_hdot = max dynamic-hdot
-       tightening, m/s; zero for static scenes by deadband design — raw h
-       cannot be used, feeding rides h~0 in the bowl). Supersedes the constant
-       use_temporal_ensembler flag when true. Gate holds ensembler_gate_hold
-       seconds past the last reading above ensembler_env_hdot_on. -->
-  <arg name="ensembler_dynamic_gate" default="true" />
+  <!-- DISABLED at user request (2026-07-29). This was the quasi-static-scene
+       switch: it watched /cbf_safety/env_hdot (the CBF's moving-obstacle
+       tightening) and, above ensembler_env_hdot_on, OVERRODE the constant
+       use_temporal_ensembler flag to turn the ensembler on for
+       ensembler_gate_hold seconds — logging
+         "Moving obstacle detected (env_hdot ... >= ...) — temporal ensembler ON"
+       With the gate false the whole mechanism is inert: the planner does not
+       even subscribe to /cbf_safety/env_hdot (casf_generative_node_PC.py:449)
+       and use_temporal_ensembler alone decides, with no scene-dependent
+       override. The two thresholds below are kept only so the knob still
+       exists; they have no effect while the gate is false.
+       NOTE the param is still passed explicitly to the planner node below
+       rather than deleted, so a stale `true` left on a warm roscore by an
+       older run cannot silently switch it back on. -->
+  <arg name="ensembler_dynamic_gate" default="false" />
   <arg name="ensembler_env_hdot_on" default="0.04" />
   <arg name="ensembler_gate_hold" default="4.0" />
   <arg name="trajectory_retime_mode" default="joint_speed" />
@@ -99,7 +204,100 @@
   <arg name="commit_distance" default="0.00" />
   <arg name="cbf_kappa" default="5.0" />
   <arg name="cbf_recovery_kappa" default="5.0" />
+  <!-- Constraint-bound margin m [m/s]: the QP enforces hdot >= -kappa*h + m,
+       so a nominal pushing at a wall settles at the standoff h* = m/kappa
+       (2 mm here). Left at the tested feeding value; the sampled-data margin
+       below adds a velocity-EARNED term on top of it (the pick-place launch
+       sets this to 0 and relies on the earned term alone — worth an A/B here,
+       since feeding legitimately rides h ~ 0 inside the bowl). -->
   <arg name="cbf_constraint_margin" default="0.01" />
+  <!-- Sampled-data (ZOH) QP margin, A/B toggle. true = the constraint bound is
+       tightened by the STATE-DEPENDENT term of the sampled-data CBF condition
+       (Breeden, Garg & Panagou, L-CSS 2022) instead of relying on a constant:
+       m(dq) = (L/2)||dq||^2 T [m/s], with the per-link L below and
+       T = cbf_sampled_data_T. This is the SAME certificate the certified
+       reflex enforces post-hoc, applied where the decision is made: the QP
+       commands the largest hold-certifiable slide speed itself instead of
+       commanding a velocity the reflex must veto every tick. The standoff it
+       buys is velocity-dependent and -> 0 at rest, i.e. earned, not a constant
+       fudge. Logged per cycle as the 'sampled_margin' diagnostics scalar.
+       FEEDING CAVEAT: the skewering phase runs slowly at h ~ 0 inside the
+       bowl, where ||dq||^2 is small and the term nearly vanishes — but verify
+       on a bowl-entry run before trusting it, and set false to fall back to
+       the constant margin alone. -->
+  <arg name="cbf_sampled_data_margin" default="true" />
+  <!-- ISSf tracking-error margin (Kolathaya & Ames, IEEE L-CSS 2019): the
+       plant executes dq = u + d, not the command (velocity-controller lag,
+       output low-pass memory, reflex scaling), so every QP row is tightened by
+       ||grad_h_row|| * epsilon to certify the TRUE flow rather than silently
+       assuming perfect tracking. epsilon is the PROJECTED disturbance bound:
+       the certificate only ever consumes grad_h . d, so the identified
+       quantity is |cmd_hdot - real_hdot| / ||grad_h||, i.e. the mismatch
+       measured ALONG the constraint direction, straight from the diagnostics
+       log. 0.025 covers the p99 of every speed bin on the pick-place twin and
+       is speed-INDEPENDENT there (the tracking error is mostly filter lag
+       along the tangential command direction). Re-identify on a feeding run
+       before quoting a certified bound. rho stays available
+       (eps(v) = eps0 + rho*v). eps0 = rho = 0 = off (legacy bound). -->
+  <arg name="cbf_issf_epsilon" default="0.025" />
+  <arg name="cbf_issf_rho" default="0.0" />
+  <!-- Compact controller-rate epsilon identification. Every tick is
+       evaluated; one worst-case summary is published per divisor window. -->
+  <arg name="cbf_epsilon_sample_divisor" default="10" />
+  <arg name="cbf_epsilon_normal_alpha_threshold" default="0.90" />
+  <arg name="cbf_epsilon_motion_threshold" default="0.0001" />
+  <!-- Linearization point of the margin/eps speed: "executed" =
+       min(command-based v^2, (||dq_measured|| + headroom)^2). Fixes the
+       repair->margin feedback loop (a published command self-inflating the
+       margin to its cap) and the parked overcharge (margin linearized at the
+       NOMINAL speed while the arm executes a fraction of it). headroom = the
+       identified per-hold speed INCREASE bound; braking cannot deepen the dip.
+       "command" = legacy self-referential linearization. -->
+  <arg name="cbf_sampled_data_linearization" default="executed" />
+  <arg name="cbf_sampled_data_vel_headroom" default="0.15" />
+  <!-- T [s]: the zero-order-hold duration the sampled-data margin
+       mu = 0.5 * L * ||dq||^2 * T is dimensioned on. It must MAJORATE the real
+       interval between two published commands, since that is the span the
+       command is actually held over. 0 = auto (1/rate_hz), which silently
+       under-states the true hold whenever the loop runs late. -->
+  <arg name="cbf_sampled_data_T" default="0.00666666666" />
+  <!-- Per-link L for the sampled-margin rows, in cbf_link_names order — for
+       feeding that is the list made explicit at the CBF node below:
+       link3, link4, link5, link6, link7, hand, rightfinger, leftfinger,
+       fork_tip. Values are the one-sided curvature sups of the deployed
+       analytic barrier (sdf_gradient_experiments/lipschitz_bound_study.py,
+       nfunc12 p99s, rounded up): link3 4.26, link4 4.71, link5 9.59,
+       link6 21.81, link7 31.97, hand 19.72. The two FINGERS use the same
+       tuned 20 as the pick-place launch. fork_tip has NO entry in the study
+       (it is not a panda link), so it takes the conservative global worst case
+       20 — over-estimating L only tightens the certificate, never weakens it.
+       Empty string = scalar ~cbf_sampled_data_L everywhere (legacy). -->
+  <arg name="cbf_sampled_data_L_links" default="4.3 4.7 9.6 21.8 32.0 19.7 20 20 20" />
+  <!-- Final repair over ALL solve rows, not the min-h row alone. The
+       critical-row repair fixes the min-h link exactly and can thereby push
+       INTO a second nearly-opposed row (fork + robot links pinched around the
+       container rim), which the reflex then rightly vetoes (alpha = 0 freeze)
+       although a direction improving BOTH rows exists. All-rows repair re-runs
+       the Dykstra sweeps on the post-filter command (in-graph,
+       multi_graphed only). -->
+  <arg name="cbf_repair_all_rows" default="true" />
+  <!-- Repair iterations, decoupled from the solve's 6: 6 sweeps over
+       task-metric-skewed opposing rows leave a constant residual that is
+       re-paid every cycle. 24 POCS sweeps of K tiny vector ops are sub-ms
+       inside the graph and drive the tail below 1e-4. -->
+  <arg name="cbf_repair_sweeps" default="24" />
+  <!-- Repair inner algorithm: dykstra = exact min-W-norm projection onto the
+       row intersection (validated family, solver_study.py; smallest deviation
+       from the near-optimal command). Requires exact per-row projections, so
+       the grad-min gate is BINARY under it (row in/out at
+       cbf_repair_grad_min) instead of a damped ramp, which would freeze the
+       Dykstra fixed point at gate*projection. pocs = feasibility-only fallback
+       tolerating the damped gate ramp. -->
+  <arg name="cbf_repair_qp_algorithm" default="dykstra" />
+  <!-- Rows whose barrier gradient is below this norm are excluded from the
+       repair: near-degenerate gradients otherwise produce violent corrections
+       (the projection divides by ||g||^2). -->
+  <arg name="cbf_repair_grad_min" default="0.03" />
   <arg name="cbf_recovery_switch_margin" default="0.015" />
   <arg name="cbf_enforce_final_constraint" default="true" />
   <arg name="cbf_integrate_from_current" default="true" />
@@ -119,6 +317,26 @@
   <arg name="max_feedback_velocity" default="0.5" />
   <arg name="cbf_filter_tau" default="0.05" />
   <arg name="cbf_velocity_filter_tau" default="0.05" />
+  <!-- Output-smoothing seam (uses cbf_velocity_filter_tau as its time
+       constant). output_filter = legacy post-QP low-pass, re-certified by the
+       final repair. in_projection = the same exponential memory moved INTO the
+       projection objective (solver input = (1-gamma)*previous command +
+       gamma*nominal): identical smoothing when no constraint is active,
+       feasible-by-construction output on active rows — it removes the
+       filter-then-repair seam, and the repair stays as verification.
+       Offline equivalence + seam proof:
+       tests/test_smoothing_in_projection.py. -->
+  <arg name="cbf_smoothing_mode" default="in_projection" />
+  <!-- /cbf_safety/ready waits for a first obstacle cloud and the planner waits
+       on that (planner_wait_for_cbf_ready), which is what stops the shield
+       running blind. Set false ONLY for a configuration where no obstacle
+       source exists at all, since the planner would otherwise never plan. -->
+  <arg name="cbf_watchdog_require_obstacles" default="true" />
+  <!-- Master switch, was hardcoded true on the node. false = the shield is not
+       constructed at all; for the "sans CBF" ABLATION prefer
+       cbf_monitor_only:=true, which still computes the barrier and
+       diagnostics (so the run is measurable) but applies no correction. -->
+  <arg name="enable_cbf" default="false" />
   <arg name="cbf_use_nominal_velocity_topic" default="true" />
   <arg name="cbf_nominal_velocity_timeout" default="0.25" />
   <arg name="cbf_nominal_feedforward_gain" default="1.0" />
@@ -132,6 +350,48 @@
   <arg name="cbf_escape_normal_gain" default="0.04" />
   <arg name="cbf_escape_normal_h_trigger" default="0.0" />
   <arg name="cbf_escape_max_velocity" default="0.2" />
+  <!-- Remaining escape knobs, wired for parity with the pick-and-place launch.
+       ALL INERT here: cbf_escape_enabled is false, and it stays false by
+       design — an autonomous "when stuck, go up" reflex is inappropriate near
+       a person's face (the thesis treats frontal blockage of the controlled
+       link as an assumed safe-stop limitation, ch. 4). q_dot_clear
+       (cbf_nullspace_clearance_gain) is the sanctioned deadlock relief here. -->
+  <arg name="cbf_escape_lift_gain" default="0.2" />
+  <!-- Proportional escape gate time constant [s]: the escape authority ramps
+       with h-proximity, gated by actual CBF conflict and EMA-filtered with
+       this tau, instead of latching or chattering on a binary trigger. -->
+  <arg name="cbf_escape_gate_tau" default="0.3" />
+  <arg name="cbf_escape_probe_enabled" default="false" />
+  <arg name="cbf_escape_probe_num_dirs" default="16" />
+  <!-- Long radii = the probe's planning horizon: short ones make every tangent
+       direction along a wall score as an identical corridor, so "around" (the
+       edge 12-15 cm away) can never win the vote. -->
+  <arg name="cbf_escape_probe_radii" default="0.05 0.10 0.20 0.5" />
+  <!-- Concave-pocket machinery (hemisphere elevations + clearance-growth
+       scoring + nominal-inward suppression) OFF: "0"/0.0/0.0 = the legacy
+       gentle nudge (tangent slide + probed lift only). -->
+  <arg name="cbf_escape_probe_elevations" default="0" />
+  <arg name="cbf_escape_probe_growth_weight" default="0.0" />
+  <arg name="cbf_escape_suppress_nominal" default="0.0" />
+  <arg name="cbf_escape_probe_clearance_cap" default="0.20" />
+  <arg name="cbf_escape_probe_goal_weight" default="0.02" />
+  <arg name="cbf_escape_probe_commit_weight" default="0.02" />
+  <!-- Table top is z=0.75 in the feeding world frame. -->
+  <arg name="cbf_escape_probe_min_z" default="0.78" />
+  <arg name="cbf_escape_probe_ema" default="0.3" />
+  <!-- Tabu re-vote: if the committed escape direction yields
+       < tabu_min_progress of TCP motion along itself for tabu_timeout seconds
+       (QP-clipped: wedged), it is penalized for tabu_ttl seconds and the probe
+       re-votes. Progress = displacement along the direction, not h (a good
+       tangential escape slides at h ~ trigger). -->
+  <arg name="cbf_escape_probe_tabu_timeout" default="1.5" />
+  <arg name="cbf_escape_probe_tabu_min_progress" default="0.03" />
+  <arg name="cbf_escape_probe_tabu_weight" default="0.8" />
+  <arg name="cbf_escape_probe_tabu_ttl" default="8.0" />
+  <!-- Speculative exploration OFF (0 = disabled); the proportional gate +
+       probe + simple stall tabu are the whole local deadlock net. -->
+  <arg name="cbf_escape_probe_resolve_timeout" default="0.0" />
+  <arg name="cbf_escape_probe_reentry_window" default="0.0" />
   <arg name="sam_tracking_rate_hz" default="5.0" />
   <arg name="sam3_init_retry_period" default="8.0" />
   <arg name="sam3_init_backoff_after_failures" default="2" />
@@ -180,7 +440,7 @@
   <arg name="persistent_floor_height_max_step"    default="0.0" />
   <!-- Camera-independent obstacle. In the Panda/world convention, -Y is the
        robot's right side; the default sphere moves only along +Y. -->
-  <arg name="moving_sphere_enabled" default="true" />
+  <arg name="moving_sphere_enabled" default="false" />
   <arg name="moving_sphere_initial_x" default="0.30" />
   <arg name="moving_sphere_initial_y" default="-2.8" />
   <arg name="moving_sphere_initial_z" default="0.5" />
@@ -224,7 +484,7 @@
   <arg name="cbf_profile_sync" default="false" />
   <arg name="cbf_publish_diagnostics" default="true" />
   <arg name="cbf_diagnostics_decimation" default="4" />
-  <arg name="fm_use_torch_compile" default="false" />
+  <arg name="fm_use_torch_compile" default="true" />
   <!-- CBF node selection: cbf_safety_node_Bernstein.py (single soft-min
        constraint, CUDA graph) or cbf_safety_node_Bernstein_multicbf.py.
        The multicbf-specific args below are ignored by the Bernstein node. -->
@@ -240,6 +500,33 @@
   <arg name="cbf_final_constraint_mode" default="solver_bound"/>
   <arg name="cbf_multi_gradient_mode" default="analytical" />
   <arg name="cbf_multi_fd_eps" default="0.001" />
+  <!-- Inner QP solver over the active half-spaces. pocs = legacy cyclic
+       projections: converges to A feasible dq, which over-corrects when
+       several rows are active at once (the excess of an early projection is
+       never given back) and depends on row order. dykstra = Dykstra's
+       corrected projections (= Hildreth's dual method for half-spaces): one
+       correction-memory vector per row, converges to the EXACT min-W-norm
+       projection of the nominal onto the intersection, i.e. the true QP
+       optimum. Identical output when at most 1 constraint is active; smaller,
+       order-independent corrections in multi-constraint episodes (bowl rim +
+       food + robot). ~2 extra vector ops per row-step inside the CUDA graph
+       (sub-ms). Refs in the node comment (Dykstra 1983; Boyle & Dykstra 1986;
+       Hildreth 1957). -->
+  <arg name="cbf_qp_algorithm" default="dykstra" />
+  <!-- Cross-cycle Dykstra warm start: carry the dual multipliers per link
+       identity across cycles (offline prototype: solver_study.py — the
+       ill-conditioned tail converges in ~2-3 cycles instead of plateauing). -->
+  <arg name="cbf_dykstra_warmstart" default="true" />
+  <!-- Soft joint-limit barrier on the FINAL commanded velocity (both CUDA-
+       graph and eager paths): each joint brakes as it approaches its URDF
+       limit (allowed speed = kappa * distance-to-band) and gets a small
+       bounded push back if it enters the band. On the Panda this IS the
+       singularity guard: elbow-straight = q4 at its upper limit,
+       wrist-aligned = q6 at its lower limit, so a 0.15 rad margin keeps the
+       arm away from both regardless of who commands the motion (FM, CBF
+       correction, escape, q_dot_clear). 0 = off. -->
+  <arg name="cbf_joint_limit_margin" default="0.15" />
+  <arg name="cbf_joint_limit_kappa" default="3.0" />
   <arg name="cbf_h_activate" default="0.1" />
   <!-- Two-rate reflex brake: a ~1 kHz layer between the 100 Hz CBF-QP and the
        velocity controller that extrapolates h(t) ~ h + grad_h^T dq dt under
@@ -251,25 +538,89 @@
        ON by default for feeding; enable_cbf_reflex:=false is the
        100 Hz-only ablation arm. -->
   <arg name="enable_cbf_reflex" default="true" />
+  <!-- Hard-real-time path: keep the GPU SDF/QP in Python, but consume one
+       atomic command+certificate packet inside the 1 kHz C++ ros_control
+       update (certified_cbf_velocity_controller, panda joints in
+       config/simple_controllers.yaml). false = the validated Python reflex
+       node (cbf_reflex_node.py, section 8.5) instead. -->
+  <arg name="use_cpp_certified_controller" default="true" />
   <arg name="cbf_reflex_rate_hz" default="1000.0" />
   <!-- No horizon arg: the reflex measures its own decision period and
        certifies only that, so the guarantee no longer assumes the CBF
-       solves within a hand-set latency (see cbf_reflex_node.py). -->
+       solves within a hand-set latency (see cbf_reflex_node.py). A slow QP
+       just ages the state, which brakes harder on its own. Standoff is bought
+       with h_stop (a distance), not a padded horizon. -->
   <arg name="cbf_reflex_h_stop" default="0.0" />
+  <!-- Must be STRICTLY GREATER than the QP band slope
+       max_inward_speed/h_activate (here 0.20/0.1 = 2.0 1/s), with real gap —
+       NOT equal. Whenever the nominal pushes at an obstacle the QP saturates
+       its constraint (equality), so its command decays h at exactly
+       slope*h - margins. The reflex re-checks that command with extra
+       remainder charges the QP does not carry (drift correction L*p.dq,
+       unmeasured-gap ISSf charge, per-tick curvature): at exp_kappa = slope
+       the certificate is tight-against-tight with ZERO slack and those charges
+       tip every QP-legal command negative (measured on the pick-place twin:
+       74% of ticks braked, alpha ~ 0 the whole path). The gap
+       (exp_kappa - slope)*h + QP margins is the slack budget. Any
+       exp_kappa > 0 yields the same forward-invariance guarantee (zeroing-CBF
+       with class-K alpha(h) = exp_kappa*h); the QP's tighter band remains the
+       shaping layer, the reflex the backstop for commands that escape
+       certification (nested class-K layering, cf. Rosolia/Singletary/Ames
+       multirate control). -->
+  <arg name="cbf_reflex_exp_kappa" default="25.0" />
+  <!-- Reflex extrapolation mode. linear = legacy first-order estimate with the
+       frozen gradient. certified = sampled-data CBF bound (Breeden, Garg &
+       Panagou, "Control Barrier Functions in Sampled-Data Systems", IEEE
+       L-CSS 2022): adds the Lipschitz remainder -(L/2)||dq*T||^2 so
+       h >= h_stop is guaranteed over the WHOLE zero-order-hold interval, not
+       just at the extrapolation endpoint; reduces to linear as L -> 0. Full
+       derivation + assumptions + references: cbf_reflex_node.py docstring.
+       NOTE: the certificate assumes an UNBIASED h — hence
+       cbf_barrier_value_mode:=hard below. -->
+  <arg name="cbf_reflex_mode" default="certified" />
+  <!-- Per-link L [m/rad^2], cbf_link_names order (link3..7, hand, fingers,
+       fork_tip) — same values and same fork_tip caveat as
+       cbf_sampled_data_L_links above. Validate against the empirical estimate
+       in /cbf_reflex/status[4]. A scalar value is still accepted (legacy
+       global constant). -->
+  <arg name="cbf_reflex_grad_lipschitz" default="4.3 4.7 9.6 21.8 32.0 19.7 20 20 20" />
+  <!-- Retrained n_func=12 candidate models (validated 2026-07-14: finger MAE
+       halved to 0.61 mm, p95 gradient angle 124->41 deg, negative curvature
+       sup 840->508 vs production n_func=8; link3 retrained 2026-07-19, p99
+       8.7 -> 4.3). Only the links whose PRODUCTION model is still n_func=8
+       need swapping: panda_link3 and the two fingers (link4..7, hand and
+       fork_tip are already n=12). These are the models the L vectors above
+       were measured on. Empty string = production models everywhere. -->
+       Empty = production models everywhere, which is what this launch ran
+       before the knob existed — keep it that way and opt in explicitly:
+         cbf_model_override_dir:=$(find vision_processing)/third_party/SDF_Bernstein_Basis/panda_test/Models/nfunc12_candidate -->
+  <arg name="cbf_model_override_dir"
+       default="$(find vision_processing)/third_party/SDF_Bernstein_Basis/panda_test/Models/nfunc12_candidate" />
+  <arg name="cbf_model_override_links" default="panda_link3 panda_leftfinger panda_rightfinger" />
   <!-- Barrier VALUE mode. soft = legacy Softmin value: under-reports clearance
        by the crowding bias tau*log(M_eff) (~15 mm when the dense moving-sphere
        cloud parks dozens of points within tau of the min), so the reported h
        dips below 0 while the true clearance stays positive. hard = exact
        per-link hard-min VALUE for the QP band + diagnostics; the smooth
-       Softmin still supplies the gradient direction. -->
-  <arg name="cbf_barrier_value_mode" default="soft" />
+       Softmin still supplies the gradient direction.
+       CHANGED soft -> hard together with cbf_reflex_mode:=certified above:
+       the certified reflex REQUIRES an unbiased h (assumption (iii) in
+       cbf_reflex_node.py), else it brakes on phantom near-zero values whose
+       true clearance is millimetres larger. If you revert cbf_reflex_mode to
+       linear, revert this to soft as well.
+       NOTE: the hard value is what the QP band and every safety claim use.
+       h_corr = h_soft + alpha*log(N) is an ANALYSIS quantity only (the single
+       function whose value and gradient are consistent, hence the one the
+       invariance theorem applies to); it OVERSHOOTS the true hard min and is
+       optimistic, so it must never be used to state a clearance. -->
+  <arg name="cbf_barrier_value_mode" default="hard" />
   <!-- Time-varying CBF term for the moving obstacle: estimates the
        environment-induced hdot (measured hdot minus the robot's own
        grad_h.dq contribution) and tightens the active half-spaces by
        clamp(-hdot_env - deadband, 0, max): the robot yields at the obstacle's
        approach speed instead of discovering it one cycle at a time. Static
        scenes fall inside the deadband -> zero effect. -->
-  <arg name="cbf_dynamic_hdot_enabled" default="true" />
+  <arg name="cbf_dynamic_hdot_enabled" default="false" />
   <arg name="cbf_dynamic_hdot_tau" default="0.05" />
   <arg name="cbf_dynamic_hdot_deadband" default="0.01" />
   <arg name="cbf_dynamic_hdot_max" default="0.5" />
@@ -392,11 +743,41 @@
   <arg name="grasp_softmin_beta" default="0.003" />
   <arg name="grasp_d_safe" default="0.002" />
 
+  <!-- 1.9. Gazebo Simulation Environment.
+       Declared here rather than at the top of the file: it forwards the CBF's
+       own reflex/ISSf constants to the certified C++ velocity controller, and
+       roslaunch resolves $(arg ...) in document order, so every arg it reads
+       must already be declared above. -->
+  <include file="$(find vision_processing)/launch/feeding_simulation_position_controller.launch">
+    <arg name="use_direct_group_position_controller" value="$(arg use_direct_group_position_controller)" />
+    <arg name="use_direct_group_velocity_controller" value="$(arg use_direct_group_velocity_controller)" />
+    <arg name="launch_sam3_server" value="$(arg launch_sam3_server)" />
+    <arg name="gui" value="$(arg gui)" />
+    <!-- Hard-real-time C++ reflex: one atomic command+certificate packet
+         consumed inside the 1 kHz ros_control update instead of the Python
+         reflex node, so the QP and the reflex share ONE set of constants. -->
+    <arg name="use_certified_cbf_controller"
+         value="$(eval arg('use_cpp_certified_controller') and arg('enable_cbf_reflex'))" />
+    <arg name="certified_max_joint_velocity" value="$(arg max_joint_velocity)" />
+    <arg name="certified_h_stop" value="$(arg cbf_reflex_h_stop)" />
+    <arg name="certified_h_activate" value="$(arg cbf_h_activate)" />
+    <arg name="certified_grad_lipschitz" value="$(arg cbf_reflex_grad_lipschitz)" />
+    <arg name="certified_exp_kappa" value="$(arg cbf_reflex_exp_kappa)" />
+    <arg name="certified_recovery_speed" value="$(arg cbf_recovery_speed)" />
+    <arg name="certified_recovery_depth" value="$(arg cbf_recovery_depth)" />
+    <arg name="certified_issf_epsilon" value="$(arg cbf_issf_epsilon)" />
+    <arg name="certified_issf_rho" value="$(arg cbf_issf_rho)" />
+    <arg name="certified_epsilon_sample_divisor" value="$(arg cbf_epsilon_sample_divisor)" />
+    <arg name="certified_epsilon_normal_alpha_threshold" value="$(arg cbf_epsilon_normal_alpha_threshold)" />
+    <arg name="certified_epsilon_motion_threshold" value="$(arg cbf_epsilon_motion_threshold)" />
+  </include>
+
   <!-- 3. Dual SAM3+SAM2 Detector -->
   <!-- Tracks the target and publishes a 2D mask -->
   <node name="sam3_sam2" pkg="vision_processing" type="sam3_sam2_node.py" output="screen" cwd="node">
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
         <param name="target_prompt" value="$(arg target_prompt)" />
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="publish_all_as_obstacles" value="true" />
         <param name="tracking_rate_hz" value="$(arg sam_tracking_rate_hz)" />
         <param name="sam3_init_retry_period" value="$(arg sam3_init_retry_period)" />
@@ -451,6 +832,7 @@
          robot_body_radius — filter radius around each body link to remove self-projections -->
   <node name="persistent_cloud" pkg="vision_processing" type="persistent_cloud_node.py" output="screen" cwd="node">
         <param name="depth_topic"         value="$(arg depth_topic)" />
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="info_topic"          value="$(arg info_topic)" />
         <param name="voxel_size"          value="$(arg persistent_voxel_size)" />
         <param name="free_margin"         value="$(arg persistent_free_margin)" />
@@ -489,6 +871,7 @@
   <!-- Creates the conditioned point cloud for the Flow Matching model -->
   <node name="condition_merger" pkg="vision_processing" type="condition_pcd_from_perception.py" output="screen">
         <param name="num_points" value="$(arg condition_num_points)" />
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="target_timeout" value="$(arg condition_target_timeout)" />
         <param name="hold_last_target_on_loss" value="$(arg condition_hold_last_target_on_loss)" />
         <param name="target_hold_max_age" value="$(arg condition_target_hold_max_age)" />
@@ -500,6 +883,7 @@
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
         <remap from="/planner/nominal_trajectory" to="/planner/raw_nominal_trajectory" />
         <param name="model_name" value="$(arg casf_model_name)" />
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <!-- Woodbury metric warp gains -->
         <param name="casf_kappa" value="$(arg casf_kappa)" />
         <param name="casf_alpha" value="$(arg casf_alpha)" />
@@ -555,6 +939,17 @@
         <param name="check_finite_debug" value="false" />
         <param name="single_shot" value="$(arg planner_single_shot)" />
         <param name="tcp_frame" value="panda_TCP" />
+        <!-- ROBOT IDENTITY, explicit for the same reason as on the CBF node
+             below: this node's NAME (safe_generative_planner) is shared with
+             the pick-and-place launches, which point it at a gripper URDF and
+             a fork-less link list. Private params outlive a launch on a
+             roscore that is not restarted, so leaving these implicit lets a
+             feeding run silently inherit the pick-place robot. Values are the
+             node's own feeding defaults. -->
+        <param name="urdf_path" value="$(find vision_processing)/urdf/panda_camera.xacro" />
+        <param name="controlled_link" value="fork_tip" />
+        <param name="voxel_dir" value="$(find vision_processing)/third_party/RDF/panda_layer/meshes/voxel_128" />
+        <rosparam param="cbf_link_names">['panda_link2','panda_link3','panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','fork_tip']</rosparam>
   </node>
 
   <!-- 6.5. SDF Trajectory Projector -->
@@ -596,6 +991,11 @@
         <param name="out_topic" value="/planner/nominal_joint_command" />
         <param name="velocity_out_topic" value="$(arg trajectory_velocity_out_topic)" />
         <param name="hold_current_until_trajectory" value="true" />
+        <!-- Always written, never omitted: this node name is shared with the PP
+             launches and private params outlive a launch on a warm roscore, so
+             the arg's false default still overwrites a stale true left behind by
+             a PP campaign. -->
+        <param name="enable_episode_control" value="$(arg enable_episode_control)" />
         <param name="log_timing" value="$(arg log_trajectory_timing)" />
         <param name="use_progress_clock" value="$(arg trajectory_use_progress_clock)" />
         <param name="progress_lag_limit_rad" value="$(arg trajectory_progress_lag_limit_rad)" />
@@ -617,10 +1017,35 @@
              and the reflex node owns the real controller topic. -->
         <remap from="/joint_group_velocity_controller/command"
                to="/cbf_safety/pre_reflex_command"
-               if="$(arg enable_cbf_reflex)" />
+               if="$(eval arg('enable_cbf_reflex') and not arg('use_cpp_certified_controller'))" />
         <env name="PYTORCH_CUDA_ALLOC_CONF" value="$(arg pytorch_cuda_alloc_conf)" />
-        <param name="enable_cbf"               value="true" />
-        <param name="cbf_reflex_publish"       value="$(arg enable_cbf_reflex)" />
+        <param name="enable_cbf"               value="$(arg enable_cbf)" />
+        <param name="cbf_reflex_publish"
+               value="$(eval arg('enable_cbf_reflex') and not arg('use_cpp_certified_controller'))" />
+        <param name="certified_command_publish"
+               value="$(eval arg('enable_cbf_reflex') and arg('use_cpp_certified_controller'))" />
+        <param name="watchdog_require_obstacles" value="$(arg cbf_watchdog_require_obstacles)" />
+        <param name="model_override_dir" value="$(arg cbf_model_override_dir)" />
+        <param name="model_override_links" value="$(arg cbf_model_override_links)" />
+        <!-- ROBOT IDENTITY, made EXPLICIT (all four are identical to the node's
+             built-in feeding defaults, so this changes nothing on a clean
+             master). Two reasons they must not be left implicit:
+               1. the per-link vectors cbf_sampled_data_L_links /
+                  cbf_reflex_grad_lipschitz are positional in cbf_link_names
+                  order, so that order has to be pinned where they are set;
+               2. this node's NAME (cbf_safety_Bernstein) is shared with the
+                  pick-and-place launches, which DO set ~urdf_path to a
+                  gripper URDF. Private params survive on a roscore that is not
+                  restarted between runs, so a feeding launch after a PP run
+                  would silently inherit panda_pickplace.xacro / the PP link
+                  list and build the CBF on the WRONG ROBOT (no fork_tip). -->
+        <param name="urdf_path" value="$(find vision_processing)/urdf/panda_camera.xacro" />
+        <param name="controlled_link" value="fork_tip" />
+        <param name="voxel_dir" value="$(find vision_processing)/third_party/RDF/panda_layer/meshes/voxel_128" />
+        <rosparam param="cbf_link_names">['panda_link3','panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_rightfinger','panda_leftfinger','fork_tip']</rosparam>
+        <!-- Same shared-node-name hygiene: always written, so a stale true left
+             on a warm roscore by a PP campaign cannot leak into a plain launch. -->
+        <param name="enable_episode_control" value="$(arg enable_episode_control)" />
         <param name="publish_controller_command" value="$(arg use_direct_group_position_controller)" />
         <param name="publish_velocity_controller_command"
                value="$(eval arg('use_direct_group_velocity_controller') and not arg('use_direct_group_position_controller'))" />
@@ -640,6 +1065,10 @@
         <param name="cbf_sdf_prefilter_max_points" value="$(arg cbf_sdf_prefilter_max_points)" />
         <param name="cbf_selection_metric" value="$(arg cbf_selection_metric)" />
         <param name="cbf_cluster_mode" value="$(arg cbf_cluster_mode)" />
+        <param name="cbf_selection_mode" value="$(arg cbf_selection_mode)" />
+        <param name="cbf_sdf_graph_points" value="$(arg cbf_sdf_graph_points)" />
+        <param name="cbf_profile_graph" value="$(arg cbf_profile_graph)" />
+        <param name="cbf_profile_graph_after" value="$(arg cbf_profile_graph_after)" />
         <param name="fork_mesh_selection_points" value="$(arg cbf_fork_mesh_selection_points)" />
         <param name="publish_yellow_points" value="$(arg cbf_publish_yellow_points)" />
         <param name="selected_obstacle_hold_time" value="$(arg cbf_selected_obstacle_hold_time)" />
@@ -652,6 +1081,17 @@
         <param name="cbf_kappa"    value="$(arg cbf_kappa)" />
         <param name="cbf_recovery_kappa" value="$(arg cbf_recovery_kappa)" />
         <param name="cbf_constraint_margin" value="$(arg cbf_constraint_margin)" />
+        <param name="cbf_sampled_data_margin" value="$(arg cbf_sampled_data_margin)" />
+        <param name="cbf_issf_epsilon" value="$(arg cbf_issf_epsilon)" />
+        <param name="cbf_issf_rho" value="$(arg cbf_issf_rho)" />
+        <param name="cbf_sampled_data_linearization" value="$(arg cbf_sampled_data_linearization)" />
+        <param name="cbf_sampled_data_T" value="$(arg cbf_sampled_data_T)" />
+        <param name="cbf_sampled_data_vel_headroom" value="$(arg cbf_sampled_data_vel_headroom)" />
+        <param name="cbf_sampled_data_L_links" value="$(arg cbf_sampled_data_L_links)" />
+        <param name="cbf_repair_all_rows" value="$(arg cbf_repair_all_rows)" />
+        <param name="cbf_repair_sweeps" value="$(arg cbf_repair_sweeps)" />
+        <param name="cbf_repair_qp_algorithm" value="$(arg cbf_repair_qp_algorithm)" />
+        <param name="cbf_repair_grad_min" value="$(arg cbf_repair_grad_min)" />
         <param name="cbf_recovery_switch_margin" value="$(arg cbf_recovery_switch_margin)" />
         <param name="cbf_enforce_final_constraint" value="$(arg cbf_enforce_final_constraint)" />
         <param name="cbf_integrate_from_current" value="$(arg cbf_integrate_from_current)" />
@@ -671,6 +1111,10 @@
         <param name="cbf_final_constraint_mode" value="$(arg cbf_final_constraint_mode)"/>
         <param name="cbf_profile_multicbf" value="$(arg cbf_profile_multicbf)" />
         <param name="cbf_active_constraints" value="$(arg cbf_active_constraints)" />
+        <param name="cbf_qp_algorithm" value="$(arg cbf_qp_algorithm)" />
+        <param name="cbf_dykstra_warmstart" value="$(arg cbf_dykstra_warmstart)" />
+        <param name="cbf_joint_limit_margin" value="$(arg cbf_joint_limit_margin)" />
+        <param name="cbf_joint_limit_kappa" value="$(arg cbf_joint_limit_kappa)" />
         <param name="cbf_multi_gradient_mode" value="$(arg cbf_multi_gradient_mode)" />
         <param name="cbf_multi_fd_eps" value="$(arg cbf_multi_fd_eps)" />
         <param name="cbf_h_activate" value="$(arg cbf_h_activate)" />
@@ -730,6 +1174,7 @@
         <param name="max_feedback_velocity"    value="$(arg max_feedback_velocity)" />
         <param name="cbf_filter_tau"           value="$(arg cbf_filter_tau)" />
         <param name="cbf_velocity_filter_tau"  value="$(arg cbf_velocity_filter_tau)" />
+        <param name="cbf_smoothing_mode"       value="$(arg cbf_smoothing_mode)" />
         <param name="use_nominal_velocity_topic" value="$(arg cbf_use_nominal_velocity_topic)" />
         <param name="nominal_velocity_topic" value="$(arg trajectory_velocity_out_topic)" />
         <param name="nominal_velocity_timeout" value="$(arg cbf_nominal_velocity_timeout)" />
@@ -744,6 +1189,25 @@
         <param name="cbf_escape_normal_gain"   value="$(arg cbf_escape_normal_gain)" />
         <param name="cbf_escape_normal_h_trigger" value="$(arg cbf_escape_normal_h_trigger)" />
         <param name="cbf_escape_max_velocity"  value="$(arg cbf_escape_max_velocity)" />
+        <param name="cbf_escape_lift_gain"     value="$(arg cbf_escape_lift_gain)" />
+        <param name="cbf_escape_gate_tau"      value="$(arg cbf_escape_gate_tau)" />
+        <param name="cbf_escape_probe_enabled" value="$(arg cbf_escape_probe_enabled)" />
+        <param name="cbf_escape_probe_num_dirs" value="$(arg cbf_escape_probe_num_dirs)" />
+        <param name="cbf_escape_probe_radii"   value="$(arg cbf_escape_probe_radii)" />
+        <param name="cbf_escape_probe_elevations" value="$(arg cbf_escape_probe_elevations)" />
+        <param name="cbf_escape_probe_growth_weight" value="$(arg cbf_escape_probe_growth_weight)" />
+        <param name="cbf_escape_suppress_nominal" value="$(arg cbf_escape_suppress_nominal)" />
+        <param name="cbf_escape_probe_clearance_cap" value="$(arg cbf_escape_probe_clearance_cap)" />
+        <param name="cbf_escape_probe_goal_weight" value="$(arg cbf_escape_probe_goal_weight)" />
+        <param name="cbf_escape_probe_commit_weight" value="$(arg cbf_escape_probe_commit_weight)" />
+        <param name="cbf_escape_probe_min_z"   value="$(arg cbf_escape_probe_min_z)" />
+        <param name="cbf_escape_probe_ema"     value="$(arg cbf_escape_probe_ema)" />
+        <param name="cbf_escape_probe_tabu_timeout" value="$(arg cbf_escape_probe_tabu_timeout)" />
+        <param name="cbf_escape_probe_tabu_min_progress" value="$(arg cbf_escape_probe_tabu_min_progress)" />
+        <param name="cbf_escape_probe_tabu_weight" value="$(arg cbf_escape_probe_tabu_weight)" />
+        <param name="cbf_escape_probe_tabu_ttl" value="$(arg cbf_escape_probe_tabu_ttl)" />
+        <param name="cbf_escape_probe_reentry_window" value="$(arg cbf_escape_probe_reentry_window)" />
+        <param name="cbf_escape_probe_resolve_timeout" value="$(arg cbf_escape_probe_resolve_timeout)" />
         <param name="tcp_filter_radius" value="$(arg tcp_filter_radius)" />
         <param name="fork_filter_radius" value="$(arg fork_filter_radius)" />
         <!-- persistent_obstacles is built from cleaned_obstacles (food already excluded by SAM2)
@@ -762,17 +1226,40 @@
         <param name="cbf_ema_alpha" value="$(arg cbf_ema_alpha)" />
   </node>
 
-  <!-- 8.5. Reflex brake layer (only with enable_cbf_reflex:=true).
+  <!-- 8.5. Reflex brake layer, PYTHON path (enable_cbf_reflex:=true AND
+       use_cpp_certified_controller:=false; otherwise the C++
+       certified_cbf_velocity_controller owns the 1 kHz layer instead).
        Consumes the intercepted CBF velocity command plus
        /cbf_safety/reflex_state (h, env_hdot, grad_h per link) and republishes
        an alpha-scaled velocity to the real controller topic at ~1 kHz.
        Pure brake: it can only shrink the QP-certified velocity, never steer,
-       so it cannot introduce new constraint violations. -->
+       so it cannot introduce new constraint violations.
+       exp_kappa switches the certified requirement from the invariance floor
+       h_end >= h_stop to the SAME discrete exponential condition the QP
+       enforces, h_end >= (1 - kappa*T) h_now: for h < 0 it demands certified
+       INCREASE (attractivity half of the zeroing-CBF theorem, Xu et al. ADHS
+       2015) so a QP recovery command passes instead of freezing at alpha = 0;
+       h_stop stays 0 — standoff comes only from the certified QP margins,
+       never a tuned floor. issf_epsilon mirrors the QP's disturbance bound
+       into the reflex certificate. -->
   <node name="cbf_reflex" pkg="vision_processing" type="cbf_reflex_node.py"
-        output="screen" if="$(arg enable_cbf_reflex)">
+        output="screen"
+        if="$(eval arg('enable_cbf_reflex') and not arg('use_cpp_certified_controller'))">
         <param name="rate_hz"  value="$(arg cbf_reflex_rate_hz)" />
         <param name="h_stop"   value="$(arg cbf_reflex_h_stop)" />
         <param name="h_activate" value="$(arg cbf_h_activate)" />
+        <param name="mode" value="$(arg cbf_reflex_mode)" />
+        <param name="grad_lipschitz" value="$(arg cbf_reflex_grad_lipschitz)" />
+        <param name="exp_kappa" value="$(arg cbf_reflex_exp_kappa)" />
+        <!-- h<0 demand = recovery_slack * the QP's own recovery law (must
+             match the QP's cbf_recovery_speed/_depth; see node docstring:
+             kappa*|h| below zero demands more outward speed than the QP
+             recovery stack delivers and vetoes the retreat). -->
+        <param name="recovery_speed" value="$(arg cbf_recovery_speed)" />
+        <param name="recovery_depth" value="$(arg cbf_recovery_depth)" />
+        <param name="recovery_slack" value="0.5" />
+        <param name="issf_epsilon" value="$(arg cbf_issf_epsilon)" />
+        <param name="issf_rho" value="$(arg cbf_issf_rho)" />
         <param name="in_velocity_topic"  value="/cbf_safety/pre_reflex_command" />
         <param name="out_velocity_topic" value="/joint_group_velocity_controller/command" />
   </node>
@@ -821,6 +1308,7 @@
   <node name="fork_grasp" pkg="vision_processing" type="fork_grasp_node.py"
         output="screen" if="$(arg grasp_enabled)">
         <param name="robot_model" value="panda" />
+        <param name="enable_episode_control" value="$(arg enable_episode_control)"/>
         <param name="fork_link" value="fork_tip" />
         <param name="food_model" value="food_cube" />
         <param name="food_link" value="base_link" />
@@ -846,6 +1334,63 @@
              Use grasp_point_radius + d_safe to show the CBF keep-out boundary. -->
         <param name="envelope_radius" value="$(arg grasp_point_radius)" />
         <param name="publish_viz" value="$(arg launch_rviz)" />
+  </node>
+
+  <!-- 9.5. Episode director (ablation campaign only; see enable_episode_control).
+       Rewinds the world in place between trials: pause, node-state resets,
+       arm -> home, objects -> episode poses, unpause, wait for the perception
+       chain, then open the gate. Node resets are DISCOVERED by service suffix,
+       so this block carries no list of them. -->
+  <node name="episode_director" pkg="vision_processing" type="episode_director.py"
+        output="screen" if="$(arg enable_episode_control)">
+        <param name="robot_model" value="panda"/>
+        <param name="settle_time" value="1.0"/>
+        <!-- Home configuration, matching the -J spawn arguments of
+             feeding_simulation_position_controller.launch. This bench does NOT
+             share the pick-place home, so the director's PANDA_HOME default
+             would teleport the arm into a different posture (and toward the
+             container) at every reset. Keep these two in sync. -->
+        <rosparam param="arm_home">
+          panda_joint1: -0.000059
+          panda_joint2: -0.125928
+          panda_joint3:  0.000117
+          panda_joint4: -2.193312
+          panda_joint5: -0.000251
+          panda_joint6:  2.064780
+          panda_joint7:  0.785511
+        </rosparam>
+        <!-- Links whose twist is zeroed after the teleport. The default list
+             plus fork_tip, which is a standalone Gazebo link here
+             (disableFixedJointLumping in panda_camera.xacro) and carries mass,
+             so a residual twist on it survives the rewind. -->
+        <rosparam param="arm_links">['panda_link0','panda_link1','panda_link2','panda_link3','panda_link4','panda_link5','panda_link6','panda_link7','panda_hand','panda_leftfinger','panda_rightfinger','fork_tip']</rosparam>
+        <!-- Re-cleared after the unpause: while paused no joint states are
+             published, so these two still hold the PRE-reset pose and would
+             command the arm back out of home. -->
+        <rosparam param="post_settle_services">['/trajectory_executor/episode/reset', '/cbf_safety_Bernstein/episode/reset']</rosparam>
+        <param name="home_tolerance" value="0.05"/>
+        <!-- Wrist-camera chain: the mask topic is this bench's SAM2 output, and
+             merged_cloud is what the planner is conditioned on. Both are stale
+             until SAM3 re-prompts after the tracker memory drop. -->
+        <rosparam param="ready_topics">['/vision/sam2_tracked_mask', '/vision/merged_cloud']</rosparam>
+        <!-- The bowl in world coordinates (with its spawn roll of pi/2, which
+             must be written or the identity quaternion lays it flat and empties
+             it), and the food as an OFFSET from the bowl. The offset is the
+             spawn difference of the two models, so a zero draw reproduces the
+             deployed scene exactly. The table and the seated person are static
+             scenery and stay out of episode control. -->
+        <rosparam param="objects">
+          container: {x: 0.47,  y: 0.0, z: 0.778, rpy: [1.5708, 0.0, 0.0]}
+          food_cube: {x: -0.02, y: 0.0, z: -0.014}
+        </rosparam>
+        <rosparam param="object_relative_to">
+          food_cube: container
+        </rosparam>
+        <param name="seed" value="$(arg randomize_seed)"/>
+        <rosparam param="randomize" subst_value="true">
+          container: {x: $(arg randomize_bowl_x), y: $(arg randomize_bowl_y)}
+          food_cube: {x: $(arg randomize_food_x), y: $(arg randomize_food_y)}
+        </rosparam>
   </node>
 
   <!-- 10. RViz Visualization -->

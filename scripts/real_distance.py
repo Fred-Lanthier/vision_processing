@@ -42,9 +42,16 @@ ROBOT_VARIANTS = {
     },
     'feeding': {
         'urdf': 'urdf/panda_camera.xacro',
+        # Was stale: link4..7 + hand + fork_tip only (6 links), while the
+        # feeding CBF has protected 9 for a long time. An offline "true"
+        # clearance computed over fewer links than the barrier reports an
+        # OPTIMISTIC h_real, so the gap to h read as basis-SDF error when part
+        # of it was simply geometry the overlay never looked at. Kept in sync
+        # with ~cbf_link_names in green_cube_feeding_casf.launch.
         'protected_links': [
-            'panda_link4', 'panda_link5', 'panda_link6', 'panda_link7',
-            'panda_hand', 'fork_tip',
+            'panda_link3', 'panda_link4', 'panda_link5', 'panda_link6',
+            'panda_link7', 'panda_hand', 'panda_rightfinger',
+            'panda_leftfinger', 'fork_tip',
         ],
     },
 }

@@ -606,31 +606,50 @@ def main():
             h_real = d_real - args.d_safe
 
     # 1. Barrier value -----------------------------------------------------
+    # Bias-compensated barrier, on the same axis: h_corr is the same quantity as
+    # h with the soft-min crowding bias removed, so the traces read as one
+    # family (surrogate contraint -> corrigé). Identical to h in hard-value
+    # mode, where drawing it would only duplicate a curve.
+    h_corr = np.asarray(s["h_corr"], dtype=float) if "h_corr" in s else None
+    # Hard-value mode is read off the node's OWN signature: it sets
+    # h_corr = h EXACTLY (bit-identical, no epsilon) when
+    # ~cbf_barrier_value_mode:=hard, because there is then no softmin bias to
+    # remove. It must NOT be inferred from h vs h_hard: h_hard is a DIFFERENT
+    # quantity (see below), so in a two-group run it differs from h even in
+    # hard mode -- which made this figure label the exact hard barrier
+    # "h_soft" and the whole-body series "h_min", i.e. both traces wrong and
+    # apparently inverted (run1003: min h = +3.65 mm shown as h_soft,
+    # min h_hard = -5.75 mm shown as h_min, while max|h - h_corr| was 0.0).
     hard_value_mode = (
-        "h_hard" in s
-        and np.isfinite(s["h_hard"]).any()
-        and np.nanmax(np.abs(s["h"] - s["h_hard"])) < 1e-6
+        h_corr is not None
+        and np.isfinite(h_corr).any()
+        and np.nanmax(np.abs(s["h"] - h_corr)) == 0.0
     )
     learned_h_label = r"$h_{\min}$" if hard_value_mode else r"$h_{\mathrm{soft}}$"
     fig, ax = plt.subplots(figsize=(ts.TEXTWIDTH, 2.5))
     ax.plot(t, s["h"], color=ts.BLUE, label=learned_h_label, lw=1.0)
-    # HARD minimum of the barrier over the selected set. In soft-min mode the
-    # "h" field above is the softmin surrogate the QP actually constrains, which
-    # sits BELOW the true minimum by softmin_gap; h_hard is the value that says
-    # whether the robot was really clear. Drawn only when it differs from "h"
-    # (in multi_projected mode the two are the same series and one trace,
-    # already labelled h_min, is enough).
+    # h_hard is NOT "the hard version of h". The node builds it with
+    # _hardmin_h_value_no_grad -> get_whole_body_sdf_batch(return_per_link=False),
+    # i.e. the min over EVERY protected body including the grasped-object link,
+    # minus the GLOBAL d_safe -- whereas "h" is the robot/fork group only, at
+    # its own margin, and comes from the CUDA-graph step at a slightly older q.
+    # So with the grasp separate constraint active it sits BELOW h by up to
+    # (d_safe - grasp_d_safe), which is a margin bookkeeping difference and not
+    # a clearance loss. Verified on run1003: h_hard - h <= 0 on 100% of cycles
+    # (median 0.00, min -22.4 mm), and at its minimum h_food = +8.4 mm while
+    # h_hard = -5.75 mm ~= h_food - 13 mm = h_food - (d_safe - grasp_d_safe).
+    # The grasped object's own barrier is h_food (figure h_groups); that is the
+    # series that says whether the carried object was clear.
     h_hard = np.asarray(s["h_hard"], dtype=float) if "h_hard" in s else None
-    if h_hard is not None and np.isfinite(h_hard).any() and not hard_value_mode:
-        ax.plot(t, h_hard, color=ts.GREY, lw=1.0,
-                label=r"$h_{\min}$ (min dur)")
-    # Bias-compensated barrier, on the same axis: h_corr is the same quantity as
-    # h with the soft-min crowding bias removed, so the three traces read as
-    # one family (surrogate contraint -> corrigé -> vrai minimum). Identical to
-    # h in multi_projected mode, where drawing it would only duplicate a curve.
-    h_corr = np.asarray(s["h_corr"], dtype=float) if "h_corr" in s else None
+    two_group = "h_food" in s and np.isfinite(s["h_food"]).any()
+    if h_hard is not None and np.isfinite(h_hard).any():
+        hard_label = (
+            r"$h_{\mathrm{tout\ corps}}$ (objet saisi inclus, $d_{\mathrm{safe}}$ global)"
+            if two_group else r"$h_{\min}$ (min dur)")
+        if not hard_value_mode or two_group:
+            ax.plot(t, h_hard, color=ts.GREY, lw=1.0, label=hard_label)
     if (h_corr is not None and np.isfinite(h_corr).any()
-            and np.nanmax(np.abs(s["h"] - h_corr)) > 1e-6):
+            and not hard_value_mode):
         ax.plot(t, h_corr, color=ts.SKY, lw=1.0, label=r"$h_{\mathrm{corr}}$")
     if h_real is not None:
         ax.plot(t, h_real, color=ts.ORANGE, lw=1.0,
@@ -643,13 +662,16 @@ def main():
     ax.set_ylabel("h [m]")
     # Minima annotés : c'est le chiffre que porte une affirmation de sécurité.
     stats_lines = []
+    # The barrier the QP actually constrained, under its own name in each mode.
+    stats_lines.append(r"min $%s$ = %.1f mm"
+                       % ("h_{\\min}" if hard_value_mode else "h_{\\mathrm{soft}}",
+                          np.nanmin(s["h"]) * 1e3))
     if h_hard is not None and np.isfinite(h_hard).any():
-        stats_lines.append(r"min $h_{\min}$ = %.1f mm" % (np.nanmin(h_hard) * 1e3))
-    if not hard_value_mode:
-        stats_lines.append(r"min $h_{\mathrm{soft}}$ = %.1f mm"
-                           % (np.nanmin(s["h"]) * 1e3))
+        stats_lines.append(
+            (r"min $h_{\mathrm{tout\ corps}}$ = %.1f mm" if two_group
+             else r"min $h_{\min}$ = %.1f mm") % (np.nanmin(h_hard) * 1e3))
     if (h_corr is not None and np.isfinite(h_corr).any()
-            and np.nanmax(np.abs(s["h"] - h_corr)) > 1e-6):
+            and not hard_value_mode):
         stats_lines.append(r"min $h_{\mathrm{corr}}$ = %.1f mm"
                            % (np.nanmin(h_corr) * 1e3))
     if h_real is not None and np.isfinite(h_real).any():

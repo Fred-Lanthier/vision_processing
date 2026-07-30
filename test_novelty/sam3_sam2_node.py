@@ -34,6 +34,7 @@ if muggled_sam_path not in sys.path:
 if pkg_path not in sys.path:
     sys.path.insert(0, pkg_path)
 from pipeline_timing import TimingPublisher
+from episode_control import EpisodeControl
 
 # Imports Muggled SAM / Samurai
 try:
@@ -110,7 +111,13 @@ class Sam3Sam2Node:
         
         # --- PUBLISHERS ROS ---
         self.pub_debug = rospy.Publisher('/vision/sam2_tracked_mask', Image, queue_size=1)
-        
+
+        # Ablation campaign hook. The reset only RAISES a flag; the tracker is
+        # mutated inside ai_worker so the memory banks are never dropped
+        # mid-step. Inert unless ~enable_episode_control.
+        self._episode_reset_pending = False
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+
         rospy.loginfo("✅ Nœud DUAL SAM3+SAM2 Prêt (Mask-Only Output).")
         
         self.ai_thread = threading.Thread(target=self.ai_worker)
@@ -181,6 +188,11 @@ class Sam3Sam2Node:
             )
         self.next_init_time = now + retry_period
 
+    def _episode_reset(self):
+        """Drop both SAM2 memory banks; ai_worker re-prompts SAM3 next frame."""
+        self._episode_reset_pending = True
+        return "sam2 tracker memory dropped; SAM3 re-init on next frame"
+
     def ai_worker(self):
         rate = rospy.Rate(max(self.tracking_rate_hz, 0.1))
         while not rospy.is_shutdown():
@@ -191,7 +203,20 @@ class Sam3Sam2Node:
                 rate.sleep()
                 continue
             rgb_cv, depth_cv, frame_time = frame_data
-            
+
+            if self._episode_reset_pending:
+                # Serviced here, between steps: dropping the memory banks
+                # underneath step_video_masking would tear the tracker state.
+                # next_init_time is zeroed so the SAM3 re-prompt is not held off
+                # by a backoff earned in the previous episode.
+                self._episode_reset_pending = False
+                self.obj_mem_target = None
+                self.obj_mem_obstacle = None
+                self.frame_idx = 0
+                self.last_init_time = 0
+                self.next_init_time = 0.0
+                self.init_fail_count = 0
+
             # Vérification de l'état d'initialisation
             needs_init = False
             if self.obj_mem_target is None:

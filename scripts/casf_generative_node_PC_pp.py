@@ -590,6 +590,22 @@ class CASFGenerativeNode:
         episode's plans visible to the next; the cached conditioning cloud is
         dropped so the first plan of a new episode cannot be conditioned on the
         previous scene."""
+        # THE PROPRIOCEPTIVE HISTORY. obs_queue is the model's agent_pos input:
+        # a deque of the last obs_horizon poses. Left alone it still holds the
+        # END of the previous episode, and because it is already full the
+        # "wait until we have enough history" guard passes immediately -- so the
+        # first plan of a new episode is conditioned on a history that says the
+        # arm is at the box having just released. The observation is centred on
+        # the current fork tip, so absolute position cancels, but the RELATIVE
+        # displacement between the entries does not: the model sees a large
+        # bogus jump and plans accordingly. Clearing it makes the planner wait
+        # for obs_horizon genuinely fresh observations, which is the same state
+        # it starts a fresh launch in.
+        self.obs_queue.clear()
+        # Matches the reset gripper (re-armed to PRE_GRASP, fingers opened).
+        # Self-heals from /joint_states within a cycle, but the first plan would
+        # otherwise be conditioned on the carrying state.
+        self.current_gripper_open = 1.0
         self.ensembler.buffer.clear()
         self.plan_published = False
         self.is_committed = False
@@ -597,7 +613,8 @@ class CASFGenerativeNode:
         self.fork_food_distance = float('inf')
         self.latest_cloud_gpu = None
         self.latest_cloud_stamp = None
-        return "planner state cleared (ensembler, commit latch, cloud)"
+        return ("planner state cleared (obs history, gripper flag, "
+                "ensembler, commit latch, cloud)")
 
     def _episode_reconfigure(self):
         """Re-read the tier-1 planner knobs. No graph, no reload, no warmup."""

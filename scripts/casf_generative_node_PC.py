@@ -107,6 +107,7 @@ if scripts_path not in sys.path:
     sys.path.insert(0, scripts_path)
 sys.path.append(os.path.join(pkg_path, 'src', 'vision_processing', 'diffusion_model_train'))
 from pipeline_timing import TimingPublisher
+from episode_control import EpisodeControl
 
 # Two checkpoint families share the same U-Net architecture but use different
 # normalizers:
@@ -431,6 +432,16 @@ class CASFGenerativeNode:
         )
         self.last_pose_source_log = 0.0
 
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        # fm_noise_seed is the ONLY tier-1 knob here and it is genuinely free:
+        # initial_fm_noise() seeds inside torch.random.fork_rng per call, so
+        # sampling carries no RNG state between episodes and re-seeding is an
+        # attribute write. Nothing here touches the checkpoint or the compiled
+        # velocity net -- the torch.compile warmup must survive the campaign.
+        self.episode = EpisodeControl(
+            on_reset=self._episode_reset,
+            on_reconfigure=self._episode_reconfigure)
+
         # 4.5 Compile + CUDA-graph the FM velocity net (shrinks the planner's
         # GPU burst so the shared GPU is free for the 150 Hz CBF loop).
         self._setup_fm_compile()
@@ -469,36 +480,71 @@ class CASFGenerativeNode:
     def _setup_fm_compile(self):
         """Compile + CUDA-graph the FM velocity net.
 
-        The planner runs at ~8 Hz but each replan does N_PRED forward passes
-        through velocity_net (55-85 ms total, batch-1 launch-overhead bound).
-        That burst monopolizes the GPU the 150 Hz CBF loop shares, inflating
-        its red-point preprocess to 40-52 ms. reduce-overhead mode captures
-        each forward as a CUDA graph (graph trees), collapsing per-kernel
-        launch overhead so the burst drops toward ~15-20 ms and stops
-        colliding with the safety loop. Math is unchanged (same fp32 graph).
+        The planner runs at ~5 Hz but each replan does N_PRED forward passes
+        through velocity_net (measured 106 ms mean / 167 ms p95 eager on the
+        feeding rig, batch-1 launch-overhead bound). That burst monopolizes the
+        GPU the 100 Hz CBF loop shares -- separate PROCESS = separate CUDA
+        context, so the CBF's priority stream cannot preempt it -- and it is the
+        dominant term in that loop's readback tail (cbf_d2h 10.9 ms mean /
+        107 ms max). reduce-overhead mode captures each forward as a CUDA graph
+        (graph trees), collapsing per-kernel launch overhead so the burst drops
+        toward ~15-20 ms and stops head-of-line-blocking the safety loop. Math
+        is unchanged (same fp32 graph).
 
-        Compilation + capture are forced now via a warmup so the first live
-        replan does not stall. Any failure falls back to the eager net.
+        THREADING: the capture and the replay must run in the SAME thread --
+        reduce-overhead's CUDA-graph state is thread-local, and mismatched
+        threads trip `_is_key_in_tls` on the first live replan. That is why this
+        flag was historically forced off for feeding: the warmup below used to
+        run inline here, i.e. in __init__ (main thread), while control_loop runs
+        in a rospy.Timer thread. The warmup is now DEFERRED to the first
+        control_loop tick via _warmup_fm_compile(); here we only install the
+        wrapper (torch.compile is lazy -- nothing is traced or captured until
+        the first call, which now happens in the timer thread). Any failure
+        there falls back to the eager net.
         """
         self._velocity_net_eager = self.fm_agent.velocity_net
+        self._fm_needs_warmup = False
         if not self.fm_use_torch_compile:
             rospy.loginfo("FM torch.compile disabled (~fm_use_torch_compile=false).")
             return
         if self.device.type != "cuda":
             rospy.loginfo("FM torch.compile skipped: planner not on CUDA.")
             return
+        # Wrap only; the trace+capture happens on first call in the timer
+        # thread (see _warmup_fm_compile). Installing the wrapper here is
+        # thread-agnostic -- torch.compile records no CUDA-graph state until
+        # invoked.
+        self.fm_agent.velocity_net = torch.compile(
+            self.fm_agent.velocity_net, mode="reduce-overhead")
+        self._fm_needs_warmup = True
+        rospy.loginfo(
+            "FM torch.compile (reduce-overhead) installed; warmup deferred to "
+            "the first planner tick (timer thread) so capture == replay "
+            "thread.")
+
+    def _warmup_fm_compile(self):
+        """Trace+capture the compiled velocity_net IN THE TIMER THREAD.
+
+        Called once from control_loop so the CUDA-graph capture happens in the
+        same thread that will replay it. Uses prediction-shaped dummy inputs;
+        shapes MUST match the live call (B=1, pred_horizon, action_dim) or the
+        graph re-records on the first real replan. On any failure, reverts to
+        the eager net (correctness over speed) and never retries.
+        """
+        self._fm_needs_warmup = False
         try:
             t0 = time.perf_counter()
-            self.fm_agent.velocity_net = torch.compile(
-                self.fm_agent.velocity_net, mode="reduce-overhead")
-            # Warm up with prediction-shaped dummy inputs. Shapes MUST match the
-            # live call (B=1, pred_horizon, action_dim) or the graph re-records
-            # on the first real replan.
             B, H = 1, self.pred_horizon
             dt_pred = 1.0 / max(self.n_pred, 1)
             dummy_obs = {
                 'point_cloud': torch.randn(B, self.num_points_pcd, 3, device=self.device),
-                'agent_pos': torch.zeros(B, self.obs_horizon, 9, device=self.device),
+                # obs_dim, not a hardcoded 9: it comes from the checkpoint cfg
+                # (and is what the agent was built with), and a shape mismatch
+                # here does not fail loudly -- it silently re-records the graph
+                # on the first live replan, i.e. exactly the stall this warmup
+                # exists to prevent.
+                'agent_pos': torch.zeros(B, self.obs_horizon, self.obs_dim,
+                                         device=self.device),
             }
             with torch.inference_mode():
                 global_cond = self.fm_agent.encode_obs(dummy_obs)
@@ -510,11 +556,60 @@ class CASFGenerativeNode:
                         A = A + v * dt_pred
             torch.cuda.synchronize()
             rospy.loginfo(
-                "✅ FM velocity_net compiled (reduce-overhead) + warmed up in %.1fs",
-                time.perf_counter() - t0)
+                "✅ FM velocity_net compiled (reduce-overhead) + warmed up in "
+                "%.1fs (timer thread)", time.perf_counter() - t0)
         except Exception as e:
-            rospy.logwarn("FM torch.compile failed (%s); using eager velocity_net.", e)
+            rospy.logwarn(
+                "FM torch.compile warmup failed (%s); using eager velocity_net.",
+                e)
             self.fm_agent.velocity_net = self._velocity_net_eager
+
+    # ----- episode lifecycle (ablation campaign; see episode_control.py) -----
+
+    def _episode_reset(self):
+        """Clear the planner's per-episode state.
+
+        The ensembler buffer and the commit/publish latches are what make one
+        episode's plans visible to the next; the cached conditioning cloud is
+        dropped so the first plan of a new episode cannot be conditioned on the
+        previous scene."""
+        # THE PROPRIOCEPTIVE HISTORY. obs_queue is the model's agent_pos input:
+        # a deque of the last obs_horizon poses. Left alone it still holds the
+        # END of the previous episode, and because it is already full the
+        # "wait until we have enough history" guard passes immediately -- so the
+        # first plan of a new episode is conditioned on a history that says the
+        # fork is at the mouth having just delivered. The observation is centred
+        # on the current fork tip, so absolute position cancels, but the RELATIVE
+        # displacement between the entries does not: the model sees a large
+        # bogus jump and plans accordingly. Clearing it makes the planner wait
+        # for obs_horizon genuinely fresh observations, which is the same state
+        # it starts a fresh launch in.
+        self.obs_queue.clear()
+        self.ensembler.buffer.clear()
+        self.plan_published = False
+        self.is_committed = False
+        self.plan_seq = 0
+        self.fork_food_distance = float('inf')
+        self.latest_cloud_gpu = None
+        self.latest_cloud_stamp = None
+        return ("planner state cleared (obs history, ensembler buffer, "
+                "commit latches, cached conditioning cloud)")
+
+    def _episode_reconfigure(self):
+        """Re-read the tier-1 planner knobs. No graph, no reload, no warmup."""
+        changed = []
+        for name, cast in (("fm_noise_seed", int),
+                           ("planner_rate_hz", float),
+                           ("n_pred", int),
+                           ("use_temporal_ensembler", bool),
+                           ("trajectory_retime_joint_speed", float)):
+            if not rospy.has_param("~" + name):
+                continue
+            new = cast(rospy.get_param("~" + name))
+            if getattr(self, name, None) != new:
+                setattr(self, name, new)
+                changed.append(f"{name}={new}")
+        return ("; ".join(changed)) if changed else "no change"
 
     def cbf_ready_callback(self, msg):
         if msg.data and not self.cbf_ready:
@@ -811,8 +906,18 @@ class CASFGenerativeNode:
             rospy.logerr_throttle(5.0, f"Error unpacking merged cloud: {e}")
 
     def control_loop(self, event):
+        # First tick only: trace+capture the compiled FM net HERE, in the timer
+        # thread, so the CUDA-graph capture thread matches every future replay
+        # thread (see _setup_fm_compile). This tick just warms (a multi-second
+        # one-time compile) and returns; the planner publishes nothing yet and
+        # the CBF holds, so the stall is harmless. Subsequent ticks plan
+        # normally against the ~15-20 ms compiled burst.
+        if self._fm_needs_warmup:
+            self._warmup_fm_compile()
+            return
+
         t_capture = rospy.get_time()
-        
+
         if self.single_shot and self.plan_published:
             return
             

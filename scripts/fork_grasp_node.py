@@ -27,16 +27,25 @@ Services:
   /fork_grasp/grab    (std_srvs/Trigger) — force an attach now.
   /fork_grasp/release (std_srvs/Trigger) — detach (deliver the food).
 """
+import os
+import sys
+
 import numpy as np
+import rospkg
 import rospy
 import tf2_ros
 from geometry_msgs.msg import Point
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs.point_cloud2 as pc2
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from std_srvs.srv import Trigger, TriggerResponse
 from visualization_msgs.msg import Marker
+
+_pkg_path = rospkg.RosPack().get_path('vision_processing')
+if _pkg_path not in sys.path:
+    sys.path.insert(0, _pkg_path)
+from episode_control import EpisodeControl
 
 try:
     from scipy.spatial import cKDTree
@@ -117,6 +126,11 @@ class ForkGraspNode:
             self.grasp_cloud_topic, PointCloud2, queue_size=1, latch=True)
         self.pub_envelope = rospy.Publisher(
             "/viz/grasp_sdf_envelope", Marker, queue_size=1, latch=True)
+        # Grasp state, mirroring /pp_grasp/state on the pick-place bench so the
+        # ablation campaign's EpisodeMonitor reads one contract on both. Latched:
+        # a subscriber that attaches mid-episode must still learn the state.
+        self.pub_state = rospy.Publisher("/fork_grasp/state", String,
+                                         queue_size=10, latch=True)
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
@@ -142,6 +156,10 @@ class ForkGraspNode:
                              queue_size=1)
         rospy.Service("/fork_grasp/grab", Trigger, self._grab_srv)
         rospy.Service("/fork_grasp/release", Trigger, self._release_srv)
+
+        # Ablation campaign hook (inert unless ~enable_episode_control).
+        self.episode = EpisodeControl(on_reset=self._episode_reset)
+        self._publish_state()
 
         rospy.loginfo(
             "fork_grasp_node ready: weld %s/%s <- %s/%s when min|%s , %s| < "
@@ -210,6 +228,14 @@ class ForkGraspNode:
         return float(np.sqrt((diff ** 2).sum(-1)).min())
 
     # -- attach / detach -----------------------------------------------------
+    def _publish_state(self):
+        """GRASPED once the food is welded to the fork, PRE_GRASP otherwise.
+
+        Two states, not a richer FSM: this node has no closing phase to report
+        (there are no fingers), so the weld is the only transition there is."""
+        self.pub_state.publish(
+            String(data="GRASPED" if self.attached else "PRE_GRASP"))
+
     def attach(self):
         if self.attached:
             return True
@@ -220,6 +246,7 @@ class ForkGraspNode:
         try:
             self._attach_srv(self._make_request())
             self.attached = True
+            self._publish_state()
             rospy.loginfo("Spiked food: welded %s/%s to %s/%s.",
                           self.food_model, self.food_link,
                           self.robot_model, self.fork_link)
@@ -238,6 +265,7 @@ class ForkGraspNode:
             self._detach_srv(self._make_request())
             self.attached = False
             self._near_count = 0
+            self._publish_state()
             rospy.loginfo("Released food: detached %s from %s.",
                           self.food_model, self.robot_model)
             self._clear_grasp_cloud()
@@ -370,6 +398,41 @@ class ForkGraspNode:
         ok = self.detach()
         return TriggerResponse(success=ok,
                                message="detached" if ok else "detach failed")
+
+    # -- episode lifecycle (ablation campaign; see episode_control.py) --------
+    def _episode_reset(self):
+        """Detach the weld and drop every cached cloud.
+
+        The detach is the load-bearing part, and it must happen BEFORE the
+        director moves the food: with food_cube still welded to fork_tip, a
+        set_model_state on the food fights the attacher joint and the scene reset
+        silently half-succeeds. Same failure mode as the pick-place gripper node.
+
+        _clear_grasp_cloud is called unconditionally because detach() returns
+        early when nothing is attached, which would leave a latched grasped-cloud
+        from the previous episode being published to the CBF as an extra
+        protected link riding the fork."""
+        was_attached = self.attached
+        ok = self.detach()
+        self.attached = False
+        self._near_count = 0
+        self._publish_state()
+        self._clear_grasp_cloud()
+        self._grasp_cloud_fork = None
+        # Perception caches: stamps zeroed too, otherwise the timeout logic reads
+        # the previous episode's clouds as fresh for up to cloud_timeout.
+        self._fork_pts = None
+        self._fork_stamp = 0.0
+        self._target_pts = None
+        self._target_stamp = 0.0
+        self._fit_pts = None
+        self._fit_stamp = 0.0
+        if was_attached and not ok:
+            raise RuntimeError(
+                "food was welded to the fork and the detach service failed; "
+                "the scene reset would half-fail silently")
+        return (f"fork grasp re-armed (attached={was_attached} -> False, "
+                f"weld detached, cached clouds cleared)")
 
     # -- main loop -----------------------------------------------------------
     def _tick(self, _evt):
